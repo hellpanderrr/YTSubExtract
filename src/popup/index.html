@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Subtitles</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>
+      <span class="logo-icon">📺</span>
+      <span>YouTube Subs</span>
+    </h1>
+    <span class="version">v1.0</span>
+  </header>
+  
+  <div class="status-container">
+    <div id="status-icon" class="spinner"></div>
+    <div id="status" class="status-text">Initializing...</div>
+  </div>
+  
+  <div class="controls">
+    <!-- Source Language -->
+    <div class="form-group">
+      <label for="lang-select">Source Language</label>
+      <select id="lang-select" disabled>
+        <option value="" disabled selected>Loading languages...</option>
+      </select>
+    </div>
+    
+    <!-- Translation Option -->
+    <div class="form-group">
+      <div class="translation-toggle">
+        <label class="toggle-label" for="translate-check">
+          <input type="checkbox" id="translate-check" class="toggle-checkbox" disabled>
+          <span>Translate Subtitles</span>
+        </label>
+      </div>
+      
+      <div id="translation-options" class="translation-options">
+        <label for="translate-lang">Target Language</label>
+        <select id="translate-lang" disabled>
+          <option value="" disabled selected>Select language...</option>
+        </select>
+      </div>
+    </div>
+    
+    <!-- Download Buttons -->
+    <div class="btn-group">
+      <button id="btn-srt" disabled>SRT</button>
+      <button id="btn-vtt" disabled>VTT</button>
+      <button id="btn-txt" disabled>TXT</button>
+    </div>
+  </div>
+
+  <!-- Logs Section -->
+  <div id="logs-container" class="logs-section hidden">
+    <div class="logs-header" id="logs-toggle">
+      <div class="logs-title">
+        <span class="logs-toggle-icon">▶</span>
+        <span>Debug Logs</span>
+      </div>
+      <button id="copy-logs" class="copy-btn">Copy</button>
+    </div>
+    <div class="logs-content">
+      <textarea id="logs" readonly></textarea>
+    </div>
+  </div>
+
+  <footer>
+    <div>Powered by 3-Tier Architecture</div>
+  </footer>
+
+  <script type="module" src="./popup.js"></script>
+</body>
+</html>
