@@ -16,6 +16,7 @@ const translateLang = document.getElementById('translate-lang');
 const translationOptions = document.getElementById('translation-options');
 
 let currentVideoId = null;
+let currentVideoTitle = null;
 let currentTranscript = null;
 
 function setStatus(msg, type = 'info', loading = false) {
@@ -71,6 +72,11 @@ async function init() {
     const url = new URL(tab.url);
     if (url.hostname.includes('youtube.com') && url.searchParams.has('v')) {
       currentVideoId = url.searchParams.get('v');
+      
+      if (tab.title) {
+        currentVideoTitle = tab.title.replace(/ - YouTube$/, '');
+      }
+
       setStatus(`Video found: ${currentVideoId}`);
       fetchLanguages(currentVideoId);
     } else {
@@ -91,7 +97,12 @@ async function fetchLanguages(videoId) {
 
     if (response && response.success) {
       const { languages, title } = response.data;
-      setStatus(`Ready: ${title.substring(0, 30)}...`);
+      
+      if (title && title !== 'YouTube Video') {
+        currentVideoTitle = title;
+      }
+      
+      setStatus(`Ready: ${currentVideoTitle ? currentVideoTitle.substring(0, 30) : 'Video'}...`);
       populateLanguageSelect(languages);
       enableControls(true);
     } else {
@@ -217,7 +228,18 @@ async function fetchAndDownload(format) {
       }
 
       const filenameLang = shouldTranslate ? targetLanguage : lang;
-      downloadFile(content, `subtitles_${currentVideoId}_${filenameLang}.${ext}`, mime);
+      
+      let safeTitle = 'video';
+      if (currentVideoTitle) {
+        // Sanitize title: remove illegal characters for filenames
+        safeTitle = currentVideoTitle
+          .replace(/[<>:"/\\|?*]/g, '') // Remove illegal chars
+          .replace(/\s+/g, '_')         // Replace spaces with underscores
+          .substring(0, 50);            // Limit length
+      }
+      
+      const filename = `${safeTitle}_${currentVideoId}_${filenameLang}.${ext}`;
+      downloadFile(content, filename, mime);
       setStatus('Done!', 'success');
     } else {
       if (response && response.logs) {
