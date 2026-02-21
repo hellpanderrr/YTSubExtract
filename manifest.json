@@ -1,15 +1,27 @@
 {
   "manifest_version": 3,
-  "name": "YouTube Subtitle Downloader",
+  "name": "YTSubExtract for YouTube™",
+    "short_name": "YTSubExtract",
+
   "version": "1.0.0",
-  "description": "Download YouTube subtitles with intelligent 3-tier fallback system",
+  "description": "FOSS YouTube™ subtitle extractor. No ads, no tracking, no premium. Just SRT, VTT, and TXT.",
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
     "default_popup": "src/popup/index.html",
-    "default_title": "YouTube Subtitles"
+    "default_title": "YTSubExtract",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
   },
   "permissions": [
     "activeTab",
@@ -23,8 +35,12 @@
   ],
   "content_scripts": [
     {
-      "matches": ["*://*.youtube.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -36,5 +52,6 @@
         "path": "rules.json"
       }
     ]
-  }
+  },
+  "homepage_url" :"https://github.com/hellpanderrr/YTSubExtract"
 }

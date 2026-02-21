@@ -38,7 +38,8 @@ export default defineConfig({
     viteStaticCopy({
       targets: [
         { src: 'manifest.json', dest: '.' },
-        { src: 'rules.json', dest: '.' }
+        { src: 'rules.json', dest: '.' },
+        { src: 'icons', dest: '.' }
       ]
     })
   ]

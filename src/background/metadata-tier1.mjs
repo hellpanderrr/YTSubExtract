@@ -149,21 +149,7 @@ export async function fetchMetadataTier1(videoId) {
                              if (menuItems) {
                                  languages = menuItems.map(item => ({
                                      code: item.title?.simpleText || item.title?.runs?.[0]?.text, // This is usually the Name, not code. 
-                                     // Transcript menu items often don't have language code explicitly, 
-                                     // but they are what's available. 
-                                     // Wait, we need 'code' for the API. 
-                                     // The item has 'continuation'.
-                                     // Actually, we need the language CODE (e.g. 'en', 'ru').
-                                     // The menu items usually display "English", "Russian".
-                                     // Does it have the code?
-                                     // Usually not directly in the menu item text.
-                                     // But the 'continuation' token implies it.
-                                     // However, for our extension to work, we need the code to pass to getSubtitles.
                                      
-                                     // If we can't get the code, this fallback might be useless for *fetching* subtitles 
-                                     // unless we reverse engineer the code from the name or continuation.
-                                     
-                                     // Let's look at what we have.
                                      name: item.title?.simpleText || item.title?.runs?.[0]?.text || "Unknown",
                                      isAuto: false, // Hard to tell from menu
                                      isTranslation: false

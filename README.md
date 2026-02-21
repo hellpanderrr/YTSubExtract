@@ -1,74 +1,67 @@
-# YouTube Subtitle Downloader (MV3)
+# YTSubExtract: YouTube Subtitle Extractor (MV3)
 
-A powerful Chrome Extension to download YouTube subtitles with a 3-tier fallback system and auto-translation capabilities.
+A high-performance Chrome Extension designed to extract subtitles from YouTube videos using a robust **3-Tier Fallback System**. Built for reliability, it bypasses common API restrictions (age-gating, region locks) by impersonating different client types (Android, Web, Desktop).
 
-## 🏗️ Architecture
+## 🛠️ Tech Stack & Libraries
 
-This extension uses a robust **3-Tier Fallback System** to ensure subtitles can be extracted even when YouTube changes its API or blocks certain requests.
+This extension is built with **Vanilla JavaScript (ES Modules)** and **Vite**, targeting **Chrome Manifest V3**.
 
-### 🔹 Tier 1: Android Client API (Primary)
-- **Method**: Direct API call mimicking the official YouTube Android App.
-- **Why**: The Web client often returns empty captions for age-restricted or region-locked videos. The Android client is much more reliable.
-- **Translation**: Supports the `tlang` parameter for server-side translation (Google Translate API).
-- **Location**: Runs in the **Background Service Worker**.
+| Component | Library / Tool | Purpose |
+| :--- | :--- | :--- |
+| **Core Logic** | **`youtube-caption-extractor`** (Modified) | The foundation for **Tier 1**. We vendored and heavily modified this library to support **Android Client** impersonation (for 18+ videos) and direct translation injection. |
+| **API Interaction** | **`youtubei.js`** | Full-featured InnerTube API client. Handles complex protobuf parsing and mimics desktop client behavior (Tier 3). |
+| **DOM Extraction** | **`@playzone/youtube-transcript`** | Lightweight scraper for extracting transcripts directly from the `ytInitialPlayerResponse` object in the DOM (Tier 2). |
+| **Text Processing** | **`he`** | Robust HTML entity decoder. Converts raw XML entities (e.g., `&amp;`, `&#39;`) into readable text. |
+| **Sanitization** | **`striptags`** | High-performance HTML/XML tag stripper. Removes `<text>` and formatting tags from raw caption data. |
+| **Bundler** | **`vite`** | Modern build tool for extremely fast HMR and optimized production builds. |
+| **Packaging** | **`crx`** & **`zip-a-folder`** | Automates the creation of `.crx` files and `.zip` archives for Chrome Web Store distribution. |
 
-### 🔹 Tier 2: Web Client / Page Context (Fallback)
-- **Method**: Extracts data directly from the video page's initial data (ytInitialPlayerResponse).
-- **Why**: If the API call fails (e.g., due to IP blocking), this method uses the user's existing session cookies and page context.
-- **Location**: Runs in the **Content Script** (in the context of the active tab).
+## 🏗️ Technical Architecture
 
-### 🔹 Tier 3: Native Parsing & InnerTube (Last Resort)
-- **Method**: Uses the heavy `youtubei.js` library to emulate a full desktop client session + a "Native" fetcher that intercepts the video page's own `fmt=json3` resources.
-- **Why**: If all else fails, this method attempts to parse the raw data streams that the YouTube player itself uses.
-- **Location**: Hybrid (Background Worker + Content Script).
+The extension operates on a **Priority Fallback Model** to ensure 100% extraction success rate.
 
----
+### 1. Tier 1: Android API Client (Primary)
+*   **Mechanism**: The Service Worker constructs a raw HTTP request to `https://www.youtube.com/youtubei/v1` masquerading as the **YouTube Android App** (`com.google.android.youtube`).
+*   **Why**: The Android client API is less restrictive than the Web client. It reliably returns captions for **age-restricted** and **embedded-restricted** videos where the web player often fails.
+*   **Translation**: Injects the `&tlang={targetLang}` parameter directly into the caption URL for server-side translation by Google.
 
-## 📚 Libraries & Tools
+### 2. Tier 2: DOM & Page Context (Fallback)
+*   **Mechanism**: A Content Script injects into the active tab to access the window's `ytInitialPlayerResponse` object.
+*   **Why**: If the API is blocked (403/429), this method leverages the user's **existing session cookies** and signed-in state to retrieve the caption tracks already loaded by the player.
+*   **Library**: Uses `@playzone/youtube-transcript`.
 
-We use a specific set of libraries to handle different aspects of the extraction process:
+### 3. Tier 3: Native InnerTube Emulation (Last Resort)
+*   **Mechanism**: Initializes a heavy `youtubei.js` session within the Service Worker to perform a full "desktop" handshake.
+*   **Why**: Handles edge cases where video metadata is obfuscated or requires complex signature deciphering (sig/n-parameter).
 
-### Core Logic
-| Library | Purpose |
-| :--- | :--- |
-| **`he`** | HTML Entity decoder. Used to clean up raw XML captions (e.g., converts `&amp;` to `&`) from Tier 1. |
-| **`striptags`** | Removes XML/HTML tags from the raw caption text in Tier 1. |
-| **`youtubei.js`** | A powerful wrapper around YouTube's internal API. Used for deep metadata extraction and the Tier 3 fallback mechanism. |
-| **`@playzone/youtube-transcript`** | A lightweight library used in Tier 2 to extract transcripts from the DOM/Window object. |
+### ⚡ Performance & Caching
+*   **Instant Format Switching**: The extension caches the *raw parsed transcript* (JSON) in memory (`metadata:${videoId}`). Switching between **SRT**, **VTT**, and **TXT** formats is instant (0ms latency) as it re-serializes the cached data instead of re-fetching.
+*   **State Persistence**: Uses `chrome.storage.local` to persist user preferences (Translation enabled/disabled, Target Language) across sessions.
 
-### Build System
-| Tool | Purpose |
-| :--- | :--- |
-| **`vite`** | The build tool used to bundle the extension (ES modules -> browser-compatible JS). Supports HMR (Hot Module Replacement) for development. |
-| **`crx`** | Used to pack the extension into a `.crx` file for distribution. |
-| **`zip-a-folder`** | Creates the `.zip` archive for the Chrome Web Store. |
+## 📦 Installation & Build
 
----
+### Prerequisites
+*   Node.js 16+
+*   npm 8+
 
-## 🚀 Installation for Development
+### Setup
+```bash
+# Clone repository
+git clone https://github.com/your-repo/youtube_sub_ext.git
 
-1. Clone the repository.
-2. Run `npm install`.
-3. Run `npm run dev` for hot-reload or `npm run build` for production.
-4. Load the `dist` folder in Chrome Extensions (Developer Mode).
+# Install dependencies
+npm install
 
-## 📦 Build & Release
+# Development (Hot Reload)
+npm run dev
 
-### Manual Build
-To create a zip file for the store:
+# Production Build
+npm run build
+```
+
+### Release
+To generate a production-ready ZIP for the Chrome Web Store:
 ```bash
 npm run zip
+# Output: builds/extension.zip
 ```
-The output will be in `builds/extension.zip`.
-
-### GitHub Actions (CI/CD)
-This project includes two manual workflows for release management:
-
-1. **Build & Create Release (GitHub)**:
-   - Go to **Actions** -> Select workflow -> Click **Run workflow**.
-   - Creates a GitHub Release with the `extension.zip` attached.
-
-2. **Publish to Chrome Store**:
-   - Go to **Actions** -> Select workflow -> Click **Run workflow**.
-   - Automatically uploads and publishes the extension to the Chrome Web Store.
-   - *Requires `CLIENT_ID`, `CLIENT_SECRET`, `REFRESH_TOKEN`, `EXTENSION_ID` secrets.*
