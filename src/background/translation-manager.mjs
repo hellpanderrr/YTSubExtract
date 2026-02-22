@@ -5,6 +5,7 @@
 import { getSubtitles, getLanguages } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
+import he from 'he';
 
 export class TranslationManager {
   constructor() {
@@ -39,8 +40,11 @@ export class TranslationManager {
             this.cache.set(cacheKey, result);
             return result;
         }
+        // If Tier 1 returned no languages, log it
+        console.warn('Tier 1 Metadata returned no languages');
     } catch (e1) {
-        console.warn('Tier 1 Metadata failed:', e1);
+        // If Tier 1 failed (e.g. Sign in required), log it
+        console.warn('Tier 1 Metadata failed:', e1.message || e1);
     }
 
     // Tier 2
@@ -61,12 +65,32 @@ export class TranslationManager {
     // Tier 3
     try {
         const result = await getVideoMetadataTier3(videoId);
-        this.cache.set(cacheKey, result);
-        return result;
+        if (result && result.languages && result.languages.length > 0) {
+            this.cache.set(cacheKey, result);
+            return result;
+        }
+        console.warn('Tier 3 returned no languages, falling back to Tier 4...');
     } catch (e3) {
         console.error('Tier 3 Metadata failed:', e3);
-        throw new Error('All metadata tiers failed');
     }
+
+    // Tier 4 (Page Context / Age Restricted Fallback)
+    try {
+        console.log('[TranslationManager] Attempting Tier 4 (Page Context)...');
+        const result = await this._getLanguagesTier4(videoId);
+        if (result && result.languages.length > 0) {
+             const meta = {
+                title: result.title || 'YouTube Video',
+                languages: result.languages
+             };
+             this.cache.set(cacheKey, meta);
+             return meta;
+        }
+    } catch (e4) {
+        console.error('Tier 4 Metadata failed:', e4);
+    }
+
+    throw new Error('All metadata tiers failed');
   }
 
 
@@ -97,6 +121,33 @@ export class TranslationManager {
             return resolve([]);
           }
           resolve(response.languages || []);
+        });
+      });
+    });
+  }
+
+  async _getLanguagesTier4(videoId) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) return resolve({ languages: [] });
+        
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_CONTEXT_LANGUAGES', videoId }, (response) => {
+          if (chrome.runtime.lastError) {
+              console.error('[Tier 4] Runtime error:', chrome.runtime.lastError.message);
+              return resolve({ languages: [] });
+          }
+
+          if (response?.logs) {
+              console.groupCollapsed('[Tier 4] Page Context Logs');
+              response.logs.forEach(l => console.log(l));
+              console.groupEnd();
+          }
+
+          if (!response?.success) {
+            console.error('[Tier 4] Failed:', response?.error || 'Unknown error');
+            return resolve({ languages: [] });
+          }
+          resolve(response);
         });
       });
     });
@@ -353,6 +404,173 @@ export class TranslationManager {
     } catch (err) {
         errors.push({ tier: '3-legacy', error: err.message });
         log(`[Tier 3] Legacy Failed: ${err.message}`);
+    }
+
+    // === TIER 4 (Page Context Injection) ===
+    try {
+        log(`[Tier 4] Attempting Page Context Injection${translate ? ' (with translation)' : ''}...`);
+        
+        const result = await new Promise((resolve, reject) => {
+             chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
+                if (tabs.length === 0) return reject(new Error('No active YouTube tab'));
+                
+                chrome.tabs.sendMessage(tabs[0].id, {
+                    type: 'FETCH_PAGE_CONTEXT_TRANSCRIPT',
+                    videoId,
+                    lang: sourceLang,
+                    translate,
+                    translateLang: targetLang
+                }, async (response) => {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    
+                    if (response?.logs) {
+                        log('--- [Tier 4 Content Logs] ---');
+                        response.logs.forEach(l => log(l));
+                        log('-----------------------------');
+                    }
+                    
+                    // Log the response object for debugging
+                    log(`[Tier 4] Content Response: success=${response?.success}, url=${response?.url}, error=${response?.error}`);
+
+                    if (response?.success) {
+                        resolve(response.result);
+                    } else if (response?.url) {
+                         // Fallback: Content script failed to fetch (likely CORB/ORB), but found URL.
+                         // Try fetching from Background (privileged context).
+                         log(`[Tier 4] Content fetch failed. Fallback: Fetching URL from background: ${response.url}`);
+                         
+                         try {
+                             const bgRes = await fetch(response.url, { credentials: 'include' });
+                             const text = await bgRes.text();
+                             
+                             log(`[Tier 4] Background Fetch Status: ${bgRes.status} ${bgRes.statusText}`);
+                             log(`[Tier 4] Background Body Length: ${text.length}`);
+                             if (text.length > 0) {
+                                log(`[Tier 4] Body Preview: ${text.substring(0, 500)}`);
+                             }
+
+                             if (!text || text.trim().length === 0) {
+                                 throw new Error('Background fetch returned empty body');
+                             }
+                             
+                             let segments = [];
+                             // Try JSON3 first if url has fmt=json3
+                             if (response.url.includes('fmt=json3') || text.startsWith('{')) {
+                                 try {
+                                     const json = JSON.parse(text);
+                                     if (json.events) {
+                                         segments = json.events
+                                            .filter(e => e.segs)
+                                            .map(e => ({
+                                                start: (e.tStartMs || 0) / 1000,
+                                                duration: (e.dDurationMs || 0) / 1000,
+                                                text: e.segs.map(s => s.utf8 || '').join('')
+                                            }))
+                                            .filter(e => e.text.trim().length > 0);
+                                     }
+                                 } catch (e) {
+                                     log(`[Tier 4] Background JSON3 parse failed: ${e.message}`);
+                                 }
+                             }
+                             
+                             // If no segments from JSON3, try XML regex
+                     if (segments.length === 0) {
+                         const regex = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+                         let match;
+                         while ((match = regex.exec(text)) !== null) {
+                             segments.push({
+                                 start: parseFloat(match[1]),
+                                 duration: parseFloat(match[2]),
+                                 text: he.decode(match[3])
+                             });
+                         }
+                     }
+                     
+                     // If XML/JSON3 failed, try VTT
+                     if (segments.length === 0) {
+                         log(`[Tier 4] XML/JSON3 empty. Trying VTT fallback...`);
+                         let vttUrl = response.url;
+                         if (vttUrl.includes('fmt=')) {
+                            vttUrl = vttUrl.replace(/fmt=[^&]+/, 'fmt=vtt');
+                         } else {
+                            vttUrl += '&fmt=vtt';
+                         }
+                         
+                         try {
+                             log(`[Tier 4] Background Fetching VTT: ${vttUrl}`);
+                             const vttRes = await fetch(vttUrl);
+                             const vttText = await vttRes.text();
+                             
+                             if (vttText && vttText.includes('WEBVTT')) {
+                                 const lines = vttText.split('\n');
+                                 let currentStart = 0;
+                                 let currentDur = 0;
+                                 let currentText = [];
+                                 
+                                 for (let line of lines) {
+                                     line = line.trim();
+                                     if (!line || line === 'WEBVTT') continue;
+                                     
+                                     const timeMatch = line.match(/(\d{2}:\d{2}:\d{2}\.\d{3})\s-->\s(\d{2}:\d{2}:\d{2}\.\d{3})/);
+                                     if (timeMatch) {
+                                         if (currentText.length > 0) {
+                                             segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
+                                             currentText = [];
+                                         }
+                                         const parseTime = (t) => {
+                                             const parts = t.split(':');
+                                             return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+                                         };
+                                         currentStart = parseTime(timeMatch[1]);
+                                         currentDur = parseTime(timeMatch[2]) - currentStart;
+                                     } else if (!line.match(/^\d+$/)) {
+                                         currentText.push(line);
+                                     }
+                                 }
+                                 if (currentText.length > 0) {
+                                     segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
+                                 }
+                                 log(`[Tier 4] VTT parsed ${segments.length} segments`);
+                             }
+                         } catch (vttErr) {
+                             log(`[Tier 4] VTT fetch failed: ${vttErr.message}`);
+                         }
+                     }
+                     
+                     if (segments.length > 0) {
+                                 log(`[Tier 4] Background fetch success: ${segments.length} segments`);
+                                 resolve(segments);
+                             } else {
+                                 reject(new Error('Background fetch parsed 0 segments'));
+                             }
+                             
+                         } catch (bgErr) {
+                             log(`[Tier 4] Background fetch failed: ${bgErr.message}`);
+                             reject(new Error(response?.error || 'Unknown error'));
+                         }
+                    } else {
+                        reject(new Error(response?.error || 'Unknown error'));
+                    }
+                });
+             });
+        });
+
+        if (result && result.length > 0) {
+             log('[Tier 4] Success!');
+             const response = { 
+                source: 'tier4-page-context', 
+                result, 
+                translated: translate,
+                sourceLang,
+                targetLang,
+                logs
+             };
+             this.cache.set(cacheKey, response);
+             return response;
+        }
+    } catch (err) {
+        errors.push({ tier: 4, error: err.message });
+        log(`[Tier 4] Failed: ${err.message}`);
     }
 
     const finalError = new Error(`All extraction tiers failed: ${JSON.stringify(errors)}`);

@@ -50,7 +50,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         sendResponse({ success: true, result: segments });
       } catch (err) {
-        sendResponse({ success: false, error: err.message });
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const errorStack = err instanceof Error ? err.stack : '';
+        sendResponse({ success: false, error: errorMessage, stack: errorStack });
       }
     })();
     return true;
@@ -88,9 +90,565 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(err => sendResponse({ success: false, error: err.message, logs: err.logs || [] }));
     return true;
   }
+
+  if (msg.type === 'GET_PAGE_CONTEXT_LANGUAGES') {
+    (async () => {
+        const logs = [];
+        const log = (m) => logs.push(`[Content] ${m}`);
+        try {
+            const playerResponse = await getRobustPlayerResponse(log);
+
+            if (!playerResponse || !playerResponse.captions) {
+                 if (playerResponse) {
+                     log(`Found playerResponse but NO CAPTIONS. VideoId: ${playerResponse.videoDetails?.videoId}, Title: ${playerResponse.videoDetails?.title}`);
+                     // Check if playabilityStatus says anything
+                     if (playerResponse.playabilityStatus) {
+                         log(`Playability: ${playerResponse.playabilityStatus.status}`);
+                     }
+                 } else {
+                     log('No playerResponse found after all attempts.');
+                 }
+                 throw new Error('No captions found in page context.');
+            }
+            
+            const captionTracks = playerResponse.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+            log(`Found ${captionTracks.length} caption tracks.`);
+            
+            const languages = captionTracks.map(t => ({
+                code: t.languageCode,
+                name: t.name.simpleText,
+                isAuto: t.kind === 'asr'
+            }));
+            
+            sendResponse({ success: true, languages, title: playerResponse.videoDetails?.title, logs });
+        } catch (err) {
+            sendResponse({ success: false, error: err.message, logs });
+        }
+    })();
+    return true;
+  }
+
+  if (msg.type === 'FETCH_PAGE_CONTEXT_TRANSCRIPT') {
+    (async () => {
+        const logs = [];
+        const log = (m) => logs.push(`[Content] ${m}`);
+        
+        const tryFetchTranscript = async (url) => {
+             try {
+                 log(`Fetching transcript from: ${url}`);
+                 
+                 // Try fetch directly
+                 const response = await fetch(url);
+                 const text = await response.text();
+                 
+                 log(`Fetch Response Status: ${response.status} ${response.statusText}`);
+                 log(`Fetch Response Body Length: ${text.length}`);
+                 
+                 // Log headers to debug empty body
+                 const headers = {};
+                 response.headers.forEach((val, key) => { headers[key] = val; });
+                 log(`Response Headers: ${JSON.stringify(headers)}`);
+
+                 // Check for 204 No Content explicitly
+                 if (response.status === 204) {
+                     log('Status 204 No Content received.');
+                     return { ok: false, status: 204, text: '', url };
+                 }
+
+                 if (response.ok && text.length > 0) {
+                     return { ok: true, status: response.status, text, url };
+                 } else {
+                     log(`Fetch failed or empty. Status: ${response.status}. Body Len: ${text.length}`);
+                     
+                     // If we got a 200 OK but empty body, check if we can retry with no-cache
+                     if (response.status === 200 && text.length === 0) {
+                         log('Trying one more time with cache-control: no-cache...');
+                         try {
+                             const retry = await fetch(url, { cache: 'no-store' });
+                             const retryText = await retry.text();
+                             log(`Retry Status: ${retry.status}, Len: ${retryText.length}`);
+                             if (retryText.length > 0) {
+                                 return { ok: true, status: retry.status, text: retryText, url };
+                             }
+                         } catch (e) {
+                             log(`Retry failed: ${e.message}`);
+                         }
+                     }
+                     
+                     return { ok: false, status: response.status, text, url };
+                 }
+             } catch (e) {
+                 log(`Fetch error: ${e.message}`);
+                 return { ok: false, status: 0, text: '', url };
+             }
+        };
+
+        try {
+            let playerResponse = await getRobustPlayerResponse(log);
+            
+            if (!playerResponse || !playerResponse.captions) {
+                 throw new Error('No player response found in page context');
+            }
+            
+            // Helper to extract track URL from response
+            const getTrackUrl = (pr, lang, translate, translateLang) => {
+                const tracks = pr.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+                
+                // Log all available tracks for debugging
+                log(`Available tracks in playerResponse: ${tracks.length}`);
+                tracks.forEach((t, i) => {
+                    log(`Track #${i}: lang=${t.languageCode}, name=${t.name?.simpleText}, kind=${t.kind}, vssId=${t.vssId}`);
+                });
+
+                let t;
+                if (lang === 'auto') {
+                    t = tracks.find(x => x.languageCode === 'en') || tracks[0];
+                } else {
+                    t = tracks.find(x => x.languageCode === lang);
+                }
+                if (!t) {
+                    log(`No track found for lang=${lang}. Picking first available.`);
+                    t = tracks[0];
+                }
+                if (!t) return null;
+                
+                log(`Selected track: lang=${t.languageCode}, kind=${t.kind}, baseUrl=${t.baseUrl.substring(0, 50)}...`);
+
+                let u = t.baseUrl;
+                if (translate && translateLang) {
+                    u += `&tlang=${translateLang}`;
+                }
+                
+                // Check expiration
+                const expireMatch = u.match(/expire=(\d+)/);
+                if (expireMatch) {
+                    const expireTime = parseInt(expireMatch[1], 10);
+                    const now = Math.floor(Date.now() / 1000);
+                    const diff = expireTime - now;
+                    log(`URL Expire: ${expireTime} (Now: ${now}, Diff: ${diff}s)`);
+                }
+                
+                return u;
+            };
+
+            let url = getTrackUrl(playerResponse, msg.lang, msg.translate, msg.translateLang);
+            if (!url) throw new Error('Track not found');
+            
+            let fetchResult = await tryFetchTranscript(url);
+            
+            // If empty, try to refresh playerResponse
+            if (!fetchResult.text || fetchResult.text.trim().length === 0) {
+                log('Empty response. forcing refresh of playerResponse via page fetch...');
+                playerResponse = await getRobustPlayerResponse(log, true); // Force refresh
+                
+                if (playerResponse && playerResponse.captions) {
+                    const newUrl = getTrackUrl(playerResponse, msg.lang, msg.translate, msg.translateLang);
+                    if (newUrl && newUrl !== url) {
+                        log('Got new URL from fresh page data. Retrying fetch...');
+                        fetchResult = await tryFetchTranscript(newUrl);
+                        fetchResult.url = newUrl;
+                    } else {
+                         log('Fresh page data yielded same URL or no URL. Retrying original URL with json3...');
+                    }
+                }
+            }
+
+            let xmlText = fetchResult.text;
+            
+            // Retry with json3 if XML failed/empty
+            if (!xmlText || xmlText.trim().length === 0) {
+                 log(`XML body empty. Retrying with fmt=json3...`);
+                 
+                 // If we have a fresh URL from refresh, use it. Otherwise use original.
+                 // Note: tryFetchTranscript updates 'fetchResult' but not 'url' variable.
+                 // We should check if fetchResult has a new URL.
+                 let urlToUse = fetchResult.url || url;
+                 
+                 let jsonUrl = urlToUse;
+                 if (jsonUrl.includes('fmt=')) {
+                    jsonUrl = jsonUrl.replace(/fmt=[^&]+/, 'fmt=json3');
+                 } else {
+                    jsonUrl += '&fmt=json3';
+                 }
+                 
+                 log(`Fetching JSON3 from: ${jsonUrl}`);
+                 try {
+                     const jsonResp = await fetch(jsonUrl, { credentials: 'include' });
+                     const jsonText = await jsonResp.text();
+                     log(`JSON3 Response Status: ${jsonResp.status} ${jsonResp.statusText}`);
+                     
+                     if (jsonText && jsonText.trim().length > 0) {
+                         // Log preview of JSON3 response for debugging
+                         log(`JSON3 Body Preview (first 500 chars): ${jsonText.substring(0, 500)}`);
+                         
+                         try {
+                             const json = JSON.parse(jsonText);
+                             const events = json.events;
+                             if (events) {
+                                 const segments = events
+                                    .filter(e => e.segs)
+                                    .map(e => ({
+                                        start: (e.tStartMs || 0) / 1000,
+                                        duration: (e.dDurationMs || 0) / 1000,
+                                        text: e.segs.map(s => s.utf8 || '').join('')
+                                    }))
+                                    .filter(e => e.text.trim().length > 0);
+
+                                 log(`Parsed ${segments.length} segments from JSON3.`);
+                                 sendResponse({ success: true, result: segments, logs });
+                                 return;
+                             } else {
+                                 log('JSON3 parsed but no events found.');
+                             }
+                         } catch (e) {
+                             log(`JSON3 parse failed: ${e.message}`);
+                         }
+                     } else {
+                         log('JSON3 response body is empty.');
+                     }
+                 } catch (e) {
+                     log(`JSON3 fetch failed: ${e.message}`);
+                 }
+
+                 // Try VTT if JSON3 failed
+                 let vttUrl = urlToUse;
+                 if (vttUrl.includes('fmt=')) {
+                    vttUrl = vttUrl.replace(/fmt=[^&]+/, 'fmt=vtt');
+                 } else {
+                    vttUrl += '&fmt=vtt';
+                 }
+                 
+                 log(`Fetching VTT from: ${vttUrl}`);
+                 try {
+                     const vttResp = await fetch(vttUrl);
+                     const vttText = await vttResp.text();
+                     log(`VTT Response Status: ${vttResp.status}`);
+                     
+                     if (vttText && vttText.trim().length > 0 && vttText.includes('WEBVTT')) {
+                         log(`VTT Body Preview: ${vttText.substring(0, 200)}`);
+                         // Simple VTT parser
+                         const lines = vttText.split('\n');
+                         const segments = [];
+                         let currentStart = 0;
+                         let currentDur = 0;
+                         let currentText = [];
+                         
+                         for (let line of lines) {
+                             line = line.trim();
+                             if (!line) continue;
+                             if (line === 'WEBVTT') continue;
+                             
+                             // Timestamp line: 00:00:00.000 --> 00:00:05.000
+                             const timeMatch = line.match(/(\d{2}:\d{2}:\d{2}\.\d{3})\s-->\s(\d{2}:\d{2}:\d{2}\.\d{3})/);
+                             if (timeMatch) {
+                                 if (currentText.length > 0) {
+                                     segments.push({
+                                         start: currentStart,
+                                         duration: currentDur,
+                                         text: currentText.join(' ')
+                                     });
+                                     currentText = [];
+                                 }
+                                 
+                                 const parseTime = (t) => {
+                                     const parts = t.split(':');
+                                     return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+                                 };
+                                 
+                                 currentStart = parseTime(timeMatch[1]);
+                                 const end = parseTime(timeMatch[2]);
+                                 currentDur = end - currentStart;
+                             } else if (!line.match(/^\d+$/)) {
+                                 // Text line (skip cue numbers)
+                                 currentText.push(line);
+                             }
+                         }
+                         
+                         if (currentText.length > 0) {
+                              segments.push({
+                                  start: currentStart,
+                                  duration: currentDur,
+                                  text: currentText.join(' ')
+                              });
+                         }
+                         
+                         if (segments.length > 0) {
+                    log(`Parsed ${segments.length} segments from VTT.`);
+                    sendResponse({ success: true, result: segments, logs });
+                    return;
+                }
+            }
+        } catch (e) {
+            log(`VTT fetch failed: ${e.message}`);
+        }
+        
+        // Try SRV3 (XML-based but different)
+        let srv3Url = urlToUse.replace(/fmt=[^&]+/, '') + '&fmt=srv3';
+        log(`Fetching SRV3 from: ${srv3Url}`);
+        try {
+            const srv3Resp = await fetch(srv3Url);
+            const srv3Text = await srv3Resp.text();
+            log(`SRV3 Response Status: ${srv3Resp.status}, Len: ${srv3Text.length}`);
+            if (srv3Text.length > 0 && srv3Text.includes('<text')) {
+                // Parse SRV3 (similar to XML)
+                 const parser = new DOMParser();
+                 const xmlDoc = parser.parseFromString(srv3Text, "text/xml");
+                 const texts = xmlDoc.getElementsByTagName('text');
+                 const segs = [];
+                 for (let i = 0; i < texts.length; i++) {
+                     const node = texts[i];
+                     const start = parseFloat(node.getAttribute('start') || node.getAttribute('t') / 1000);
+                     const dur = parseFloat(node.getAttribute('dur') || node.getAttribute('d') / 1000);
+                     let text = node.textContent;
+                     if (text) segs.push({ start, duration: dur, text });
+                 }
+                 if (segs.length > 0) {
+                     log(`Parsed ${segs.length} segments from SRV3.`);
+                     sendResponse({ success: true, result: segs, logs });
+                     return;
+                 }
+            }
+        } catch(e) { log(`SRV3 fetch failed: ${e.message}`); }
+
+        // Last resort: Clean URL (no signature) with credentials
+        // This fixes cases where the signed URL from playerResponse is broken/IP-bound
+        log(`[Tier 4] SRV3 empty. Trying Clean URL fallback...`);
+        try {
+            const vMatch = urlToUse.match(/[?&]v=([^&]+)/);
+            const langMatch = urlToUse.match(/[?&]lang=([^&]+)/);
+            
+            if (vMatch && langMatch) {
+                let cleanUrl = `https://www.youtube.com/api/timedtext?v=${vMatch[1]}&lang=${langMatch[1]}&fmt=json3`;
+                const tlangMatch = urlToUse.match(/[?&]tlang=([^&]+)/);
+                if (tlangMatch) cleanUrl += `&tlang=${tlangMatch[1]}`;
+                const kindMatch = urlToUse.match(/[?&]kind=([^&]+)/);
+                if (kindMatch) cleanUrl += `&kind=${kindMatch[1]}`;
+
+                log(`[Tier 4] Fetching Clean URL (JSON3): ${cleanUrl}`);
+                let cleanResp = await fetch(cleanUrl, { credentials: 'include' });
+                let cleanText = await cleanResp.text();
+                
+                // If JSON3 fails, try VTT
+                if (!cleanText || cleanText.trim().length === 0) {
+                     log(`[Tier 4] JSON3 clean fetch empty. Trying VTT...`);
+                     let vttUrl = cleanUrl.replace('fmt=json3', 'fmt=vtt');
+                     cleanResp = await fetch(vttUrl, { credentials: 'include' });
+                     cleanText = await cleanResp.text();
+                     if (cleanText && cleanText.includes('WEBVTT')) {
+                         log(`[Tier 4] VTT Clean fetch successful.`);
+                         // Parse VTT simply
+                         const lines = cleanText.split('\n');
+                         const segs = [];
+                         let currentStart = 0;
+                         let currentText = '';
+                         
+                         for (let i = 0; i < lines.length; i++) {
+                             const line = lines[i].trim();
+                             if (line.includes('-->')) {
+                                 const parts = line.split('-->');
+                                 const startParts = parts[0].trim().split(':');
+                                 const endParts = parts[1].trim().split(':');
+                                 
+                                 const parseTime = (t) => {
+                                     const p = t.split('.');
+                                     const sms = parseFloat('0.' + (p[1] || '0'));
+                                     const hms = p[0].split(':').map(Number);
+                                     let seconds = 0;
+                                     if (hms.length === 3) seconds = hms[0]*3600 + hms[1]*60 + hms[2];
+                                     else if (hms.length === 2) seconds = hms[0]*60 + hms[1];
+                                     return seconds + sms;
+                                 };
+                                 
+                                 if (currentText) {
+                                     segs.push({ start: currentStart, duration: 0, text: currentText.trim() }); // Duration approx
+                                     currentText = '';
+                                 }
+                                 currentStart = parseTime(parts[0].trim());
+                             } else if (line && !line.includes('WEBVTT') && isNaN(line)) {
+                                 currentText += line + ' ';
+                             }
+                         }
+                         if (currentText) segs.push({ start: currentStart, duration: 0, text: currentText.trim() });
+                         
+                         if (segs.length > 0) {
+                             sendResponse({ success: true, result: segs, logs });
+                             return;
+                         }
+                     }
+                }
+
+                if (cleanText && cleanText.trim().length > 0) {
+                    try {
+                        const json = JSON.parse(cleanText);
+                        if (json.events) {
+                            const segments = json.events
+                               .filter(e => e.segs)
+                               .map(e => ({
+                                   start: (e.tStartMs || 0) / 1000,
+                                   duration: (e.dDurationMs || 0) / 1000,
+                                   text: e.segs.map(s => s.utf8 || '').join('')
+                               }))
+                               .filter(e => e.text.trim().length > 0);
+                            
+                            if (segments.length > 0) {
+                                log(`Parsed ${segments.length} segments from Clean URL.`);
+                                sendResponse({ success: true, result: segments, logs });
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        log(`Clean URL JSON3 parse failed: ${e.message}`);
+                    }
+                } else {
+                    log(`Clean URL returned empty body.`);
+                }
+            }
+        } catch (e) {
+            log(`Clean URL fetch failed: ${e.message}`);
+        }
+
+        // If all local attempts failed, return URL to background can try
+        if (urlToUse) {
+            log(`Returning URL to background for fallback fetch. URL: ${urlToUse}`);
+            log(`DEBUG: Try opening this URL in a new tab to see if it works: ${urlToUse}`);
+            sendResponse({ success: false, error: 'Empty response from YouTube (XML, JSON3, VTT, SRV3)', url: urlToUse, logs });
+            return;
+        } else {
+                     log('No URL available for fallback.');
+                 }
+
+                 throw new Error('Empty response from YouTube (XML and JSON3)');
+            }
+            
+            // Parse XML
+            const parser = new DOMParser();
+            const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+            const texts = xmlDoc.getElementsByTagName('text');
+            
+            const segments = [];
+            for (let i = 0; i < texts.length; i++) {
+                const node = texts[i];
+                const start = parseFloat(node.getAttribute('start'));
+                const dur = parseFloat(node.getAttribute('dur'));
+                let text = node.textContent;
+                
+                if (text) {
+                    segments.push({
+                        start,
+                        duration: dur,
+                        text: text
+                    });
+                }
+            }
+            
+            if (segments.length === 0) {
+                 log('XML parsed 0 segments. XML Content snippet: ' + xmlText.substring(0, 200));
+            }
+
+            log(`Parsed ${segments.length} segments.`);
+            sendResponse({ success: true, result: segments, logs });
+            
+        } catch (err) {
+            sendResponse({ success: false, error: err.message, logs });
+        }
+    })();
+    return true;
+  }
 });
 
+// Helper to inject script and get variable from page context
+function getPageVariable(variableName) {
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    const requestId = Math.random().toString(36).substring(7);
+    
+    const listener = (event) => {
+      if (event.source === window && 
+          event.data.type === 'PAGE_VARIABLE_RESULT' && 
+          event.data.requestId === requestId) {
+        window.removeEventListener('message', listener);
+        resolve(event.data.value);
+      }
+    };
+    window.addEventListener('message', listener);
+
+    script.textContent = `
+      (function() {
+        try {
+          const value = window['${variableName}'];
+          window.postMessage({
+            type: 'PAGE_VARIABLE_RESULT',
+            requestId: '${requestId}',
+            value: value
+          }, '*');
+        } catch (e) {
+          window.postMessage({
+            type: 'PAGE_VARIABLE_RESULT',
+            requestId: '${requestId}',
+            value: null,
+            error: e.message
+          }, '*');
+        }
+      })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+    
+    setTimeout(() => {
+        window.removeEventListener('message', listener);
+        resolve(null);
+    }, 1000);
+  });
+}
+
 // Helper to get player response from page context
+async function getRobustPlayerResponse(log, forceRefresh = false) {
+    let playerResponse = null;
+
+    if (!forceRefresh) {
+        log('Attempting to get ytInitialPlayerResponse from window...');
+        playerResponse = await getPageVariable('ytInitialPlayerResponse');
+
+        if (playerResponse) {
+            try {
+                // Check if playerResponse is valid
+                if (!playerResponse.captions) {
+                     log('ytInitialPlayerResponse found but no captions object. Force refresh?');
+                     // If it's empty, maybe we need to fetch the page again
+                     playerResponse = null;
+                }
+            } catch (e) { log('Error checking ytInitialPlayerResponse:', e); }
+        }
+        
+        if (!playerResponse) {
+             log('Window variable missing. Scanning DOM scripts...');
+             playerResponse = await getPlayerResponse();
+        }
+    } else {
+        log('Skipping window/DOM scan due to forceRefresh.');
+    }
+    
+    // If still missing or forced refresh, try to fetch the page using current session (Tier 2 style but manually)
+    // This is useful if the variable was cleared but we can re-fetch the page with cookies.
+    if (!playerResponse || forceRefresh) {
+         log('Fetching page via content script (with cookies)...');
+         try {
+             const resp = await fetch(window.location.href);
+             const text = await resp.text();
+             const match = text.match(/ytInitialPlayerResponse\s*=\s*({.+?});/);
+             if (match) {
+                 playerResponse = JSON.parse(match[1]);
+                 log('Successfully extracted from fetched page.');
+             } else {
+                 log('Fetched page but could not find ytInitialPlayerResponse.');
+             }
+         } catch (fetchErr) {
+             log(`Fetch failed: ${fetchErr.message}`);
+         }
+    }
+    return playerResponse;
+}
+
 function getPlayerResponse() {
     try {
         // Try to find the script tag containing ytInitialPlayerResponse

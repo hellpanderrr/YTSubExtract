@@ -4,7 +4,7 @@ import striptags from 'striptags';
 // Universal logger
 const createLogger = (namespace) => {
   return (message, ...args) => {
-    // console.log(`[${namespace}] ${message}`, ...args);
+    console.log(`[${namespace}] ${message}`, ...args);
   };
 };
 
@@ -17,31 +17,38 @@ const INNERTUBE_CONFIG = {
   CLIENT: {
     WEB: {
       NAME: 'WEB',
-      VERSION: '2.20260115.00.00', // Updated to 2026
+      VERSION: '2.20230628.00.00',
     },
     ANDROID: {
       NAME: 'ANDROID',
-      VERSION: '19.35.36',
+      VERSION: '19.29.35',
     },
+    IOS: {
+      NAME: 'IOS',
+      VERSION: '19.45.4',
+    }
   },
 };
 
 // Generate proper session data
-function generateSessionData() {
+function generateSessionData(clientType = 'ANDROID') {
   const visitorData = generateVisitorData();
+  
+  const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
 
   return {
     context: {
       client: {
         hl: 'en',
         gl: 'US',
-        clientName: INNERTUBE_CONFIG.CLIENT.ANDROID.NAME,
-        clientVersion: INNERTUBE_CONFIG.CLIENT.ANDROID.VERSION,
+        clientName: clientConfig.NAME,
+        clientVersion: clientConfig.VERSION,
         visitorData,
-        androidSdkVersion: 30
+        ...(clientType === 'ANDROID' ? { androidSdkVersion: 34 } : {}),
+        ...(clientType === 'IOS' ? { osName: 'iOS', osVersion: '17.5.1.21F90', deviceMake: 'Apple', deviceModel: 'iPhone14,5' } : {})
       },
       user: {
-        enableSafetyMode: false,
+        lockedSafetyMode: false,
       },
       request: {
         useSsl: true,
@@ -84,53 +91,54 @@ async function fetchInnerTube(endpoint, data) {
 }
 
 async function getVideoInfo(videoID) {
-  const sessionData = generateSessionData();
+  const sessionData = generateSessionData('ANDROID');
 
   const payload = {
-    ...sessionData,
+    context: sessionData.context,
     videoId: videoID,
     playbackContext: {
-      contentPlaybackContext: {
-        vis: 0,
-        splay: false,
-        lactMilliseconds: '-1',
-      },
-    },
-    racyCheckOk: true,
-    contentCheckOk: true,
+        contentPlaybackContext: {
+            signatureTimestamp: 19894 // Standard valid timestamp
+        }
+    }
   };
 
   const response = await fetchInnerTube('/player', payload);
-
   if (!response.ok) {
-    throw new Error(
-      `Player API failed: ${response.status} ${response.statusText}`
-    );
+      throw new Error(`InnerTube API failed with status: ${response.status}`);
   }
 
-  const playerData = await response.json();
+  const data = await response.json();
 
-  if (playerData.playabilityStatus?.status === 'LOGIN_REQUIRED') {
-    debug(` LOGIN_REQUIRED status, trying next endpoint`);
+  // If no captions in Android, try iOS
+  if (!data?.captions?.playerCaptionsTracklistRenderer?.captionTracks && 
+      !data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks) {
+        
+        debug('Android client returned no captions. Trying iOS client...');
+        const iosSession = generateSessionData('IOS');
+        const iosPayload = {
+            context: iosSession.context,
+            videoId: videoID,
+            playbackContext: {
+                contentPlaybackContext: {
+                    signatureTimestamp: 19894
+                }
+            }
+        };
 
-    const nextPayload = {
-      ...sessionData,
-      videoId: videoID,
-    };
-
-    const nextResponse = await fetchInnerTube('/next', nextPayload);
-
-    if (!nextResponse.ok) {
-      throw new Error(
-        `Next API failed: ${nextResponse.status} ${nextResponse.statusText}`
-      );
-    }
-
-    const nextData = await nextResponse.json();
-    return { playerData, nextData };
+        const iosResponse = await fetchInnerTube('/player', iosPayload);
+        if (iosResponse.ok) {
+            const iosData = await iosResponse.json();
+            if (iosData?.captions?.playerCaptionsTracklistRenderer?.captionTracks) {
+                debug('iOS client found captions!');
+                return iosData;
+            } else {
+                debug('iOS client also returned no captions.');
+            }
+        }
   }
 
-  return { playerData, nextData: null };
+  return data;
 }
 
 async function getTranscriptFromEngagementPanel(videoID, nextData) {
@@ -349,53 +357,126 @@ function extractSubtitlesFromXML(transcript, startRegex, durRegex) {
     }, []);
 }
 
-export const getLanguages = async (videoID) => {
+export async function getLanguages(videoId) {
   try {
-    const { playerData } = await getVideoInfo(videoID);
-    const title = playerData?.videoDetails?.title || 'Unknown Video';
-    const captionTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    const data = await getVideoInfo(videoId);
+    
+    // Check for captions in player response
+    const playerCaptions = data?.captions?.playerCaptionsTracklistRenderer;
+    let captionTracks = playerCaptions?.captionTracks;
 
-    if (!captionTracks || !Array.isArray(captionTracks)) {
-      return { languages: [], title };
+    if (!captionTracks) {
+        debug(`[getLanguages] No captionTracks in playerCaptionsTracklistRenderer. Keys: ${Object.keys(data?.captions || {}).join(', ')}`);
+    } else {
+        debug(`[getLanguages] Found ${captionTracks.length} tracks in standard location.`);
+    }
+    
+    // Fallback: Check inside playerOverlays (common in Android/Mobile)
+    if (!captionTracks) {
+        const playerOverlay = data?.playerOverlays?.playerOverlayRenderer;
+        if (playerOverlay) {
+             const payload = playerOverlay.playerOverlayPayload || playerOverlay;
+             if (payload.playerOverlayCaptionRenderer) {
+                 captionTracks = payload.playerOverlayCaptionRenderer.captionTracks;
+                 debug(`[getLanguages] Found ${captionTracks.length} tracks in playerOverlay.`);
+             } else {
+                 debug(`[getLanguages] playerOverlay present but no caption renderer. Keys: ${Object.keys(payload).join(', ')}`);
+             }
+        } else {
+             debug(`[getLanguages] No playerOverlayRenderer found.`);
+        }
     }
 
-    const languages = captionTracks.map(track => ({
-      languageCode: track.languageCode,
-      languageName: track.name?.simpleText || track.name?.runs?.[0]?.text || track.languageCode,
-      kind: track.kind,
-      vssId: track.vssId
-    }));
+    if (captionTracks) {
+        return {
+            languages: captionTracks.map(track => {
+                const langCode = track.languageCode;
+                const langName = track.name?.simpleText || track.name?.runs?.[0]?.text || langCode;
+                return {
+                    languageCode: langCode,
+                    languageName: langName,
+                    kind: track.kind
+                };
+            }),
+            title: data.videoDetails?.title
+        };
+    }
 
-    return { languages, title };
-  } catch (error) {
-    debug('Error getting languages:', error);
-    return { languages: [], title: 'Error' };
+    return { languages: [], title: null };
+  } catch (err) {
+    debug('Error fetching languages', err);
+    throw err;
   }
-};
+}
 
 export const getSubtitles = async ({ videoID, lang = 'en', translate, translateLang }) => {
   try {
-    const { playerData, nextData } = await getVideoInfo(videoID);
+    const data = await getVideoInfo(videoID);
+    
+    // Check for captions in player response
+    let captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
 
-    // Try transcript API first ONLY if not translating (as we don't handle translation there yet)
-    if (nextData && !translate) {
-      try {
-        const subtitles = await getTranscriptFromEngagementPanel(
-          videoID,
-          nextData
-        );
-        if (subtitles.length > 0) {
-          return subtitles;
+    if (!captionTracks) {
+    // Fallback: Check inside playerOverlays (common in Android/Mobile)
+    const playerOverlay = data?.playerOverlays?.playerOverlayRenderer;
+    if (playerOverlay) {
+        const payload = playerOverlay.playerOverlayPayload || playerOverlay;
+        if (payload.playerOverlayCaptionRenderer) {
+            captionTracks = payload.playerOverlayCaptionRenderer.captionTracks;
         }
-      } catch (error) {
-        debug('Transcript API failed:', error.message);
-      }
+    }
+  }
+
+  // Fallback for iOS structure
+  if (!captionTracks && data?.captions?.playerCaptionsTracklistRenderer?.captionTracks) {
+      captionTracks = data.captions.playerCaptionsTracklistRenderer.captionTracks;
+  }
+
+  if (!captionTracks || !Array.isArray(captionTracks)) {
+    debug('No caption tracks found in response keys:', Object.keys(data));
+    if (data.playabilityStatus) {
+        debug('Playability Status:', data.playabilityStatus.status);
+    }
+    throw new Error('No captions found');
+  }
+
+    let track;
+    if (lang === 'auto') {
+        track = captionTracks[0];
+    } else {
+        track = captionTracks.find((t) => t.languageCode === lang);
     }
 
-    // Fallback to captions (supports translation via &tlang)
-    return await getSubtitlesFromCaptions(videoID, playerData, lang, { translate, targetLang: translateLang });
-  } catch (error) {
-    debug('Error getting subtitles:', error);
-    throw error;
-  }
+    if (!track) {
+        throw new Error(`Language ${lang} not found`);
+    }
+
+    let url = track.baseUrl;
+    if (translate && translateLang) {
+        url += `&tlang=${translateLang}`;
+    }
+
+    const response = await fetch(url);
+    const xml = await response.text();
+    
+    // Parse XML to segments...
+     // Chrome Service Workers do not have DOMParser. We need a simple XML parser or regex.
+     
+     const segments = [];
+     const regex = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+     let match;
+     while ((match = regex.exec(xml)) !== null) {
+         segments.push({
+             start: parseFloat(match[1]),
+             duration: parseFloat(match[2]),
+             text: he.decode(match[3])
+         });
+     }
+     
+     return segments;
+
+   } catch (err) {
+       debug('Error getting subtitles:', err);
+       throw err;
+   }
 };
