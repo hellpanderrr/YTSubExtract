@@ -22,10 +22,20 @@ const INNERTUBE_CONFIG = {
     ANDROID: {
       NAME: 'ANDROID',
       VERSION: '19.29.35',
+      USER_AGENT: 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
+      CLIENT_ID: '3',
     },
     IOS: {
       NAME: 'IOS',
       VERSION: '19.45.4',
+      USER_AGENT: 'com.google.ios.youtube/19.45.4 (iPhone14,5; iOS 17.5.1; scale/3.00)',
+      CLIENT_ID: '5',
+    },
+    TVHTML5: {
+      NAME: 'TVHTML5',
+      VERSION: '7.20250224.08.01',
+      USER_AGENT: 'Mozilla/5.0 (Chromecast; GoogleTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.0 Safari/537.36',
+      CLIENT_ID: '7',
     }
   },
 };
@@ -36,16 +46,31 @@ function generateSessionData(clientType = 'ANDROID') {
   
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
 
+  // Base client properties
+  const baseClient = {
+    hl: 'en',
+    gl: 'US',
+    clientName: clientConfig.NAME,
+    clientVersion: clientConfig.VERSION,
+    visitorData,
+  };
+
+  // Client-specific additions
+  const clientAdditions = {
+    ANDROID: { androidSdkVersion: 34 },
+    IOS: { osName: 'iOS', osVersion: '17.5.1.21F90', deviceMake: 'Apple', deviceModel: 'iPhone14,5' },
+    TVHTML5: { 
+      tvAppInfo: { appQuality: 'LARGE' },
+      clientScreen: 'WATCH'
+    },
+    WEB: {}
+  };
+
   return {
     context: {
       client: {
-        hl: 'en',
-        gl: 'US',
-        clientName: clientConfig.NAME,
-        clientVersion: clientConfig.VERSION,
-        visitorData,
-        ...(clientType === 'ANDROID' ? { androidSdkVersion: 34 } : {}),
-        ...(clientType === 'IOS' ? { osName: 'iOS', osVersion: '17.5.1.21F90', deviceMake: 'Apple', deviceModel: 'iPhone14,5' } : {})
+        ...baseClient,
+        ...(clientAdditions[clientType] || {})
       },
       user: {
         lockedSafetyMode: false,
@@ -67,21 +92,29 @@ function generateVisitorData() {
   return result;
 }
 
-async function fetchInnerTube(endpoint, data) {
+async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
+  const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
+  
   const headers = {
     'Content-Type': 'application/json',
     Accept: '*/*',
-    'User-Agent': 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
-    'X-Youtube-Client-Version': INNERTUBE_CONFIG.CLIENT.ANDROID.VERSION,
-    'X-Youtube-Client-Name': '3', // ANDROID client ID is 3
+    'X-Youtube-Client-Version': clientConfig.VERSION,
+    'X-Youtube-Client-Name': clientConfig.CLIENT_ID || '3',
     'X-Goog-Visitor-Id': data.visitorData,
     Origin: 'https://www.youtube.com',
     Referer: 'https://www.youtube.com/',
   };
 
+  // Set User-Agent based on client type
+  if (clientConfig.USER_AGENT) {
+    headers['User-Agent'] = clientConfig.USER_AGENT;
+  } else {
+    headers['User-Agent'] = 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)';
+  }
+
   const url = `${INNERTUBE_CONFIG.API_BASE}${endpoint}?key=${INNERTUBE_CONFIG.API_KEY}`;
 
-  debug(`Calling InnerTube endpoint: ${endpoint}`);
+  debug(`Calling InnerTube endpoint: ${endpoint} with client: ${clientType}`);
 
   return await fetch(url, {
     method: 'POST',
@@ -91,11 +124,15 @@ async function fetchInnerTube(endpoint, data) {
 }
 
 async function getVideoInfo(videoID) {
+  // Try Android client first
   const sessionData = generateSessionData('ANDROID');
 
   const payload = {
     context: sessionData.context,
     videoId: videoID,
+    // NEW: Add these flags for guest mode support
+    contentCheckOk: true,
+    racyCheckOk: true,
     playbackContext: {
         contentPlaybackContext: {
             signatureTimestamp: 19894 // Standard valid timestamp
@@ -103,39 +140,83 @@ async function getVideoInfo(videoID) {
     }
   };
 
-  const response = await fetchInnerTube('/player', payload);
+  const response = await fetchInnerTube('/player', payload, 'ANDROID');
   if (!response.ok) {
       throw new Error(`InnerTube API failed with status: ${response.status}`);
   }
 
-  const data = await response.json();
+  let data = await response.json();
 
-  // If no captions in Android, try iOS
-  if (!data?.captions?.playerCaptionsTracklistRenderer?.captionTracks && 
-      !data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks) {
-        
-        debug('Android client returned no captions. Trying iOS client...');
-        const iosSession = generateSessionData('IOS');
-        const iosPayload = {
-            context: iosSession.context,
-            videoId: videoID,
-            playbackContext: {
-                contentPlaybackContext: {
-                    signatureTimestamp: 19894
-                }
-            }
-        };
+  // Helper to check if we have captions
+  const hasCaptions = (d) => d?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length > 0;
+  const hasOverlayCaptions = (d) => d?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks?.length > 0;
+  const getPlayabilityStatus = (d) => d?.playabilityStatus?.status;
+  
+  // Check for captions in Android response
+  if (hasCaptions(data) || hasOverlayCaptions(data)) {
+    debug('Android client found captions!');
+    return data;
+  }
 
-        const iosResponse = await fetchInnerTube('/player', iosPayload);
-        if (iosResponse.ok) {
-            const iosData = await iosResponse.json();
-            if (iosData?.captions?.playerCaptionsTracklistRenderer?.captionTracks) {
-                debug('iOS client found captions!');
-                return iosData;
-            } else {
-                debug('iOS client also returned no captions.');
-            }
-        }
+  const playabilityStatus = getPlayabilityStatus(data);
+  debug(`Android client playability: ${playabilityStatus}`);
+
+  // Try iOS client
+  debug('Android client returned no captions. Trying iOS client...');
+  const iosSession = generateSessionData('IOS');
+  const iosPayload = {
+      context: iosSession.context,
+      videoId: videoID,
+      // NEW: Add these flags for guest mode support
+      contentCheckOk: true,
+      racyCheckOk: true,
+      playbackContext: {
+          contentPlaybackContext: {
+              signatureTimestamp: 19894
+          }
+      }
+  };
+
+  const iosResponse = await fetchInnerTube('/player', iosPayload, 'IOS');
+  if (iosResponse.ok) {
+      const iosData = await iosResponse.json();
+      if (hasCaptions(iosData) || hasOverlayCaptions(iosData)) {
+          debug('iOS client found captions!');
+          return iosData;
+      }
+      debug(`iOS client playability: ${getPlayabilityStatus(iosData)}`);
+  }
+
+  // NEW: Try TVHTML5 client for age-restricted videos
+  debug('Trying TVHTML5 client for age-restricted video...');
+  
+  const tvSession = generateSessionData('TVHTML5');
+  const tvPayload = {
+      context: tvSession.context,
+      videoId: videoID,
+      contentCheckOk: true,
+      racyCheckOk: true
+  };
+
+  try {
+    const tvResponse = await fetchInnerTube('/player', tvPayload, 'TVHTML5');
+    if (tvResponse.ok) {
+      const tvData = await tvResponse.json();
+      const tvPlayability = getPlayabilityStatus(tvData);
+      
+      debug(`TVHTML5 playability: ${tvPlayability}`);
+      
+      if (hasCaptions(tvData) || hasOverlayCaptions(tvData)) {
+        debug('TVHTML5 client found captions! Age bypass successful.');
+        return tvData;
+      } else if (tvPlayability === 'OK' || tvPlayability === 'LIVE_STREAM_OFFLINE') {
+        // Video is playable but no captions
+        debug('TVHTML5: Video playable but no captions available');
+        return tvData;
+      }
+    }
+  } catch (tvErr) {
+    debug(`TVHTML5 client failed: ${tvErr.message}`);
   }
 
   return data;

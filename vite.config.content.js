@@ -9,9 +9,7 @@ export default defineConfig({
     target: 'esnext',
     minify: 'terser',
     rollupOptions: {
-      input: {
-        content: resolve(__dirname, 'src/content/content.js')
-      },
+      input: resolve(__dirname, 'src/content/content.js'),
       output: {
         format: 'iife',
         entryFileNames: 'content.js',

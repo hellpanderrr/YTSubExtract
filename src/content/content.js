@@ -3,7 +3,328 @@ import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/inde
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
 
+// === SNIFFER INTEGRATION ===
+// Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
+const capturedUrls = new Map();
+
+// Listen for messages from sniffer.js (MAIN world)
+window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    
+    if (event.data?.type === 'YTSUB_CAPTURED_URL') {
+        const { videoId, lang, url, timestamp } = event.data;
+        
+        if (!capturedUrls.has(videoId)) {
+            capturedUrls.set(videoId, new Map());
+        }
+        
+        capturedUrls.get(videoId).set(lang, { url, timestamp });
+        console.log(`[Content] Captured URL: video=${videoId}, lang=${lang}`);
+    }
+});
+
+// Check if URL is expired
+function isUrlExpired(url) {
+    const expireMatch = url.match(/expire=(\d+)/);
+    if (expireMatch) {
+        const expireTime = parseInt(expireMatch[1], 10);
+        const now = Math.floor(Date.now() / 1000);
+        return expireTime < now + 300; // 5 min buffer
+    }
+    return false;
+}
+
+// Get captured URL for video/lang
+function getCapturedUrl(videoId, lang) {
+    const videoUrls = capturedUrls.get(videoId);
+    if (!videoUrls) return null;
+    
+    // First try specific language
+    if (lang && lang !== 'auto') {
+        const entry = videoUrls.get(lang);
+        if (entry && !isUrlExpired(entry.url)) {
+            return entry.url;
+        }
+    }
+    
+    // Fallback: any available language
+    for (const [entryLang, entry] of videoUrls) {
+        if (!isUrlExpired(entry.url)) {
+            return entry.url;
+        }
+    }
+    
+    return null;
+}
+
+// Clean up expired URLs every minute
+setInterval(() => {
+    for (const [videoId, langMap] of capturedUrls) {
+        for (const [lang, entry] of langMap) {
+            if (isUrlExpired(entry.url)) {
+                langMap.delete(lang);
+            }
+        }
+        if (langMap.size === 0) {
+            capturedUrls.delete(videoId);
+        }
+    }
+}, 60000);
+
+// === MAIN WORLD FETCHER ===
+// Storage for pending Main World Fetch requests
+const mainWorldFetchPending = new Map();
+
+// Listen for responses from Main World Fetcher (sniffer.js)
+window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    
+    if (event.data?.type === 'MAIN_WORLD_FETCH_RESPONSE') {
+        const { requestId, success, status, statusText, body, error, url } = event.data;
+        
+        const pending = mainWorldFetchPending.get(requestId);
+        if (pending) {
+            mainWorldFetchPending.delete(requestId);
+            
+            if (success) {
+                pending.resolve({ status, statusText, body, url });
+            } else {
+                pending.reject(new Error(error || 'Main World Fetch failed'));
+            }
+        }
+    }
+});
+
+/**
+ * Fetch via MAIN world context
+ * Bypasses YouTube's empty response protection
+ * @param {string} url - URL to fetch
+ * @param {number} timeout - Timeout in ms (default 10000)
+ * @returns {Promise<{status: number, statusText: string, body: string, url: string}>}
+ */
+async function fetchViaMainWorld(url, timeout = 10000) {
+    const requestId = `mwf_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    
+    return new Promise((resolve, reject) => {
+        mainWorldFetchPending.set(requestId, { resolve, reject });
+        
+        window.postMessage({
+            type: 'REQUEST_MAIN_WORLD_FETCH',
+            url,
+            requestId
+        }, '*');
+        
+        setTimeout(() => {
+            if (mainWorldFetchPending.has(requestId)) {
+                mainWorldFetchPending.delete(requestId);
+                reject(new Error('Main World Fetch timeout'));
+            }
+        }, timeout);
+    });
+}
+
+// === FORCE CC TRIGGER ===
+/**
+ * Force toggle captions to trigger network requests
+ * Uses minimal intervals (100-200ms) to avoid visual flickering
+ * @param {number} cycles - Number of on/off cycles
+ * @param {number} intervalMs - Interval between actions in ms (default 150ms)
+ * @returns {Promise<boolean>} - Whether trigger succeeded
+ */
+async function forceTriggerCaptions(cycles = 3, intervalMs = 150) {
+    const log = (m) => console.log(`[ForceCC] ${m}`);
+    
+    try {
+        const player = document.getElementById('movie_player');
+        if (!player) {
+            log('movie_player not found');
+            return false;
+        }
+        
+        if (typeof player.toggleSubtitles !== 'function') {
+            log('toggleSubtitles API not available');
+            return false;
+        }
+        
+        log(`Starting silent trigger: ${cycles} cycles, ${intervalMs}ms interval`);
+        
+        for (let i = 0; i < cycles; i++) {
+            player.toggleSubtitles(true);
+            await new Promise(r => setTimeout(r, intervalMs));
+            
+            player.toggleSubtitles(false);
+            await new Promise(r => setTimeout(r, intervalMs));
+        }
+        
+        player.toggleSubtitles(false);
+        
+        log(`Trigger completed: ${cycles} cycles`);
+        return true;
+        
+    } catch (e) {
+        log(`Error: ${e.message}`);
+        return false;
+    }
+}
+
+/**
+ * Alternative trigger method via CC button
+ * Used when toggleSubtitles is not available
+ */
+async function forceTriggerCaptionsViaButton(cycles = 3, intervalMs = 150) {
+    const log = (m) => console.log(`[ForceCC-Button] ${m}`);
+    
+    try {
+        const ccButton = document.querySelector('.ytp-subtitles-button') || 
+                         document.querySelector('button[aria-label*="subtitles"]') ||
+                         document.querySelector('button[aria-label*="субтитры"]');
+        
+        if (!ccButton) {
+            log('CC button not found');
+            return false;
+        }
+        
+        log(`Starting button trigger: ${cycles} cycles, ${intervalMs}ms interval`);
+        
+        for (let i = 0; i < cycles; i++) {
+            ccButton.click();
+            await new Promise(r => setTimeout(r, intervalMs));
+            
+            ccButton.click();
+            await new Promise(r => setTimeout(r, intervalMs));
+        }
+        
+        log(`Button trigger completed: ${cycles} cycles`);
+        return true;
+        
+    } catch (e) {
+        log(`Error: ${e.message}`);
+        return false;
+    }
+}
+
+// === TIER 0.5: Player API ===
+// Gets captionTracks directly from movie_player (instant)
+function getPlayerCaptionTracks(videoId) {
+    const logs = [];
+    const log = (m) => logs.push(`[PlayerAPI] ${m}`);
+    
+    try {
+        // Try to find player by ID or class
+        const player = document.getElementById('movie_player') || 
+                       document.querySelector('.html5-video-player');
+        
+        if (!player) {
+            log('movie_player not found');
+            return { success: false, tracks: null, title: null, logs };
+        }
+        
+        if (typeof player.getPlayerResponse !== 'function') {
+            log('getPlayerResponse not available (player not ready)');
+            return { success: false, tracks: null, title: null, logs };
+        }
+        
+        const response = player.getPlayerResponse();
+        if (!response) {
+            log('Empty player response');
+            return { success: false, tracks: null, title: null, logs };
+        }
+        
+        // Validate videoId for SPA navigation
+        const currentVideoId = response.videoDetails?.videoId;
+        if (currentVideoId && currentVideoId !== videoId) {
+            log(`Video ID mismatch: expected ${videoId}, got ${currentVideoId}`);
+            return { success: false, tracks: null, title: null, logs };
+        }
+        
+        const tracks = response.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (!tracks || tracks.length === 0) {
+            log('No caption tracks in response');
+            return { success: false, tracks: null, title: null, logs };
+        }
+        
+        const title = response.videoDetails?.title || null;
+        log(`Found ${tracks.length} caption tracks, title: ${title}`);
+        return { success: true, tracks, title, logs };
+        
+    } catch (e) {
+        log(`Error: ${e.message}`);
+        return { success: false, tracks: null, title: null, logs };
+    }
+}
+
+// Tier 0.5 with retry - player may not be ready immediately
+async function getPlayerCaptionTracksWithRetry(videoId, maxRetries = 3, delayMs = 500) {
+    const allLogs = [];
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const result = getPlayerCaptionTracks(videoId);
+        allLogs.push(...result.logs);
+        
+        if (result.success) {
+            return { ...result, logs: allLogs };
+        }
+        
+        if (attempt < maxRetries) {
+            allLogs.push(`[PlayerAPI] Attempt ${attempt}/${maxRetries} failed, waiting ${delayMs}ms...`);
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+    }
+    
+    allLogs.push(`[PlayerAPI] All ${maxRetries} attempts failed`);
+    return { success: false, tracks: null, title: null, logs: allLogs };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // === TIER 0: Network Sniffer ===
+  if (msg.type === 'GET_CAPTURED_URL') {
+    const url = getCapturedUrl(msg.videoId, msg.lang);
+    sendResponse({ success: !!url, url });
+    return true;
+  }
+
+  // === TIER 0.5: Player API ===
+  if (msg.type === 'GET_PLAYER_TRACKS') {
+    (async () => {
+      const result = await getPlayerCaptionTracksWithRetry(msg.videoId, 3, 500);
+      sendResponse(result);
+    })();
+    return true;
+  }
+
+  // === MAIN WORLD FETCHER ===
+  if (msg.type === 'MAIN_WORLD_FETCH') {
+    (async () => {
+      try {
+        const result = await fetchViaMainWorld(msg.url, msg.timeout || 10000);
+        sendResponse({ success: true, ...result });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  // === FORCE CC TRIGGER ===
+  if (msg.type === 'FORCE_CC_TRIGGER') {
+    (async () => {
+      try {
+        // Try player API first
+        let success = await forceTriggerCaptions(msg.cycles || 3, msg.interval || 150);
+        
+        // Fallback to button click
+        if (!success) {
+          success = await forceTriggerCaptionsViaButton(msg.cycles || 3, msg.interval || 150);
+        }
+        
+        sendResponse({ success });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
   if (msg.type === 'GET_CAPTION_TRACKS') {
     getCaptionTracks(msg.videoId)
       .then(result => sendResponse({ success: true, ...result }))

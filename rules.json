@@ -6,7 +6,11 @@
       "type": "modifyHeaders",
       "requestHeaders": [
         { "header": "Origin", "operation": "set", "value": "https://www.youtube.com" },
-        { "header": "Referer", "operation": "set", "value": "https://www.youtube.com/" }
+        { "header": "Referer", "operation": "set", "value": "https://www.youtube.com/" },
+        { "header": "User-Agent", "operation": "set", "value": "com.google.android.youtube/19.29.35 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)" },
+        { "header": "Sec-Ch-Ua", "operation": "remove" },
+        { "header": "Sec-Ch-Ua-Mobile", "operation": "remove" },
+        { "header": "Sec-Ch-Ua-Platform", "operation": "remove" }
       ]
     },
     "condition": {
@@ -16,6 +20,20 @@
   },
   {
     "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "User-Agent", "operation": "set", "value": "com.google.android.youtube/19.29.35 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "timedtext",
+      "resourceTypes": ["xmlhttprequest", "other"]
+    }
+  },
+  {
+    "id": 3,
     "priority": 1,
     "action": {
       "type": "modifyHeaders",

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && vite build -c vite.config.content.js",
+    "build": "vite build && vite build -c vite.config.content.js && vite build -c vite.config.sniffer.js",
     "preview": "vite preview",
     "pack": "npm run build && node scripts/pack.cjs",
     "zip": "npm run build && node scripts/zip.cjs",
