@@ -3,6 +3,7 @@ import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
+const btnReset = document.getElementById('reset-btn');
 const langSelect = document.getElementById('lang-select');
 const btnSrt = document.getElementById('btn-srt');
 const btnVtt = document.getElementById('btn-vtt');
@@ -73,13 +74,15 @@ async function init() {
     if (url.hostname.includes('youtube.com') && url.searchParams.has('v')) {
       currentVideoId = url.searchParams.get('v');
       
-      if (tab.title) {
-        currentVideoTitle = tab.title.replace(/ - YouTube$/, '');
-      }
+      // Don't trust tab.title immediately as it might be stale from previous video
+      currentVideoTitle = 'Loading title...';
 
+      // Show reset button
+      btnReset.style.display = 'flex';
       setStatus(`Video found: ${currentVideoId}`);
       fetchLanguages(currentVideoId);
     } else {
+      btnReset.style.display = 'none';
       setStatus('Not a YouTube video page', 'error');
     }
   } catch (e) {
@@ -294,6 +297,40 @@ translateLang.addEventListener('change', saveSettings);
   }).catch(err => {
     console.error('Failed to copy logs: ', err);
   });
+});
+
+// Reset Button Logic
+btnReset.addEventListener('click', async () => {
+  if (!currentVideoId) return;
+  
+  // Animate button
+  const icon = btnReset.querySelector('svg');
+  icon.style.transition = 'transform 0.5s ease';
+  icon.style.transform = 'rotate(360deg)';
+  setTimeout(() => icon.style.transform = '', 500);
+
+  setStatus('Resetting cache...', 'info', true);
+  enableControls(false);
+  
+  try {
+    // 1. Clear cache in background
+    await chrome.runtime.sendMessage({
+      type: 'CLEAR_CACHE',
+      videoId: currentVideoId
+    });
+    
+    // 2. Clear local state
+    currentVideoTitle = null;
+    currentTranscript = null;
+    langSelect.innerHTML = '<option disabled selected>Reloading...</option>';
+    
+    // 3. Re-fetch languages (force refresh)
+    await fetchLanguages(currentVideoId);
+    
+  } catch (e) {
+    setStatus('Reset failed: ' + e.message, 'error');
+    console.error(e);
+  }
 });
 
 // Initialize

@@ -14,6 +14,27 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Cache Management
+  // ─────────────────────────────────────────────────────────────
+  clearCache(videoId) {
+    if (videoId) {
+      // Clear metadata
+      this.cache.delete(`metadata:${videoId}`);
+      
+      // Clear transcripts for this video
+      for (const key of this.cache.keys()) {
+        if (key.startsWith(`transcript:${videoId}`)) {
+          this.cache.delete(key);
+        }
+      }
+      console.log(`[TranslationManager] Cleared cache for ${videoId}`);
+    } else {
+      this.cache.clear();
+      console.log('[TranslationManager] Cleared all cache');
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // Get Video Metadata (Languages + Title)
   // ─────────────────────────────────────────────────────────────
   async getMetadata(videoId) {

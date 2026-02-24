@@ -49,7 +49,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 3. Clear Cache (Optional)
   if (request.type === 'CLEAR_CACHE') {
-    translationManager.clearCache();
+    translationManager.clearCache(request.videoId);
     sendResponse({ success: true });
     return true;
   }

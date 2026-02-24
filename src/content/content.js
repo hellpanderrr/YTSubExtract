@@ -96,7 +96,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const logs = [];
         const log = (m) => logs.push(`[Content] ${m}`);
         try {
-            const playerResponse = await getRobustPlayerResponse(log);
+            let playerResponse = await getRobustPlayerResponse(log);
+
+            // Validate video ID against requested videoId
+            if (playerResponse && playerResponse.videoDetails?.videoId !== msg.videoId) {
+                 log(`[Content] Stale playerResponse found for videoId=${playerResponse.videoDetails?.videoId}. Expected=${msg.videoId}. Forcing refresh...`);
+                 playerResponse = await getRobustPlayerResponse(log, true);
+            }
+
+            // Re-validate after refresh
+            if (playerResponse && playerResponse.videoDetails?.videoId && playerResponse.videoDetails.videoId !== msg.videoId) {
+                log(`[Content] Video ID mismatch after refresh! Found: ${playerResponse.videoDetails.videoId}, Expected: ${msg.videoId}`);
+                // We shouldn't use this response as it belongs to another video
+                playerResponse = null; 
+            }
 
             if (!playerResponse || !playerResponse.captions) {
                  if (playerResponse) {
@@ -185,6 +198,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         try {
             let playerResponse = await getRobustPlayerResponse(log);
+
+            // Validate video ID against requested videoId
+            if (playerResponse && playerResponse.videoDetails?.videoId !== msg.videoId) {
+                 log(`[Content] Stale playerResponse found for videoId=${playerResponse.videoDetails?.videoId}. Expected=${msg.videoId}. Forcing refresh...`);
+                 playerResponse = await getRobustPlayerResponse(log, true);
+            }
+
+            // Re-validate after refresh
+            if (playerResponse && playerResponse.videoDetails?.videoId && playerResponse.videoDetails.videoId !== msg.videoId) {
+                log(`[Content] Video ID mismatch after refresh! Found: ${playerResponse.videoDetails.videoId}, Expected: ${msg.videoId}`);
+                playerResponse = null; 
+            }
             
             if (!playerResponse || !playerResponse.captions) {
                  throw new Error('No player response found in page context');
