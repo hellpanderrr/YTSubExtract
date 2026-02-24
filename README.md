@@ -1,3 +1,6 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hellpanderrr/YTSubExtract)
+
+
 # YTSubExtract: YouTube Subtitle Extractor (MV3)
 
 A high-performance Chrome Extension designed to extract subtitles from YouTube videos using a robust **4-Tier Fallback System**. Built for reliability and speed.
