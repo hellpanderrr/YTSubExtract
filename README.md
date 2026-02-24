@@ -3,59 +3,126 @@
 
 # YTSubExtract: YouTube Subtitle Extractor (MV3)
 
-A high-performance Chrome Extension designed to extract subtitles from YouTube videos using a robust **4-Tier Fallback System**. Built for reliability and speed.
+A Chrome Extension for extracting subtitles from YouTube videos using a multi-tier fallback system. Built for Manifest V3.
 
-## 🛠️ Tech Stack & Libraries
-
-This extension is built with **Vanilla JavaScript (ES Modules)** and **Vite**, targeting **Chrome Manifest V3**.
+## Tech Stack
 
 | Component | Library / Tool | Purpose |
 | :--- | :--- | :--- |
-| **Core Logic** | **`youtube-caption-extractor`** (Modified) | The foundation for **Tier 1**. We vendored and heavily modified this library to support **Android Client** impersonation. |
-| **API Interaction** | **`youtubei.js`** | Full-featured InnerTube API client. Handles complex protobuf parsing and mimics desktop client behavior (Tier 3). |
-| **DOM Extraction** | **`@playzone/youtube-transcript`** | Lightweight scraper for extracting transcripts directly from the `ytInitialPlayerResponse` object in the DOM (Tier 2/4). |
-| **Text Processing** | **`he`** | Robust HTML entity decoder. Converts raw XML entities (e.g., `&amp;`, `&#39;`) into readable text. |
-| **Sanitization** | **`striptags`** | High-performance HTML/XML tag stripper. Removes `<text>` and formatting tags from raw caption data. |
-| **Bundler** | **`vite`** | Modern build tool for extremely fast HMR and optimized production builds. |
-| **Packaging** | **`crx`** & **`zip-a-folder`** | Automates the creation of `.crx` files and `.zip` archives for Chrome Web Store distribution. |
+| Network Interception | Vanilla JS | MAIN world script intercepts `fetch`/`XHR` for URL capture |
+| Player API | Vanilla JS | Direct `movie_player.getPlayerResponse()` access |
+| API Client | `youtube-caption-extractor` (modified) | Android/iOS client impersonation |
+| InnerTube API | `youtubei.js` | Full InnerTube client with protobuf support |
+| DOM Extraction | `@playzone/youtube-transcript` | Extracts transcripts from `ytInitialPlayerResponse` |
+| Text Processing | `he` | HTML entity decoding |
+| Sanitization | `striptags` | HTML/XML tag stripping |
+| Bundler | `vite` | Build tool with multiple configurations |
+| Packaging | `crx` & `zip-a-folder` | Chrome Web Store distribution |
 
-## 🏗️ Technical Architecture
+## Architecture
 
-The extension operates on a **Priority Fallback Model** to ensure 100% extraction success rate for playable videos.
+The extension uses a priority fallback model with multiple extraction methods.
 
-### 1. Tier 1: Android API Client (Primary)
-*   **Mechanism**: The Service Worker constructs a raw HTTP request to `https://www.youtube.com/youtubei/v1` masquerading as the **YouTube Android App** (`com.google.android.youtube`).
-*   **Why**: The Android client API is fast and efficient.
-*   **Translation**: Injects the `&tlang={targetLang}` parameter directly into the caption URL for server-side translation by Google.
+### Tier 0: Network Sniffer
 
-### 2. Tier 2: DOM & Page Context (Fallback)
-*   **Mechanism**: A Content Script injects into the active tab to access the window's `ytInitialPlayerResponse` object.
-*   **Why**: If the API is blocked (403/429), this method leverages the user's **existing session cookies** and signed-in state to retrieve the caption tracks already loaded by the player.
-*   **Library**: Uses `@playzone/youtube-transcript`.
+**Mechanism**: Content script injected into MAIN world at `document_start` intercepts all `fetch` and `XMLHttpRequest` calls.
 
-### 3. Tier 3: Native InnerTube Emulation (Last Resort)
-*   **Mechanism**: Initializes a heavy `youtubei.js` session within the Service Worker to perform a full "desktop" handshake.
-*   **Why**: Handles edge cases where video metadata is obfuscated or requires complex signature deciphering (sig/n-parameter).
+**Use Case**: Videos with subtitles already loaded.
 
-### 4. Tier 4: Page Context Injection (Ultimate Fallback)
-*   **Mechanism**: Injects a micro-script into the page to read the `ytInitialPlayerResponse` global variable directly from the user's browser session.
-*   **Why**: If all API requests fail (e.g., due to strict API limitations), this method uses the data the user's browser *already has*. **Note**: This requires the user to be able to play the video.
+### Tier 0.5: Player API
 
-### ⚡ Performance & Caching
-*   **Instant Format Switching**: The extension caches the *raw parsed transcript* (JSON) in memory (`metadata:${videoId}`). Switching between **SRT**, **VTT**, and **TXT** formats is instant (0ms latency) as it re-serializes the cached data instead of re-fetching.
-*   **State Persistence**: Uses `chrome.storage.local` to persist user preferences (Translation enabled/disabled, Target Language) across sessions.
+**Mechanism**: Direct access to `document.getElementById('movie_player').getPlayerResponse()`.
 
-## 📦 Installation & Build
+
+**Use Case**: SPA navigation where URL changes without page reload. Includes retry logic (3 attempts, 500ms delay).
+
+### Tier 1.5: Embed Page Extraction
+
+**Mechanism**: Fetches the embed page (`/embed/{videoId}`) and extracts `ytInitialPlayerResponse` from HTML.
+
+**Use Case**: Guest mode (no login required), works without authentication.
+
+### Tier 1: Android/iOS API Client
+
+**Mechanism**: HTTP request to `https://www.youtube.com/youtubei/v1` masquerading as YouTube mobile app.
+
+**Features**: 
+- `contentCheckOk: true` and `racyCheckOk: true` flags for restricted content
+- `tlang` parameter injection for server-side translation
+
+### Tier 2: DOM Extraction
+
+**Mechanism**: Content script accesses `ytInitialPlayerResponse` object from page context.
+
+**Use Case**: API blocked (403/429), leverages existing session cookies.
+
+### Tier 3: InnerTube Emulation
+
+**Mechanism**: Full `youtubei.js` session for desktop client handshake.
+
+**Use Case**: Complex signature deciphering, obfuscated metadata.
+
+### Tier 4: Main World Fetcher
+
+**Mechanism**: Fetches timedtext URLs from MAIN world context to bypass empty response protection.
+
+**Use Case**: Age-restricted videos, YouTube returning 200 OK with empty body.
+
+## Extraction Cascades
+
+### Metadata Cascade (Available Languages)
+```
+Tier 0.5 → Tier 1.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
+```
+Tier 0 skipped (captures single language URL, metadata needs all languages).
+
+### Download Cascade (Subtitle Content)
+```
+Tier 0 → Tier 0.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
+```
+Tier 0 first (use captured URL directly if available).
+
+## MAIN World Injection
+
+Uses Manifest V3's `"world": "MAIN"` feature:
+
+```json
+{
+  "matches": ["*://*.youtube.com/*"],
+  "js": ["sniffer.js"],
+  "run_at": "document_start",
+  "world": "MAIN"
+}
+```
+
+**Benefits**:
+- Intercepts `window.fetch` and `XMLHttpRequest` before YouTube's code
+- No deprecated `webRequest` API required
+- Captures early network requests at `document_start`
+
+**Communication Flow**:
+```
+sniffer.js (MAIN world)
+    ↓ window.postMessage ↓
+content.js (ISOLATED world)
+    ↓ chrome.runtime.sendMessage ↓
+background.js (Service Worker)
+```
+
+## Performance
+
+- **Format Switching**: Raw transcript cached in memory (`metadata:${videoId}`). SRT/VTT/TXT conversion is instant.
+- **State Persistence**: `chrome.storage.local` for user preferences.
+- **URL Expiration**: Sniffer-captured URLs checked before use.
+
+## Build
 
 ### Prerequisites
-*   Node.js 16+
-*   npm 8+
+- Node.js 16+
+- npm 8+
 
-### Setup
+### Commands
 ```bash
-# Clone repository
-git clone https://github.com/hellpanderrr/YTSubExtract.git
-
 # Install dependencies
 npm install
 
@@ -64,11 +131,15 @@ npm run dev
 
 # Production Build
 npm run build
-```
 
-### Release
-To generate a production-ready ZIP for the Chrome Web Store:
-```bash
+# Chrome Web Store ZIP
 npm run zip
 # Output: builds/extension.zip
 ```
+
+### Build Configuration
+Three Vite configurations:
+- `vite.config.js` - Background script and popup
+- `vite.config.content.js` - Content script (ISOLATED world)
+- `vite.config.sniffer.js` - Network sniffer (MAIN world)
+
