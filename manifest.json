@@ -3,7 +3,7 @@
   "name": "YTSubExtract for YouTube™",
     "short_name": "YTSubExtract",
 
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "FOSS YouTube™ subtitle extractor. No ads, no tracking, no premium. Just SRT, VTT, and TXT.",
   "background": {
     "service_worker": "background.js",
