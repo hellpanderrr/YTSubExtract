@@ -1,0 +1,98 @@
+name: Build & Publish Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.0.1)'
+        required: true
+        default: 'v1.0.0'
+        type: string
+      draft:
+        description: 'Create GitHub release as draft?'
+        required: true
+        default: false    
+        type: boolean
+      publish_to_chrome:
+        description: 'Upload to Chrome Web Store?'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  # 1. Build the project
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Extension
+        run: npm run build
+
+      - name: Zip Extension
+        run: npm run zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-zip
+          path: builds/extension.zip
+          retention-days: 7 # Increased to 7 days for reliability
+
+  # 2. Publish to Chrome Web Store
+  chrome_store:
+    needs: build
+    # Using modern inputs context which returns a true boolean
+    if: ${{ inputs.publish_to_chrome }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-zip
+          path: builds
+
+      - name: Upload to Chrome Web Store
+        uses: mnao305/chrome-extension-upload@v4.0.1
+        with:
+          file-path: builds/extension.zip
+          extension-id: ${{ secrets.EXTENSION_ID }}
+          client-id: ${{ secrets.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          refresh-token: ${{ secrets.REFRESH_TOKEN }}
+          publish: false
+
+  # 3. Create GitHub Release
+  github_release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-zip
+          path: builds
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Release ${{ inputs.version }}
+          # Use boolean directly without == 'true' comparison
+          draft: ${{ inputs.draft }} 
+          prerelease: false
+          files: builds/extension.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
