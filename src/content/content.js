@@ -45,9 +45,13 @@ function getCapturedUrl(videoId, lang) {
         if (entry && !isUrlExpired(entry.url)) {
             return entry.url;
         }
+        // If specific language requested but not found, don't fall back
+        // to a different language - return null to let other tiers handle it
+        console.log(`[Content] Requested lang '${lang}' not in captured URLs, skipping Tier 0`);
+        return null;
     }
     
-    // Fallback: any available language
+    // For 'auto' mode: fallback to any available language
     for (const [entryLang, entry] of videoUrls) {
         if (!isUrlExpired(entry.url)) {
             return entry.url;
