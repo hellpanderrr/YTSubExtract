@@ -3,6 +3,10 @@ import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/inde
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
 
+// === CONFIGURATION ===
+const DEBUG = false; // Set to true to enable verbose debug logging
+const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
+
 // === SNIFFER INTEGRATION ===
 // Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
 const capturedUrls = new Map();
@@ -19,7 +23,13 @@ window.addEventListener('message', (event) => {
         }
         
         capturedUrls.get(videoId).set(lang, { url, timestamp });
-        console.log(`[Content] Captured URL: video=${videoId}, lang=${lang}`);
+        
+        // Log the lang parameter from the URL for verification
+        if (DEBUG) {
+            const urlLangMatch = url.match(URL_LANG_REGEX);
+            const urlLang = urlLangMatch ? urlLangMatch[1] : 'no-lang';
+            console.log(`[Content] Captured URL: video=${videoId}, storedLang=${lang}, urlLang=${urlLang}, url=${url.substring(0, 100)}...`);
+        }
     }
 });
 
@@ -37,27 +47,66 @@ function isUrlExpired(url) {
 // Get captured URL for video/lang
 function getCapturedUrl(videoId, lang) {
     const videoUrls = capturedUrls.get(videoId);
-    if (!videoUrls) return null;
+    
+    // Debug logging for language fallback issue
+    if (DEBUG) {
+        const availableKeys = videoUrls ? Array.from(videoUrls.keys()) : [];
+        console.log(`[getCapturedUrl] Debug: videoId=${videoId}, requested=${lang}, available keys=[${availableKeys.join(', ')}]`);
+    }
+    
+    if (!videoUrls) {
+        if (DEBUG) console.log(`[getCapturedUrl] Debug: No videoUrls map found for videoId=${videoId}, returning null`);
+        return null;
+    }
     
     // First try specific language
     if (lang && lang !== 'auto') {
-        const entry = videoUrls.get(lang);
-        if (entry && !isUrlExpired(entry.url)) {
-            return entry.url;
+        let entry = videoUrls.get(lang);
+        if (DEBUG) console.log(`[getCapturedUrl] Debug: Looking for specific lang='${lang}', entry found=${!!entry}`);
+        
+        if (entry) {
+            const expired = isUrlExpired(entry.url);
+            if (DEBUG) {
+                // Extract lang parameter from URL for debugging
+                const urlLangMatch = entry.url.match(URL_LANG_REGEX);
+                const urlLang = urlLangMatch ? urlLangMatch[1] : 'no-lang-param';
+                console.log(`[getCapturedUrl] Debug: entry.url exists=${!!entry.url}, isUrlExpired=${expired}, urlLang=${urlLang}`);
+            }
+            
+            if (!expired) {
+                if (DEBUG) console.log(`[getCapturedUrl] Debug: Returning URL for lang='${lang}': ${entry.url.substring(0, 100)}...`);
+                return entry.url;
+            } else if (DEBUG) {
+                console.log(`[getCapturedUrl] Debug: URL expired for lang='${lang}', trying ASR fallback`);
+            }
         }
-        // If specific language requested but not found, don't fall back
-        // to a different language - return null to let other tiers handle it
-        console.log(`[Content] Requested lang '${lang}' not in captured URLs, skipping Tier 0`);
+        
+        // Try ASR captions (unknown) as fallback - they're always in video's language
+        // This triggers when: (1) no entry found, OR (2) entry exists but is expired
+        const asrEntry = videoUrls.get('unknown');
+        if (asrEntry && !isUrlExpired(asrEntry.url)) {
+            if (DEBUG) console.log(`[getCapturedUrl] Debug: Using ASR captions (unknown) as fallback for lang='${lang}'`);
+            return asrEntry.url;
+        }
+        
+        // If specific language and ASR fallback both failed, return null to let other tiers handle it
+        if (DEBUG) console.log(`[getCapturedUrl] Debug: Requested lang '${lang}' not available or expired, skipping Tier 0`);
         return null;
     }
     
     // For 'auto' mode: fallback to any available language
+    if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode, iterating through ${videoUrls.size} available languages`);
     for (const [entryLang, entry] of videoUrls) {
-        if (!isUrlExpired(entry.url)) {
+        const expired = isUrlExpired(entry.url);
+        if (DEBUG) console.log(`[getCapturedUrl] Debug: Checking lang='${entryLang}', expired=${expired}`);
+        
+        if (!expired) {
+            if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode - returning URL for lang='${entryLang}'`);
             return entry.url;
         }
     }
     
+    if (DEBUG) console.log(`[getCapturedUrl] Debug: All URLs expired or no entries found, returning null`);
     return null;
 }
 

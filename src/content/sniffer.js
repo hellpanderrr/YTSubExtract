@@ -22,6 +22,11 @@
             const urlObj = new URL(url, 'https://www.youtube.com');
             const videoId = urlObj.searchParams.get('v');
             const lang = urlObj.searchParams.get('lang') || urlObj.searchParams.get('tlang');
+            const hl = urlObj.searchParams.get('hl');
+            const caps = urlObj.searchParams.get('caps');
+            
+            // Debug logging
+            console.log(`[YTSub Sniffer] Parsing URL: langParam=${lang}, hlParam=${hl}, caps=${caps}`);
             
             return { videoId, lang, url };
         } catch (e) {
@@ -45,7 +50,8 @@
             timestamp: Date.now()
         }, '*');
         
-        console.log(`[YTSub Sniffer] Captured: video=${videoId}, lang=${lang || 'unknown'}`);
+        // Log full URL for debugging (truncated for readability)
+        console.log(`[YTSub Sniffer] Captured: video=${videoId}, lang=${lang || 'unknown'}, url=${url.substring(0, 150)}...`);
     }
     
     // Intercept fetch

@@ -17,18 +17,18 @@ const INNERTUBE_CONFIG = {
   CLIENT: {
     WEB: {
       NAME: 'WEB',
-      VERSION: '2.20230628.00.00',
+      VERSION: '2.20260215.00.00',
     },
     ANDROID: {
       NAME: 'ANDROID',
-      VERSION: '19.29.35',
-      USER_AGENT: 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
+      VERSION: '19.50.40',
+      USER_AGENT: 'com.google.android.youtube/19.50.40 (Linux; U; Android 14; US; Pixel 8 Build/AP2A.240905.003)',
       CLIENT_ID: '3',
     },
     IOS: {
       NAME: 'IOS',
-      VERSION: '19.45.4',
-      USER_AGENT: 'com.google.ios.youtube/19.45.4 (iPhone14,5; iOS 17.5.1; scale/3.00)',
+      VERSION: '19.49.4',
+      USER_AGENT: 'com.google.ios.youtube/19.49.4 (iPhone15,2; iOS 17.6.1; scale/3.00)',
       CLIENT_ID: '5',
     },
     TVHTML5: {
