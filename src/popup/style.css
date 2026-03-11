@@ -51,6 +51,12 @@ h1 {
   font-family:  'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .logo-icon {
   font-size: 20px;
 }

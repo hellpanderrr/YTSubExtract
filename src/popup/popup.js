@@ -115,7 +115,9 @@ async function fetchLanguages(videoId) {
         }
       }
       
-      setStatus(`Ready: ${currentVideoTitle ? currentVideoTitle.substring(0, 30) : 'Video'}...`);
+      // Set full title as tooltip for hover
+      setStatus(`Ready: ${currentVideoTitle ? currentVideoTitle.substring(0, 50) : 'Video'}...`);
+      statusEl.title = currentVideoTitle || 'Video';;
       populateLanguageSelect(languages);
       enableControls(true);
     } else {
