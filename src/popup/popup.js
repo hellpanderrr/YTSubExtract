@@ -103,6 +103,16 @@ async function fetchLanguages(videoId) {
       
       if (title && title !== 'YouTube Video') {
         currentVideoTitle = title;
+      } else {
+        // Try to get title from page tab as fallback
+        try {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (tab?.title && tab.title !== 'YouTube') {
+            currentVideoTitle = tab.title.replace(' - YouTube', '').replace('YouTube', '').trim();
+          }
+        } catch (e) {
+          console.log('Could not get tab title:', e);
+        }
       }
       
       setStatus(`Ready: ${currentVideoTitle ? currentVideoTitle.substring(0, 30) : 'Video'}...`);

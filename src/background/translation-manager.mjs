@@ -130,7 +130,7 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   // FORCE CC TRIGGER: Force caption toggle
   // ─────────────────────────────────────────────────────────────
-  async _forceTriggerCaptions(cycles = 3, interval = 150) {
+  async _forceTriggerCaptions(cycles = 3, interval = 150, targetLang = null) {
     return new Promise((resolve) => {
       chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
         if (tabs.length === 0) return resolve(false);
@@ -138,7 +138,8 @@ export class TranslationManager {
         chrome.tabs.sendMessage(tabs[0].id, { 
           type: 'FORCE_CC_TRIGGER', 
           cycles, 
-          interval 
+          interval,
+          targetLang
         }, (response) => {
           if (chrome.runtime.lastError) {
             console.warn('[ForceCC] Runtime error:', chrome.runtime.lastError.message);
@@ -245,12 +246,21 @@ export class TranslationManager {
     }
 
     // Tier 2
+    console.log('[TranslationManager] Trying Tier 2...');
     try {
-        const tier2Langs = await this._getLanguagesTier2(videoId);
-        if (tier2Langs && tier2Langs.length > 0) {
+        const tier2Result = await this._getLanguagesTier2(videoId);
+        if (tier2Result && tier2Result.length > 0) {
+            // Try to get title from page context
+            let title = 'YouTube Video';
+            try {
+                const pageTitle = await this._getPageTitle(videoId);
+                if (pageTitle) title = pageTitle;
+            } catch (e) {
+                console.log('[Tier 2] Could not get page title:', e.message);
+            }
             const result = {
-                title: 'YouTube Video',
-                languages: tier2Langs
+                title: title,
+                languages: tier2Result
             };
             this.cache.set(cacheKey, result);
             return result;
@@ -260,6 +270,7 @@ export class TranslationManager {
     }
 
     // Tier 3
+    console.log('[TranslationManager] Trying Tier 3...');
     try {
         const result = await getVideoMetadataTier3(videoId);
         if (result && result.languages && result.languages.length > 0) {
@@ -272,6 +283,7 @@ export class TranslationManager {
     }
 
     // Tier 4 (Page Context / Age Restricted Fallback)
+    console.log('[TranslationManager] Trying Tier 4...');
     try {
         console.log('[TranslationManager] Attempting Tier 4 (Page Context)...');
         const result = await this._getLanguagesTier4(videoId);
@@ -517,7 +529,34 @@ export class TranslationManager {
           if (chrome.runtime.lastError || !response?.success) {
             return resolve([]);
           }
+          // Also capture title if returned
+          if (response.title) {
+            this._cachedTitle = response.title;
+          }
           resolve(response.languages || []);
+        });
+      });
+    });
+  }
+
+  // Helper to get page title
+  async _getPageTitle(videoId) {
+    // First check if we got title from Tier 2
+    if (this._cachedTitle) {
+      return this._cachedTitle;
+    }
+    
+    // Try to get from page context
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) return resolve(null);
+        
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_TITLE', videoId }, (response) => {
+          if (response?.success && response.title) {
+            resolve(response.title);
+          } else {
+            resolve(null);
+          }
         });
       });
     });
@@ -586,7 +625,7 @@ export class TranslationManager {
         
         if (!capturedUrl) {
             log('[ForceCC] No captured URL found. Triggering captions...');
-            const triggered = await this._forceTriggerCaptions(3, 150);
+            const triggered = await this._forceTriggerCaptions(3, 150, sourceLang);
             
             if (triggered) {
                 log('[ForceCC] Captions triggered. Waiting for network requests...');
@@ -610,7 +649,16 @@ export class TranslationManager {
             
             // Add translation params if needed
             let fetchUrl = capturedUrl;
-            if (translate && targetLang && !capturedUrl.includes('tlang=')) {
+            
+            // Remove any existing tlang parameter - we want original language, not translation
+            if (fetchUrl.includes('tlang=')) {
+                log('[Tier 0] Removing existing tlang parameter to get original language');
+                fetchUrl = fetchUrl.replace(/tlang=[^&]+&?/, '');
+                // Clean up trailing &
+                fetchUrl = fetchUrl.replace(/&$/, '');
+            }
+            
+            if (translate && targetLang && !fetchUrl.includes('tlang=')) {
                 fetchUrl += `&tlang=${targetLang}`;
             }
             
@@ -639,6 +687,9 @@ export class TranslationManager {
                             
                             if (result.length > 0) {
                                 log(`[Tier 0] Success! ${result.length} segments from sniffer`);
+                                // Debug: show first few segments to verify language
+                                const firstFew = result.slice(0, 3).map(s => s.text?.substring(0, 50)).join(' | ');
+                                log(`[Tier 0] First segments: ${firstFew}`);
                                 const resp = {
                                     source: 'tier0-sniffer',
                                     result,

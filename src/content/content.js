@@ -4,7 +4,7 @@ import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/inde
 // Has access to cookies and correct headers
 
 // === CONFIGURATION ===
-const DEBUG = false; // Set to true to enable verbose debug logging
+const DEBUG = true; // Set to true to enable verbose debug logging
 const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
 
 // === SNIFFER INTEGRATION ===
@@ -94,14 +94,28 @@ function getCapturedUrl(videoId, lang) {
         return null;
     }
     
-    // For 'auto' mode: fallback to any available language
+    // For 'auto' mode: prefer ASR (auto-generated) in video's language, then fallback to any available
+    // ASR URLs typically have kind=asr parameter and are in the video's actual language
     if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode, iterating through ${videoUrls.size} available languages`);
+    
+    // First pass: look for ASR (auto-generated) captions - these are in the video's actual language
+    for (const [entryLang, entry] of videoUrls) {
+        const expired = isUrlExpired(entry.url);
+        if (DEBUG) console.log(`[getCapturedUrl] Debug: Checking lang='${entryLang}', expired=${expired}`);
+        
+        if (!expired && entry.url.includes('kind=asr')) {
+            if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode - found ASR track '${entryLang}', using it`);
+            return entry.url;
+        }
+    }
+    
+    // Second pass: if no ASR found, use first available non-expired
     for (const [entryLang, entry] of videoUrls) {
         const expired = isUrlExpired(entry.url);
         if (DEBUG) console.log(`[getCapturedUrl] Debug: Checking lang='${entryLang}', expired=${expired}`);
         
         if (!expired) {
-            if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode - returning URL for lang='${entryLang}'`);
+            if (DEBUG) console.log(`[getCapturedUrl] Debug: Auto mode - returning URL for lang='${entryLang}' (no ASR available)`);
             return entry.url;
         }
     }
@@ -184,7 +198,7 @@ async function fetchViaMainWorld(url, timeout = 10000) {
  * @param {number} intervalMs - Interval between actions in ms (default 150ms)
  * @returns {Promise<boolean>} - Whether trigger succeeded
  */
-async function forceTriggerCaptions(cycles = 3, intervalMs = 150) {
+async function forceTriggerCaptions(cycles = 3, intervalMs = 150, targetLang = null) {
     const log = (m) => console.log(`[ForceCC] ${m}`);
     
     try {
@@ -192,6 +206,34 @@ async function forceTriggerCaptions(cycles = 3, intervalMs = 150) {
         if (!player) {
             log('movie_player not found');
             return false;
+        }
+        
+        // If targetLang specified, try to get available tracks and log what we find
+        if (targetLang && targetLang !== 'auto') {
+            log(`Checking available caption tracks for language: ${targetLang}`);
+            try {
+                const playerResponse = player.getPlayerResponse?.();
+                const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+                
+                if (tracks && tracks.length > 0) {
+                    log(`Found ${tracks.length} caption tracks:`);
+                    tracks.forEach((t, i) => {
+                        log(`  Track ${i}: lang=${t.languageCode}, name=${t.name?.simpleText || t.name?.runs?.[0]?.text}, kind=${t.kind || 'none'}`);
+                    });
+                    
+                    // Check if target language is available
+                    const targetTrack = tracks.find(t => t.languageCode === targetLang);
+                    if (targetTrack) {
+                        log(`✓ Target language '${targetLang}' IS available`);
+                    } else {
+                        log(`✗ Target language '${targetLang}' NOT available`);
+                    }
+                } else {
+                    log('No caption tracks found in player response');
+                }
+            } catch (e) {
+                log(`Error checking tracks: ${e.message}`);
+            }
         }
         
         if (typeof player.toggleSubtitles !== 'function') {
@@ -362,8 +404,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'FORCE_CC_TRIGGER') {
     (async () => {
       try {
-        // Try player API first
-        let success = await forceTriggerCaptions(msg.cycles || 3, msg.interval || 150);
+        // Try player API first, with target language
+        let success = await forceTriggerCaptions(msg.cycles || 3, msg.interval || 150, msg.targetLang);
         
         // Fallback to button click
         if (!success) {
@@ -443,11 +485,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 name: t.language,
                 isTranslatable: t.isTranslatable
             }));
-            sendResponse({ success: true, languages });
+            
+            // Try to get title from page context
+            let title = 'YouTube Video';
+            try {
+                const player = document.getElementById('movie_player');
+                if (player && typeof player.getPlayerResponse === 'function') {
+                    const response = player.getPlayerResponse();
+                    if (response?.videoDetails?.title) {
+                        title = response.videoDetails.title;
+                    }
+                }
+            } catch (e) {
+                console.log('[Tier 2] Could not get title from player:', e.message);
+            }
+            
+            sendResponse({ success: true, languages, title });
         } catch (err) {
             sendResponse({ success: false, error: err.message });
         }
     })();
+    return true;
+  }
+
+  // Get page title handler
+  if (msg.type === 'GET_PAGE_TITLE') {
+    try {
+        let title = null;
+        const player = document.getElementById('movie_player');
+        if (player && typeof player.getPlayerResponse === 'function') {
+            const response = player.getPlayerResponse();
+            if (response?.videoDetails?.title) {
+                title = response.videoDetails.title;
+            }
+        }
+        sendResponse({ success: true, title });
+    } catch (err) {
+        sendResponse({ success: false, error: err.message });
+    }
     return true;
   }
 

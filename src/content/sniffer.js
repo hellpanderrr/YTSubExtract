@@ -21,14 +21,37 @@
             // URL can be relative or absolute
             const urlObj = new URL(url, 'https://www.youtube.com');
             const videoId = urlObj.searchParams.get('v');
-            const lang = urlObj.searchParams.get('lang') || urlObj.searchParams.get('tlang');
-            const hl = urlObj.searchParams.get('hl');
+            const lang = urlObj.searchParams.get('lang');  // Primary: explicit lang parameter
+            const tlang = urlObj.searchParams.get('tlang');  // Translation target
+            const hl = urlObj.searchParams.get('hl');  // Interface language
             const caps = urlObj.searchParams.get('caps');
+            const kind = urlObj.searchParams.get('kind');
             
             // Debug logging
-            console.log(`[YTSub Sniffer] Parsing URL: langParam=${lang}, hlParam=${hl}, caps=${caps}`);
+            console.log(`[YTSub Sniffer] Parsing URL: lang=${lang}, tlang=${tlang}, hl=${hl}, caps=${caps}, kind=${kind}`);
             
-            return { videoId, lang, url };
+            // Determine the actual caption language:
+            // 1. If 'lang' param exists, use it
+            // 2. If 'tlang' exists (translation), use 'lang' as source, but caption is translated
+            // 3. If only 'hl' and 'caps=asr', the language is unknown (ASR in interface language)
+            // 4. If kind=asr, it's auto-generated
+            
+            let finalLang = lang;
+            
+            // If no explicit lang, check if it's ASR
+            if (!finalLang) {
+                if (kind === 'asr' || caps === 'asr') {
+                    // ASR - language is unknown from URL, falls back to 'unknown'
+                    finalLang = 'unknown-asr';
+                } else {
+                    // Fallback to hl but mark as uncertain
+                    finalLang = hl || 'unknown';
+                }
+            }
+            
+            console.log(`[YTSub Sniffer] Determined lang: ${finalLang}`);
+            
+            return { videoId, lang: finalLang, url };
         } catch (e) {
             return null;
         }
