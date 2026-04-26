@@ -1,5 +1,7 @@
 import { toSRT, toVTT, toTXT } from '../utils/subtitle-formats.js';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
+import { isPlaylistUrl, extractPlaylistId, fetchPlaylistVideos } from '../utils/playlist-extractor.js';
+import { downloadZip } from '../utils/zip-generator.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
@@ -19,6 +21,29 @@ const translationOptions = document.getElementById('translation-options');
 let currentVideoId = null;
 let currentVideoTitle = null;
 let currentTranscript = null;
+let currentPlaylistId = null;
+let currentPlaylistTitle = '';
+let currentPlaylistVideos = [];
+let isPlaylistMode = false;
+
+// Playlist UI elements
+const playlistModeEl = document.getElementById('playlist-mode');
+const playlistCountEl = document.getElementById('playlist-count');
+const selectAllCheck = document.getElementById('select-all');
+const selectedCountEl = document.getElementById('selected-count');
+const playlistVideosEl = document.getElementById('playlist-videos');
+const btnDownloadZip = document.getElementById('btn-download-zip');
+const playlistProgressEl = document.getElementById('playlist-progress');
+const progressFillEl = document.getElementById('progress-fill');
+const progressTextEl = document.getElementById('progress-text');
+const controlsEl = document.querySelector('.controls');
+
+// Playlist language controls
+const playlistLangSelect = document.getElementById('playlist-lang-select');
+const playlistFormatSelect = document.getElementById('playlist-format-select');
+const playlistTranslateCheck = document.getElementById('playlist-translate-check');
+const playlistTranslateLang = document.getElementById('playlist-translate-lang');
+const playlistTranslationOptions = document.getElementById('playlist-translation-options');
 
 function setStatus(msg, type = 'info', loading = false) {
   statusEl.textContent = msg;
@@ -71,8 +96,30 @@ async function init() {
     }
 
     const url = new URL(tab.url);
+    
+    // Check for playlist mode
+    if (isPlaylistUrl(tab.url)) {
+      currentPlaylistId = extractPlaylistId(tab.url);
+      isPlaylistMode = true;
+      
+      btnReset.style.display = 'flex';
+      setStatus(`Playlist found: ${currentPlaylistId}`);
+      
+      // Hide single video controls, show playlist UI
+      if (controlsEl) controlsEl.classList.add('hidden');
+      playlistModeEl.classList.remove('hidden');
+      
+      await loadPlaylistVideos(currentPlaylistId);
+
+      // Check if there's an active download for this playlist
+      await checkAndRestoreProgress();
+      return;
+    }
+    
+    // Single video mode
     if (url.hostname.includes('youtube.com') && url.searchParams.has('v')) {
       currentVideoId = url.searchParams.get('v');
+      isPlaylistMode = false;
       
       // Don't trust tab.title immediately as it might be stale from previous video
       currentVideoTitle = 'Loading title...';
@@ -80,15 +127,420 @@ async function init() {
       // Show reset button
       btnReset.style.display = 'flex';
       setStatus(`Video found: ${currentVideoId}`);
+      
+      // Show single video controls, hide playlist UI
+      if (controlsEl) controlsEl.classList.remove('hidden');
+      playlistModeEl.classList.add('hidden');
+      
       fetchLanguages(currentVideoId);
     } else {
       btnReset.style.display = 'none';
-      setStatus('Not a YouTube video page', 'error');
+      setStatus('Not a YouTube video or playlist page', 'error');
     }
   } catch (e) {
     setStatus('Error: ' + e.message, 'error');
   }
 }
+
+async function loadPlaylistVideos(playlistId) {
+  setStatus('Loading playlist videos...', 'info', true);
+  btnDownloadZip.disabled = true;
+
+  try {
+    console.log('[Popup] Fetching playlist:', playlistId);
+    const result = await fetchPlaylistVideos(playlistId, 50);
+    console.log('[Popup] Got result:', result);
+
+    const videos = result.videos || result; // Handle both old and new format
+    currentPlaylistTitle = result.title || '';
+    currentPlaylistVideos = videos.map((v) => ({ ...v, selected: true }));
+
+    setStatus(`Loaded ${videos.length} videos${currentPlaylistTitle ? ' from "' + currentPlaylistTitle + '"' : ''}`, 'success');
+    playlistCountEl.textContent = `${videos.length} videos`;
+
+    renderPlaylistVideos();
+    updateSelectedCount();
+    btnDownloadZip.disabled = videos.length === 0;
+
+  } catch (e) {
+    console.error('[Popup] Failed to load playlist:', e);
+    setStatus('Failed to load playlist: ' + e.message, 'error');
+    playlistCountEl.textContent = 'Error';
+  }
+}
+
+function renderPlaylistVideos() {
+  console.log('[Popup] Rendering videos:', currentPlaylistVideos.length);
+  playlistVideosEl.innerHTML = '';
+
+  if (currentPlaylistVideos.length === 0) {
+    playlistVideosEl.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">No videos found</div>';
+    return;
+  }
+
+  for (const video of currentPlaylistVideos) {
+    const item = document.createElement('div');
+    item.className = 'playlist-video-item';
+    
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = video.selected;
+    checkbox.dataset.videoId = video.videoId;
+    checkbox.addEventListener('change', (e) => {
+      video.selected = e.target.checked;
+      updateSelectedCount();
+    });
+    
+    const indexSpan = document.createElement('span');
+    indexSpan.className = 'video-index';
+    indexSpan.textContent = String(video.index).padStart(2, '0');
+    
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'video-info';
+    
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'video-title';
+    titleSpan.textContent = video.title;
+    titleSpan.title = video.title;
+    
+    const durationSpan = document.createElement('span');
+    durationSpan.className = 'video-duration';
+    durationSpan.textContent = video.duration;
+    
+    infoDiv.appendChild(titleSpan);
+    infoDiv.appendChild(durationSpan);
+    
+    item.appendChild(checkbox);
+    item.appendChild(indexSpan);
+    item.appendChild(infoDiv);
+    
+    playlistVideosEl.appendChild(item);
+  }
+}
+
+function updateSelectedCount() {
+  const selected = currentPlaylistVideos.filter(v => v.selected).length;
+  selectedCountEl.textContent = `${selected} selected`;
+  btnDownloadZip.disabled = selected === 0;
+}
+
+let currentDownloadId = null;
+let progressCheckInterval = null;
+
+async function downloadPlaylistSubtitles() {
+  const selectedVideos = currentPlaylistVideos.filter(v => v.selected);
+  if (selectedVideos.length === 0) return;
+
+  // Determine format and language from playlist UI controls
+  const format = playlistFormatSelect?.value || 'srt';
+  const sourceLang = playlistLangSelect?.value || 'auto';
+  const shouldTranslate = playlistTranslateCheck?.checked || false;
+  const targetLang = playlistTranslateLang?.value || 'en';
+
+  console.log('[Popup] Starting download:', {
+    playlistId: currentPlaylistId,
+    videoCount: selectedVideos.length,
+    format,
+    sourceLang,
+    translate: shouldTranslate,
+    targetLang
+  });
+
+  setStatus(`Starting download of ${selectedVideos.length} subtitles...`, 'info', true);
+  btnDownloadZip.disabled = true;
+  playlistProgressEl.classList.remove('hidden');
+
+  try {
+    // Start batch download in background
+    console.log('[Popup] Sending BATCH_DOWNLOAD_PLAYLIST message...');
+    const response = await chrome.runtime.sendMessage({
+      type: 'BATCH_DOWNLOAD_PLAYLIST',
+      videos: selectedVideos,
+      playlistId: currentPlaylistId,
+      playlistTitle: currentPlaylistTitle,
+      options: {
+        format,
+        sourceLang,
+        translate: shouldTranslate,
+        targetLang
+      }
+    });
+    console.log('[Popup] Got response:', response);
+
+    if (!response || !response.success) {
+      console.log('[Popup] Response check failed:', response);
+      throw new Error(response?.error || 'Failed to start batch download');
+    }
+
+    currentDownloadId = response.data.downloadId;
+    console.log('[Popup] Download started, ID:', currentDownloadId);
+
+    // Start polling for progress with total video count
+    console.log('[Popup] Calling startProgressPolling with:', selectedVideos.length, 'videos');
+    startProgressPolling(selectedVideos.length);
+
+  } catch (err) {
+    console.error('[Popup] Download start error:', err);
+    setStatus('Failed to start download: ' + err.message, 'error');
+    btnDownloadZip.disabled = false;
+    playlistProgressEl.classList.add('hidden');
+  }
+}
+
+async function checkAndRestoreProgress() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'GET_DOWNLOAD_PROGRESS'
+    });
+
+    if (!response || !response.success) return;
+
+    const progress = response.data;
+    if (!progress || progress.playlistId !== currentPlaylistId) return;
+
+    // If there's an active or completed download, restore UI
+    if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error') {
+      console.log('[Popup] Restoring progress:', progress);
+
+      // Show progress UI
+      playlistProgressEl.classList.remove('hidden');
+      btnDownloadZip.disabled = true;
+
+      // Update progress display
+      if (progress.total > 0) {
+        const percent = (progress.completed / progress.total) * 100;
+        progressFillEl.style.width = `${percent}%`;
+        progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
+      }
+
+      // Handle different statuses
+      if (progress.status === 'running') {
+        startProgressPolling(progress.total);
+        setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
+      } else if (progress.status === 'completed' && progress.downloadId) {
+        // Completed but ZIP not downloaded yet
+        currentDownloadId = progress.downloadId;
+        setStatus(`Download complete! ${progress.completed}/${progress.total}`, 'success');
+        btnDownloadZip.disabled = false;
+        btnDownloadZip.textContent = 'Download ZIP';
+      } else if (progress.status === 'error') {
+        // Error occurred
+        setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+        currentDownloadId = null;
+      }
+    }
+  } catch (err) {
+    console.error('[Popup] Failed to restore progress:', err);
+  }
+}
+
+function startProgressPolling(totalVideos) {
+  console.log('[Popup] startProgressPolling called with totalVideos:', totalVideos);
+  console.log('[Popup] currentPlaylistId:', currentPlaylistId);
+
+  // Clear any existing polling
+  if (progressCheckInterval) {
+    clearInterval(progressCheckInterval);
+    progressCheckInterval = null;
+  }
+
+  // Reset UI to initial state - ALWAYS set initial text
+  const initialTotal = totalVideos || 0;
+  progressFillEl.style.width = '0%';
+  progressTextEl.textContent = `0 / ${initialTotal || '?'}`;
+  console.log('[Popup] Initial progress set to: 0 /', initialTotal || '?');
+
+  // Poll every 500ms for progress updates
+  progressCheckInterval = setInterval(async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'GET_DOWNLOAD_PROGRESS'
+      });
+
+      if (!response || !response.success) {
+        console.log('[Popup] No progress response');
+        return;
+      }
+
+      const progress = response.data;
+      console.log('[Popup] Got progress:', progress);
+
+      if (!progress) {
+        console.log('[Popup] Progress is null');
+        return;
+      }
+
+      if (progress.playlistId !== currentPlaylistId) {
+        console.log('[Popup] Playlist ID mismatch:', progress.playlistId, '!==', currentPlaylistId);
+        return;
+      }
+
+      // Update UI
+      if (progress.total > 0) {
+        const percent = (progress.completed / progress.total) * 100;
+        progressFillEl.style.width = `${percent}%`;
+        progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
+        console.log(`[Popup] UI updated: ${progress.completed}/${progress.total} (${percent.toFixed(1)}%)`);
+
+        if (progress.status === 'running') {
+          setStatus(`Downloading... ${progress.completed}/${progress.total} (${progress.failed || 0} failed)`, 'info', true);
+        }
+      } else {
+        console.log('[Popup] Total is 0, cannot calculate progress');
+      }
+
+      // Check if completed
+      if (progress.status === 'completed' && progress.downloadId) {
+        clearInterval(progressCheckInterval);
+        progressCheckInterval = null;
+
+        // Only download if background didn't already auto-download
+        if (!progress.autoDownloaded) {
+          await downloadCompletedZip(progress.downloadId);
+        } else {
+          setStatus('Downloaded successfully!', 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          currentDownloadId = null;
+        }
+
+        // Clear the progress
+        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+      }
+
+      // Check if error occurred
+      if (progress.status === 'error') {
+        clearInterval(progressCheckInterval);
+        progressCheckInterval = null;
+
+        setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+        currentDownloadId = null;
+
+        console.error('[Popup] Download error:', progress);
+        return;
+      }
+    } catch (err) {
+      console.error('Progress polling error:', err);
+    }
+  }, 500);
+}
+
+async function downloadCompletedZip(downloadId) {
+  try {
+    // Get ZIP data from storage
+    const result = await chrome.storage.local.get(downloadId);
+    const downloadData = result[downloadId];
+
+    if (!downloadData) {
+      throw new Error('Download data not found');
+    }
+
+    // Convert base64 to blob
+    const binaryString = atob(downloadData.data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: 'application/zip' });
+
+    // Download via blob URL (respects filename)
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadData.filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setStatus(
+      `Downloaded successfully!`,
+      'success'
+    );
+
+    // Clean up storage
+    await chrome.storage.local.remove(downloadId);
+
+  } catch (err) {
+    setStatus('Failed to download ZIP: ' + err.message, 'error');
+  } finally {
+    btnDownloadZip.disabled = false;
+    playlistProgressEl.classList.add('hidden');
+    currentDownloadId = null;
+  }
+}
+
+// Playlist event listeners
+selectAllCheck?.addEventListener('change', (e) => {
+  const checked = e.target.checked;
+  currentPlaylistVideos.forEach(v => v.selected = checked);
+  
+  // Update all checkboxes
+  const checkboxes = playlistVideosEl.querySelectorAll('input[type="checkbox"]');
+  checkboxes.forEach(cb => cb.checked = checked);
+  
+  updateSelectedCount();
+});
+
+btnDownloadZip?.addEventListener('click', downloadPlaylistSubtitles);
+
+// Playlist translation toggle
+function updatePlaylistTranslationState() {
+  const enabled = playlistTranslateCheck?.checked || false;
+  if (playlistTranslateLang) {
+    playlistTranslateLang.disabled = !enabled;
+  }
+
+  if (enabled) {
+    playlistTranslationOptions?.classList.add('visible');
+  } else {
+    playlistTranslationOptions?.classList.remove('visible');
+  }
+}
+
+function savePlaylistSettings() {
+  chrome.storage.local.set({
+    playlistTranslateChecked: playlistTranslateCheck?.checked,
+    playlistTargetLanguage: playlistTranslateLang?.value,
+    playlistSourceLanguage: playlistLangSelect?.value
+  });
+}
+
+function loadPlaylistSettings() {
+  chrome.storage.local.get(['playlistTranslateChecked', 'playlistTargetLanguage', 'playlistSourceLanguage'], (result) => {
+    if (result.playlistTranslateChecked !== undefined && playlistTranslateCheck) {
+      playlistTranslateCheck.checked = result.playlistTranslateChecked;
+      updatePlaylistTranslationState();
+    }
+    if (result.playlistTargetLanguage && playlistTranslateLang) {
+      const option = Array.from(playlistTranslateLang.options).find(o => o.value === result.playlistTargetLanguage);
+      if (option) {
+        playlistTranslateLang.value = result.playlistTargetLanguage;
+      }
+    }
+    if (result.playlistSourceLanguage && playlistLangSelect) {
+      const option = Array.from(playlistLangSelect.options).find(o => o.value === result.playlistSourceLanguage);
+      if (option) {
+        playlistLangSelect.value = result.playlistSourceLanguage;
+      }
+    }
+  });
+}
+
+playlistTranslateCheck?.addEventListener('change', () => {
+  updatePlaylistTranslationState();
+  savePlaylistSettings();
+});
+
+playlistTranslateLang?.addEventListener('change', savePlaylistSettings);
+playlistLangSelect?.addEventListener('change', savePlaylistSettings);
+
+// Load playlist settings on init
+loadPlaylistSettings();
 
 async function fetchLanguages(videoId) {
   setStatus('Fetching languages...', 'info', true);

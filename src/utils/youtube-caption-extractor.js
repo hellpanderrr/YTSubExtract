@@ -41,7 +41,7 @@ const INNERTUBE_CONFIG = {
 };
 
 // Generate proper session data
-function generateSessionData(clientType = 'ANDROID') {
+export function generateSessionData(clientType = 'ANDROID') {
   const visitorData = generateVisitorData();
   
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
@@ -92,7 +92,7 @@ function generateVisitorData() {
   return result;
 }
 
-async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
+export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
   
   const headers = {
@@ -123,7 +123,7 @@ async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
   });
 }
 
-async function getVideoInfo(videoID) {
+export async function getVideoInfo(videoID) {
   // Try Android client first
   const sessionData = generateSessionData('ANDROID');
 

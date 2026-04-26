@@ -2,7 +2,7 @@
 // === UNIVERSAL TRANSLATION MANAGER ===
 // Handles all 3 libraries + YouTube Native API
 
-import { getSubtitles, getLanguages } from '../utils/youtube-caption-extractor.js';
+import { getSubtitles, getLanguages, getVideoInfo } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import he from 'he';
@@ -1214,6 +1214,213 @@ export class TranslationManager {
 
     const finalError = new Error(`All extraction tiers failed: ${JSON.stringify(errors)}`);
     finalError.logs = logs;
+    throw finalError;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // API-Only Tiers for Playlist Processing
+  // Uses tiers 0.5, 1, 1.5, 3 Legacy (no active tab required)
+  // ─────────────────────────────────────────────────────────────
+  async getTranscriptForPlaylist(videoId, options = {}) {
+    const { 
+      sourceLang = 'auto', 
+      translate = false, 
+      targetLang = 'en'
+    } = options;
+
+    const logs = [];
+    const log = (msg) => {
+      console.log(`[Playlist] ${msg}`);
+      logs.push(`[Playlist] ${msg}`);
+    };
+
+    log(`Processing ${videoId} (API-only tiers)...`);
+    log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
+
+    const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${targetLang}`;
+    
+    // Check cache
+    if (this.cache.has(cacheKey)) {
+      log('Cache hit');
+      return this.cache.get(cacheKey);
+    }
+
+    const errors = [];
+
+    // === TIER 0.5: Player API URL (without active tab - direct fetch) ===
+    try {
+      log('[Tier 0.5] Attempting Player API...');
+      
+      // Get video info first
+      const videoInfo = await getVideoInfo(videoId);
+      
+      const captionTracks = videoInfo?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (captionTracks && captionTracks.length > 0) {
+        let track = captionTracks[0];
+        if (sourceLang !== 'auto') {
+          track = captionTracks.find(t => t.languageCode === sourceLang) || track;
+        }
+
+        if (track?.baseUrl) {
+          let fetchUrl = track.baseUrl;
+          if (translate && targetLang) {
+            fetchUrl += `&tlang=${targetLang}`;
+          }
+          if (!fetchUrl.includes('fmt=')) {
+            fetchUrl += '&fmt=json3';
+          } else {
+            fetchUrl = fetchUrl.replace(/fmt=[^&]+/, 'fmt=json3');
+          }
+
+          const response = await fetch(fetchUrl, {
+            headers: {
+              'User-Agent': 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
+              'Referer': `https://www.youtube.com/watch?v=${videoId}`,
+            }
+          });
+
+          if (response.ok) {
+            const text = await response.text();
+            if (text && text.trim().length > 0) {
+              try {
+                const json = JSON.parse(text);
+                if (json.events) {
+                  const result = json.events
+                    .filter(e => e.segs)
+                    .map(e => ({
+                      start: (e.tStartMs || 0) / 1000,
+                      duration: (e.dDurationMs || 0) / 1000,
+                      text: e.segs.map(s => s.utf8 || '').join('')
+                    }))
+                    .filter(e => e.text.trim().length > 0);
+                  
+                  if (result.length > 0) {
+                    log(`[Tier 0.5] Success! ${result.length} segments`);
+                    const resp = {
+                      source: 'tier0.5-playlist',
+                      result,
+                      translated: translate,
+                      sourceLang: track.languageCode,
+                      targetLang,
+                      logs
+                    };
+                    this.cache.set(cacheKey, resp);
+                    return resp;
+                  }
+                }
+              } catch (parseErr) {
+                log(`[Tier 0.5] JSON parse failed: ${parseErr.message}`);
+              }
+            }
+          }
+        }
+      }
+      log('[Tier 0.5] No success, falling back...');
+    } catch (err) {
+      errors.push({ tier: '0.5', error: err.message });
+      log(`[Tier 0.5] Failed: ${err.message}`);
+    }
+
+    // === TIER 1: youtube-caption-extractor ===
+    try {
+      log('[Tier 1] Attempting youtube-caption-extractor...');
+      
+      const result = await getSubtitles({
+        videoID: videoId,
+        lang: sourceLang !== 'auto' ? sourceLang : 'en',
+        translate: translate,
+        translateLang: translate ? targetLang : undefined
+      });
+
+      if (result && result.length > 0) {
+        // Convert to standard format
+        const normalized = result.map(s => ({
+          start: s.start,
+          duration: s.duration,
+          text: s.text
+        }));
+        
+        log(`[Tier 1] Success! ${normalized.length} segments`);
+        const response = {
+          source: 'tier1-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this.cache.set(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 1, error: err.message });
+      log(`[Tier 1] Failed: ${err.message}`);
+    }
+
+    // === TIER 1.5: Embed Page ===
+    try {
+      log('[Tier 1.5] Attempting embed page...');
+      const result = await this._extractFromEmbed(videoId, sourceLang, translate, targetLang);
+      
+      if (result && result.length > 0) {
+        log(`[Tier 1.5] Success! ${result.length} segments`);
+        const response = {
+          source: 'tier1.5-playlist',
+          result,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this.cache.set(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '1.5', error: err.message });
+      log(`[Tier 1.5] Failed: ${err.message}`);
+    }
+
+    // === TIER 3 Legacy ===
+    try {
+      log('[Tier 3 Legacy] Attempting Innertube...');
+      
+      const legacyOptions = {
+        lang: sourceLang,
+        translate: translate,
+        targetLang: targetLang
+      };
+      
+      const legacyResult = await fetchTier3Transcript(videoId, legacyOptions);
+      
+      if (legacyResult && legacyResult.segments && legacyResult.segments.length > 0) {
+        log(`[Tier 3 Legacy] Success! ${legacyResult.segments.length} segments`);
+        
+        const normalized = legacyResult.segments.map(s => ({
+          start: s.start,
+          duration: s.end - s.start,
+          text: s.text
+        }));
+        
+        const response = {
+          source: 'tier3-legacy-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang: legacyResult.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this.cache.set(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '3-legacy', error: err.message });
+      log(`[Tier 3 Legacy] Failed: ${err.message}`);
+    }
+
+    // All API-only tiers failed
+    const finalError = new Error(`All API-only tiers failed for ${videoId}`);
+    finalError.logs = logs;
+    finalError.errors = errors;
     throw finalError;
   }
 
