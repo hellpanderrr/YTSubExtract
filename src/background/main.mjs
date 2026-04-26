@@ -3,7 +3,6 @@ import { translationManager } from './translation-manager.mjs';
 import { BatchProcessor, generateErrorReport } from './batch-processor.mjs';
 
 // Polyfills for library compatibility
-// URL.createObjectURL polyfill - add only if missing, don't replace entire URL class
 if (typeof URL !== 'undefined' && !URL.createObjectURL) {
   URL.createObjectURL = function(blob) {
     return 'blob:fake://' + Math.random().toString(36).slice(2);
@@ -306,7 +305,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       }
     });
 
-    // Update progress to completed (popup will handle download)
+    // Update progress to completed (popup will download with correct filename via DOM)
     globalThis.currentDownloadProgress = {
       playlistId,
       status: 'completed',
@@ -423,6 +422,7 @@ function generateSubtitleFilename(index, videoId, title, language, format) {
 
 function sanitizeVideoTitle(title) {
   if (!title) return 'untitled';
+  // Only strip filesystem-invalid characters (popup DOM download supports Cyrillic)
   return title
     .replace(/[<>:"/\\|?*]/g, '')
     .replace(/[#&%+@!^()\[\]{}]/g, '')
@@ -438,5 +438,7 @@ function generateZipFilename(playlistId, language, title = '') {
   const sanitizedTitle = title
     ? sanitizeVideoTitle(title).substring(0, 30) + '_'
     : '';
-  return `playlist_${sanitizedTitle}${shortPlaylistId}_${language}_${timestamp}.zip`;
+  const filename = `playlist_${sanitizedTitle}${shortPlaylistId}_${language}_${timestamp}.zip`;
+  console.log('[Background] generateZipFilename - title:', title, '→ sanitized:', sanitizedTitle, '→ filename:', filename);
+  return filename;
 }

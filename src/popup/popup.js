@@ -318,11 +318,16 @@ async function checkAndRestoreProgress() {
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
-        // Completed but ZIP not downloaded yet
-        currentDownloadId = progress.downloadId;
-        setStatus(`Download complete! ${progress.completed}/${progress.total}`, 'success');
-        btnDownloadZip.disabled = false;
-        btnDownloadZip.textContent = 'Download ZIP';
+        // Completed — download ZIP if not already auto-downloaded
+        if (!progress.autoDownloaded) {
+          await downloadCompletedZip(progress.downloadId);
+        } else {
+          setStatus('Downloaded successfully!', 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          currentDownloadId = null;
+        }
+        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       } else if (progress.status === 'error') {
         // Error occurred
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
@@ -396,7 +401,7 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
-        // Only download if background didn't already auto-download
+        // Only download if background didn't already auto-download via offscreen
         if (!progress.autoDownloaded) {
           await downloadCompletedZip(progress.downloadId);
         } else {
