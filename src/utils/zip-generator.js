@@ -36,10 +36,22 @@ export async function createZip(files) {
  * Remove/replace characters that are problematic in filenames
  */
 function sanitizeFilename(name) {
-  return name
+  // Extract extension if present
+  const lastDotIndex = name.lastIndexOf('.');
+  const extension = lastDotIndex > 0 ? name.substring(lastDotIndex) : '';
+  const baseName = lastDotIndex > 0 ? name.substring(0, lastDotIndex) : name;
+
+  // Sanitize base name
+  const sanitizedBase = baseName
     .replace(/[<>:"/\\|?*]/g, '') // Remove illegal Windows chars
-    .replace(/\s+/g, '_')          // Replace spaces with underscores
-    .substring(0, 100);           // Limit length
+    .replace(/\s+/g, '_');          // Replace spaces with underscores
+
+  // Limit length (account for extension)
+  const maxLength = 100;
+  const allowedBaseLength = extension ? maxLength - extension.length : maxLength;
+  const truncatedBase = sanitizedBase.substring(0, allowedBaseLength);
+
+  return truncatedBase + extension;
 }
 
 /**
@@ -74,11 +86,11 @@ function sanitizeVideoTitle(title) {
  */
 export function generateZipFilename(playlistId, language, title = '') {
   const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const shortPlaylistId = playlistId.substring(0, 15);
+  const safePlaylistId = String(playlistId || 'playlist').substring(0, 15);
   const sanitizedTitle = title
     ? sanitizeVideoTitle(title).substring(0, 30) + '_'
     : '';
-  return `playlist_${sanitizedTitle}${shortPlaylistId}_${language}_${timestamp}.zip`;
+  return `playlist_${sanitizedTitle}${safePlaylistId}_${language}_${timestamp}.zip`;
 }
 
 /**
@@ -94,5 +106,6 @@ export function downloadZip(blob, filename) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Defer revocation to avoid race condition with download start
+  setTimeout(() => URL.revokeObjectURL(url), 100);
 }

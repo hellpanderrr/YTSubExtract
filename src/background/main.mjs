@@ -75,6 +75,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 5. Batch Download Playlist Subtitles (fire-and-forget so popup can poll progress)
   if (request.type === 'BATCH_DOWNLOAD_PLAYLIST') {
+    // Validate request
+    if (!Array.isArray(request.videos) || request.videos.length === 0 || !request.playlistId) {
+      globalThis.currentDownloadProgress = {
+        playlistId: request.playlistId || '',
+        status: 'error',
+        error: 'Invalid request: videos and playlistId are required',
+        total: 0,
+        completed: 0,
+        failed: 0
+      };
+      sendResponse({ success: false, error: 'Invalid request: videos and playlistId are required' });
+      return true;
+    }
+
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
     // Initialize progress immediately so popup sees it on first poll
     globalThis.currentDownloadProgress = {
@@ -85,6 +99,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       failed: 0,
       current: null
     };
+    // Persist to storage for service worker restart recovery
+    chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
     // Fire-and-forget: process in background, popup polls via GET_DOWNLOAD_PROGRESS
     handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId)
       .catch(err => {
@@ -97,6 +113,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           completed: globalThis.currentDownloadProgress?.completed || 0,
           failed: globalThis.currentDownloadProgress?.failed || 0
         };
+        chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
       });
     // Return immediately so popup can start polling
     sendResponse({ success: true, data: { downloadId } });
@@ -105,9 +122,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 6. Get Download Progress
   if (request.type === 'GET_DOWNLOAD_PROGRESS') {
-    sendResponse({ 
-      success: true, 
-      data: globalThis.currentDownloadProgress || null 
+    // If globalThis is null (service worker restarted), restore from storage
+    const restoreProgress = async () => {
+      if (!globalThis.currentDownloadProgress) {
+        const stored = await chrome.storage.local.get('currentDownloadProgress');
+        if (stored.currentDownloadProgress) {
+          globalThis.currentDownloadProgress = stored.currentDownloadProgress;
+        }
+      }
+      return globalThis.currentDownloadProgress || null;
+    };
+    restoreProgress().then(data => {
+      sendResponse({ success: true, data });
+    }).catch(() => {
+      sendResponse({ success: true, data: globalThis.currentDownloadProgress || null });
     });
     return true;
   }
@@ -115,6 +143,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 7. Clear Download Progress
   if (request.type === 'CLEAR_DOWNLOAD_PROGRESS') {
     globalThis.currentDownloadProgress = null;
+    chrome.storage.local.remove('currentDownloadProgress').catch(() => {});
     sendResponse({ success: true });
     return true;
   }
@@ -248,6 +277,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
           playlistId,
           status: 'running'
         };
+        chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
       },
       onVideoComplete: (result) => {
         console.log(`[Batch] Completed: ${result.videoId}`);
@@ -315,6 +345,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       downloadId,
       autoDownloaded: false
     };
+    chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
 
     return {
       downloadId,

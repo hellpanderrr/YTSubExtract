@@ -100,15 +100,19 @@ async function init() {
     // Check for playlist mode
     if (isPlaylistUrl(tab.url)) {
       currentPlaylistId = extractPlaylistId(tab.url);
+      if (!currentPlaylistId) {
+        setStatus('Failed to extract playlist ID', 'error');
+        return;
+      }
       isPlaylistMode = true;
-      
+
       btnReset.style.display = 'flex';
       setStatus(`Playlist found: ${currentPlaylistId}`);
-      
+
       // Hide single video controls, show playlist UI
       if (controlsEl) controlsEl.classList.add('hidden');
       playlistModeEl.classList.remove('hidden');
-      
+
       await loadPlaylistVideos(currentPlaylistId);
 
       // Check if there's an active download for this playlist
@@ -334,6 +338,7 @@ async function checkAndRestoreProgress() {
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
         currentDownloadId = null;
+        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       }
     }
   } catch (err) {
@@ -426,7 +431,7 @@ function startProgressPolling(totalVideos) {
         currentDownloadId = null;
 
         console.error('[Popup] Download error:', progress);
-        return;
+        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       }
     } catch (err) {
       console.error('Progress polling error:', err);

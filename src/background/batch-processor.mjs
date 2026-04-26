@@ -40,69 +40,72 @@ export class BatchProcessor {
 
     this.onProgress({ completed: 0, total, failed: 0, current: null });
 
-    // Process videos sequentially for better progress tracking
-    // (even though it's slower, it gives accurate 0->1->2->3 progress)
-    for (let i = 0; i < videos.length; i++) {
-      if (this.shouldStop) {
-        break;
-      }
+    try {
+      // Process videos sequentially for better progress tracking
+      // (even though it's slower, it gives accurate 0->1->2->3 progress)
+      for (let i = 0; i < videos.length; i++) {
+        if (this.shouldStop) {
+          break;
+        }
 
-      const video = videos[i];
+        const video = videos[i];
 
-      // Initial delay to show "processing video X"
-      await this._delay(200);
+        // Initial delay to show "processing video X"
+        await this._delay(200);
 
-      try {
-        // Report progress BEFORE processing (shows "processing X/Y")
+        try {
+          // Report progress BEFORE processing (shows "processing X/Y")
+          this.onProgress({
+            completed,
+            total,
+            failed: results.errors.length,
+            current: video.videoId
+          });
+
+          const transcript = await this._processVideo(video.videoId, options);
+
+          const result = {
+            videoId: video.videoId,
+            title: video.title,
+            index: video.index,
+            transcript,
+            format: options.format || 'srt'
+          };
+
+          results.success.push(result);
+          this.onVideoComplete(result);
+
+        } catch (err) {
+          const error = {
+            videoId: video.videoId,
+            title: video.title,
+            index: video.index,
+            error: err.message,
+            logs: err.logs || []
+          };
+
+          results.errors.push(error);
+          this.onVideoError(error);
+        }
+
+        // Update progress after each video
+        completed++;
         this.onProgress({
-          completed,
+          completed: Math.min(completed, total),
           total,
           failed: results.errors.length,
-          current: video.videoId
+          current: null
         });
 
-        const transcript = await this._processVideo(video.videoId, options);
-
-        const result = {
-          videoId: video.videoId,
-          title: video.title,
-          index: video.index,
-          transcript,
-          format: options.format || 'srt'
-        };
-
-        results.success.push(result);
-        this.onVideoComplete(result);
-
-      } catch (err) {
-        const error = {
-          videoId: video.videoId,
-          title: video.title,
-          index: video.index,
-          error: err.message,
-          logs: err.logs || []
-        };
-
-        results.errors.push(error);
-        this.onVideoError(error);
+        // Rate limiting delay between videos
+        if (i < videos.length - 1 && !this.shouldStop) {
+          await this._delay(this.delayMs);
+        }
       }
-
-      // Update progress after each video
-      completed++;
-      this.onProgress({
-        completed: Math.min(completed, total),
-        total,
-        failed: results.errors.length,
-        current: null
-      });
-
-      // Rate limiting delay between videos
-      if (i < videos.length - 1 && !this.shouldStop) {
-        await this._delay(this.delayMs);
-      }
+    } finally {
+      this.isRunning = false;
     }
 
-    this.isRunning = false;
     return results;
   }
 

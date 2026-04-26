@@ -18,6 +18,7 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
   const videos = [];
   let continuationToken = null;
   let pageCount = 0;
+  let firstData = null;
   let lastData = null;
   const maxPages = Math.ceil(maxResults / 100); // YouTube returns ~100 videos per page
 
@@ -45,6 +46,7 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 
       const data = await response.json();
       lastData = data;
+      if (!firstData) firstData = data;
 
       // Parse videos from response
       const pageVideos = parsePlaylistVideos(data);
@@ -85,8 +87,8 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 
     debug(`Total videos fetched: ${videos.length}`);
 
-    // Extract playlist title from response
-    const playlistTitle = extractPlaylistTitle(lastData);
+    // Extract playlist title from first page (continuation pages may not have title)
+    const playlistTitle = extractPlaylistTitle(firstData);
     debug(`Playlist title: ${playlistTitle}`);
 
     return { videos, title: playlistTitle };

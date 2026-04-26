@@ -1255,14 +1255,19 @@ export class TranslationManager {
       const videoInfo = await getVideoInfo(videoId);
       
       const captionTracks = videoInfo?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      if (captionTracks && captionTracks.length > 0) {
-        let track = captionTracks[0];
+      // Fallback: Check inside playerOverlays (common in Android/Mobile)
+      const overlayTracks = videoInfo?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
+      const tracks = captionTracks || overlayTracks;
+      if (tracks && tracks.length > 0) {
+        let track = tracks[0];
         if (sourceLang !== 'auto') {
-          track = captionTracks.find(t => t.languageCode === sourceLang) || track;
+          track = tracks.find(t => t.languageCode === sourceLang) || track;
         }
 
         if (track?.baseUrl) {
           let fetchUrl = track.baseUrl;
+          // Remove existing tlang parameter to avoid duplicates
+          fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]+/, '');
           if (translate && targetLang) {
             fetchUrl += `&tlang=${targetLang}`;
           }
