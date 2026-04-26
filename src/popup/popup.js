@@ -276,6 +276,11 @@ async function downloadPlaylistSubtitles() {
       throw new Error(response?.error || 'Failed to start batch download');
     }
 
+    if (!response.data || !response.data.downloadId) {
+      console.log('[Popup] Response missing data or downloadId:', response);
+      throw new Error(response?.error || 'Failed to start batch download: missing downloadId');
+    }
+
     currentDownloadId = response.data.downloadId;
     console.log('[Popup] Download started, ID:', currentDownloadId);
 
@@ -465,7 +470,8 @@ async function downloadCompletedZip(downloadId) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    // Defer revocation to avoid race with download start in popup context
+    setTimeout(() => URL.revokeObjectURL(url), 100);
 
     setStatus(
       `Downloaded successfully!`,
@@ -741,7 +747,8 @@ function downloadFile(content, filename, mimeType) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Defer revocation to avoid race with download start in popup context
+  setTimeout(() => URL.revokeObjectURL(url), 100);
 }
 
 // Event Listeners
