@@ -534,9 +534,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             title = document.title.replace(' - YouTube', '').trim();
         }
 
-        sendResponse({ title });
+        sendResponse({ success: true, title });
     } catch (e) {
-        sendResponse({ title: null, error: e.message });
+        sendResponse({ success: false, title: null, error: e.message });
     }
     return true;
   }
@@ -1073,11 +1073,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         if (videoElements.length === 0) {
-          // Try to find in ytInitialData
-          if (typeof window.ytInitialData !== 'undefined') {
-            log('Trying ytInitialData...');
-            try {
-              const initialData = window.ytInitialData;
+          // Try to find in ytInitialData via page context
+          log('Trying ytInitialData via getPageVariable...');
+          try {
+            const initialData = await getPageVariable('ytInitialData');
+            if (initialData) {
+              log('Got ytInitialData from page context');
               const contents = initialData?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents;
               if (contents) {
                 for (const section of contents) {
@@ -1121,9 +1122,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                   }
                 }
               }
-            } catch (e) {
-              log(`ytInitialData extraction failed: ${e.message}`);
+            } else {
+              log('ytInitialData not available in page context');
             }
+          } catch (e) {
+            log(`ytInitialData extraction failed: ${e.message}`);
           }
           log('No videos found in DOM or ytInitialData');
           sendResponse({ success: false, error: 'No videos found', logs });
@@ -1183,12 +1186,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (titleEl) {
           playlistTitle = titleEl.textContent?.trim() || '';
         }
-        // Fallback to ytInitialData
-        if (!playlistTitle && typeof window.ytInitialData !== 'undefined') {
+        // Fallback to ytInitialData via page context
+        if (!playlistTitle) {
           try {
-            const metadata = window.ytInitialData?.metadata?.playlistMetadataRenderer;
-            if (metadata?.title) {
-              playlistTitle = metadata.title;
+            const initialData = await getPageVariable('ytInitialData');
+            if (initialData) {
+              const metadata = initialData?.metadata?.playlistMetadataRenderer;
+              if (metadata?.title) {
+                playlistTitle = metadata.title;
+                log(`Got playlist title from ytInitialData: ${playlistTitle}`);
+              }
             }
           } catch (e) {
             // ignore

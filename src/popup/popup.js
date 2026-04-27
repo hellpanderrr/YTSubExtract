@@ -155,7 +155,7 @@ async function loadPlaylistVideos(playlistId) {
 
   try {
     console.log('[Popup] Fetching playlist:', playlistId);
-    const result = await fetchPlaylistVideos(playlistId, 50);
+    const result = await fetchPlaylistVideos(playlistId);
     console.log('[Popup] Got result:', result);
 
     const videos = result.videos || result; // Handle both old and new format
@@ -412,10 +412,13 @@ async function checkAndRestoreProgress() {
 
       // Handle different statuses
       if (progress.status === 'running') {
+        // Set guard to prevent concurrent downloads
+        currentDownloadId = progress.downloadId || 'restored';
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
         // Completed — download ZIP (auto-download flow not implemented)
+        currentDownloadId = null;
         await downloadCompletedZip(progress.downloadId);
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       } else if (progress.status === 'error') {
@@ -600,38 +603,60 @@ function updatePlaylistTranslationState() {
 }
 
 function savePlaylistSettings() {
-  chrome.storage.local.set({
-    playlistTranslateChecked: playlistTranslateCheck?.checked,
-    playlistTargetLanguage: playlistTranslateLang?.value,
-    playlistSourceLanguage: playlistLangSelect?.value,
-    playlistFormat: playlistFormatSelect?.value
-  });
+  if (!currentPlaylistId) {
+    console.log('[Popup] Skipping savePlaylistSettings - no current playlist');
+    return;
+  }
+  const keys = {
+    [`playlist:${currentPlaylistId}:translateChecked`]: playlistTranslateCheck?.checked,
+    [`playlist:${currentPlaylistId}:targetLanguage`]: playlistTranslateLang?.value,
+    [`playlist:${currentPlaylistId}:sourceLanguage`]: playlistLangSelect?.value,
+    [`playlist:${currentPlaylistId}:format`]: playlistFormatSelect?.value
+  };
+  chrome.storage.local.set(keys);
+  console.log(`[Popup] Saved playlist settings for ${currentPlaylistId}`);
 }
 
 function loadPlaylistSettings() {
-  chrome.storage.local.get(['playlistTranslateChecked', 'playlistTargetLanguage', 'playlistSourceLanguage', 'playlistFormat'], (result) => {
-    if (result.playlistTranslateChecked !== undefined && playlistTranslateCheck) {
-      playlistTranslateCheck.checked = result.playlistTranslateChecked;
+  if (!currentPlaylistId) {
+    console.log('[Popup] Skipping loadPlaylistSettings - no current playlist');
+    return;
+  }
+  const keys = [
+    `playlist:${currentPlaylistId}:translateChecked`,
+    `playlist:${currentPlaylistId}:targetLanguage`,
+    `playlist:${currentPlaylistId}:sourceLanguage`,
+    `playlist:${currentPlaylistId}:format`
+  ];
+  chrome.storage.local.get(keys, (result) => {
+    const translateChecked = result[`playlist:${currentPlaylistId}:translateChecked`];
+    const targetLanguage = result[`playlist:${currentPlaylistId}:targetLanguage`];
+    const sourceLanguage = result[`playlist:${currentPlaylistId}:sourceLanguage`];
+    const format = result[`playlist:${currentPlaylistId}:format`];
+
+    if (translateChecked !== undefined && playlistTranslateCheck) {
+      playlistTranslateCheck.checked = translateChecked;
       updatePlaylistTranslationState();
     }
-    if (result.playlistTargetLanguage && playlistTranslateLang) {
-      const option = Array.from(playlistTranslateLang.options).find(o => o.value === result.playlistTargetLanguage);
+    if (targetLanguage && playlistTranslateLang) {
+      const option = Array.from(playlistTranslateLang.options).find(o => o.value === targetLanguage);
       if (option) {
-        playlistTranslateLang.value = result.playlistTargetLanguage;
+        playlistTranslateLang.value = targetLanguage;
       }
     }
-    if (result.playlistSourceLanguage && playlistLangSelect) {
-      const option = Array.from(playlistLangSelect.options).find(o => o.value === result.playlistSourceLanguage);
+    if (sourceLanguage && playlistLangSelect) {
+      const option = Array.from(playlistLangSelect.options).find(o => o.value === sourceLanguage);
       if (option) {
-        playlistLangSelect.value = result.playlistSourceLanguage;
+        playlistLangSelect.value = sourceLanguage;
       }
     }
-    if (result.playlistFormat && playlistFormatSelect) {
-      const option = Array.from(playlistFormatSelect.options).find(o => o.value === result.playlistFormat);
+    if (format && playlistFormatSelect) {
+      const option = Array.from(playlistFormatSelect.options).find(o => o.value === format);
       if (option) {
-        playlistFormatSelect.value = result.playlistFormat;
+        playlistFormatSelect.value = format;
       }
     }
+    console.log(`[Popup] Loaded playlist settings for ${currentPlaylistId}`);
   });
 }
 

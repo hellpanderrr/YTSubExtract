@@ -40,7 +40,7 @@ The extension uses a priority fallback model with multiple extraction methods.
 
 **Mechanism**: Fetches the embed page (`/embed/{videoId}`) and extracts `ytInitialPlayerResponse` from HTML.
 
-**Use Case**: Guest mode (no login required), works without authentication and age-restricted videos.
+**Use Case**: Guest mode (no login required); handles age-restricted videos.
 
 **Timeout Protection**: 8-second timeout prevents hanging on slow responses.
 
@@ -74,9 +74,9 @@ The extension uses a priority fallback model with multiple extraction methods.
 
 ### Metadata Cascade (Available Languages)
 ```
-Parallel Batch: [Tier 0.5, Tier 1.5, Tier 1] → Tier 2 → Tier 3 → Tier 4
+Parallel Batch: [Tier 0.5, Tier 1.5] → Tier 1 → Tier 2 → Tier 3 → Tier 4
 ```
-Tiers 0.5, 1.5, and 1 execute in parallel for faster initialization. Results processed in priority order (0.5 → 1 → 1.5). Tier 0 skipped for metadata (captures single language URL, metadata needs all languages).
+Tiers 0.5 and 1.5 execute in parallel first (cheap, no API calls). Tier 1 runs sequentially only if both cheap tiers fail. Results processed in priority order (0.5 → 1.5 → 1). Tier 0 skipped for metadata (captures single language URL, metadata needs all languages).
 
 **Timeout Protection**: Each tier has 8-10 second timeout to prevent hanging.
 
