@@ -174,6 +174,9 @@ async function loadPlaylistVideos(playlistId) {
     // Populate target language dropdown for translation
     populatePlaylistTargetLanguageSelect();
 
+    // Restore saved settings now that dropdowns are populated
+    loadPlaylistSettings();
+
   } catch (e) {
     console.error('[Popup] Failed to load playlist:', e);
     setStatus('Failed to load playlist: ' + e.message, 'error');
@@ -199,9 +202,9 @@ async function fetchPlaylistLanguages(videoId) {
   }
 }
 
-function populatePlaylistLanguageSelect(languages) {
-  // Keep the "Auto" option
-  playlistLangSelect.innerHTML = '<option value="auto" selected>Auto (first available)</option>';
+function populatePlaylistLanguageSelect(languages, selectedValue = 'auto') {
+  // Keep the "Auto" option (not pre-selected, let caller decide)
+  playlistLangSelect.innerHTML = '<option value="auto">Auto (first available)</option>';
 
   if (languages && languages.length > 0) {
     languages.forEach(lang => {
@@ -211,15 +214,20 @@ function populatePlaylistLanguageSelect(languages) {
       playlistLangSelect.add(option);
     });
   }
+
+  // Restore saved value if provided and exists in options
+  if (selectedValue) {
+    const option = Array.from(playlistLangSelect.options).find(o => o.value === selectedValue);
+    if (option) {
+      playlistLangSelect.value = selectedValue;
+    }
+  }
 }
 
-function populatePlaylistTargetLanguageSelect() {
+function populatePlaylistTargetLanguageSelect(selectedValue = 'ru') {
   if (!playlistTranslateLang) return;
 
   playlistTranslateLang.innerHTML = '';
-
-  // Default to Russian if available, otherwise English
-  let defaultLang = 'ru';
 
   SUPPORTED_LANGUAGES.forEach(lang => {
     const option = document.createElement('option');
@@ -228,7 +236,13 @@ function populatePlaylistTargetLanguageSelect() {
     playlistTranslateLang.add(option);
   });
 
-  playlistTranslateLang.value = defaultLang;
+  // Restore saved value if provided and exists in options
+  if (selectedValue) {
+    const option = Array.from(playlistTranslateLang.options).find(o => o.value === selectedValue);
+    if (option) {
+      playlistTranslateLang.value = selectedValue;
+    }
+  }
 }
 
 function renderPlaylistVideos() {
@@ -283,7 +297,8 @@ function renderPlaylistVideos() {
 function updateSelectedCount() {
   const selected = currentPlaylistVideos.filter(v => v.selected).length;
   selectedCountEl.textContent = `${selected} selected`;
-  btnDownloadZip.disabled = selected === 0;
+  // Keep button disabled if download is in progress, even if items are selected
+  btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
 }
 
 let currentDownloadId = null;
@@ -377,6 +392,7 @@ async function checkAndRestoreProgress() {
       if (progress.total > 0) {
         const percent = (progress.completed / progress.total) * 100;
         progressFillEl.style.width = `${percent}%`;
+        progressFillEl.setAttribute('aria-valuenow', Math.round(percent));
         progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
       }
 
@@ -422,6 +438,7 @@ function startProgressPolling(totalVideos) {
   // Reset UI to initial state - ALWAYS set initial text
   const initialTotal = totalVideos || 0;
   progressFillEl.style.width = '0%';
+  progressFillEl.setAttribute('aria-valuenow', '0');
   progressTextEl.textContent = `0 / ${initialTotal || '?'}`;
   console.log('[Popup] Initial progress set to: 0 /', initialTotal || '?');
 
@@ -454,6 +471,7 @@ function startProgressPolling(totalVideos) {
       if (progress.total > 0) {
         const percent = (progress.completed / progress.total) * 100;
         progressFillEl.style.width = `${percent}%`;
+        progressFillEl.setAttribute('aria-valuenow', Math.round(percent));
         progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
         console.log(`[Popup] UI updated: ${progress.completed}/${progress.total} (${percent.toFixed(1)}%)`);
 
@@ -613,8 +631,7 @@ playlistTranslateCheck?.addEventListener('change', () => {
 playlistTranslateLang?.addEventListener('change', savePlaylistSettings);
 playlistLangSelect?.addEventListener('change', savePlaylistSettings);
 
-// Load playlist settings on init
-loadPlaylistSettings();
+// Note: loadPlaylistSettings is now called after dropdowns are populated in loadPlaylistVideos
 
 async function fetchLanguages(videoId) {
   setStatus('Fetching languages...', 'info', true);

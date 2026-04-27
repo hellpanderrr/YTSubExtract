@@ -343,21 +343,22 @@ export class TranslationManager {
       const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       let response;
+      let html;
       try {
         response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
           signal: controller.signal
         });
+
+        console.log(`[Tier 1.5] Fetch status: ${response.status}`);
+
+        if (!response.ok) {
+          throw new Error(`Embed page fetch failed: ${response.status}`);
+        }
+
+        html = await response.text();
       } finally {
         clearTimeout(timeoutId);
       }
-
-      console.log(`[Tier 1.5] Fetch status: ${response.status}`);
-
-      if (!response.ok) {
-        throw new Error(`Embed page fetch failed: ${response.status}`);
-      }
-
-      const html = await response.text();
       console.log(`[Tier 1.5] HTML length: ${html.length}`);
       
       // Method 1: Look for ytcfg.set({ ... })
@@ -463,15 +464,16 @@ export class TranslationManager {
       const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       let response;
+      let html;
       try {
         response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
           signal: controller.signal
         });
+
+        html = await response.text();
       } finally {
         clearTimeout(timeoutId);
       }
-
-      const html = await response.text();
       
       // Find caption track URL from embed page
       const scriptMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
@@ -1272,7 +1274,7 @@ export class TranslationManager {
     log(`Processing ${videoId} (API-only tiers)...`);
     log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
 
-    const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${targetLang}`;
+    const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${translate ? targetLang : ''}`;
     
     // Check cache
     if (this.cache.has(cacheKey)) {
@@ -1292,19 +1294,25 @@ export class TranslationManager {
       const captionTracks = videoInfo?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
       // Fallback: Check inside playerOverlays (common in Android/Mobile)
       const overlayTracks = videoInfo?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
-      const tracks = captionTracks || overlayTracks;
+      const tracks = (captionTracks?.length > 0) ? captionTracks : overlayTracks;
       if (tracks && tracks.length > 0) {
-        let track = tracks[0];
-        if (sourceLang !== 'auto') {
-          track = tracks.find(t => t.languageCode === sourceLang) || track;
+        let track;
+        if (sourceLang === 'auto') {
+          // Prefer English for auto mode, fallback to first track (match _extractFromEmbed)
+          track = tracks.find(t => t.languageCode === 'en') || tracks[0];
+        } else {
+          track = tracks.find(t => t.languageCode === sourceLang) || tracks[0];
         }
 
         if (track?.baseUrl) {
           let fetchUrl = track.baseUrl;
           // Remove existing tlang parameter to avoid duplicates
-          fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]+/, '');
+          fetchUrl = fetchUrl.replace(/tlang=[^&]+&?/, '');
+          // Clean up trailing & and ?& patterns (match extractWithTranslation behavior)
+          fetchUrl = fetchUrl.replace(/&$/, '');
+          fetchUrl = fetchUrl.replace(/\?&/, '?');
           if (translate && targetLang) {
-            fetchUrl += `&tlang=${targetLang}`;
+            fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
           }
           if (!fetchUrl.includes('fmt=')) {
             fetchUrl += '&fmt=json3';
