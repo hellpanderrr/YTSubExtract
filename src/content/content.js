@@ -1110,11 +1110,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     }
                     if (videos.length > 0) {
                       log(`Extracted ${videos.length} videos from ytInitialData`);
-                      // Get playlist title
+                      // Get playlist title from multiple sources
                       let playlistTitle = '';
                       const metadata = initialData?.metadata?.playlistMetadataRenderer;
+                      const header = initialData?.header?.playlistHeaderRenderer;
+                      const sidebar = initialData?.sidebar?.playlistSidebarRenderer?.items?.[0]?.playlistSidebarPrimaryInfoRenderer;
+
                       if (metadata?.title) {
                         playlistTitle = metadata.title;
+                        log(`Got playlist title from metadata: ${playlistTitle}`);
+                      } else if (header?.title?.simpleText) {
+                        playlistTitle = header.title.simpleText;
+                        log(`Got playlist title from header: ${playlistTitle}`);
+                      } else if (sidebar?.title?.runs?.[0]?.text) {
+                        playlistTitle = sidebar.title.runs[0].text;
+                        log(`Got playlist title from sidebar: ${playlistTitle}`);
+                      } else if (sidebar?.title?.simpleText) {
+                        playlistTitle = sidebar.title.simpleText;
+                        log(`Got playlist title from sidebar simpleText: ${playlistTitle}`);
                       }
                       sendResponse({ success: true, videos, title: playlistTitle, logs });
                       return;
@@ -1178,27 +1191,56 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         log(`Successfully extracted ${videos.length} videos from DOM`);
 
-        // Try to get playlist title
+        // Try to get playlist title from DOM
         let playlistTitle = '';
-        const titleEl = document.querySelector('ytd-playlist-header-renderer h1 yt-formatted-string') ||
-                       document.querySelector('ytd-playlist-header-renderer h1') ||
-                       document.querySelector('.ytd-playlist-header-renderer #title');
-        if (titleEl) {
-          playlistTitle = titleEl.textContent?.trim() || '';
+        const titleSelectors = [
+          'ytd-playlist-header-renderer h1 yt-formatted-string',
+          'ytd-playlist-header-renderer h1',
+          'ytd-playlist-header-renderer #title',
+          '.ytd-playlist-header-renderer #title',
+          'ytd-playlist-header-renderer .title',
+          '#playlist-header h1',
+          '[page-subtype="playlist"] h1',
+          'ytd-browse[page-subtype="playlist"] #header h1'
+        ];
+
+        for (const selector of titleSelectors) {
+          const titleEl = document.querySelector(selector);
+          if (titleEl && titleEl.textContent?.trim()) {
+            playlistTitle = titleEl.textContent.trim();
+            log(`Found playlist title using selector "${selector}": ${playlistTitle}`);
+            break;
+          }
         }
+
         // Fallback to ytInitialData via page context
         if (!playlistTitle) {
+          log('No title from DOM, trying ytInitialData...');
           try {
             const initialData = await getPageVariable('ytInitialData');
             if (initialData) {
+              // Try multiple paths for playlist metadata
               const metadata = initialData?.metadata?.playlistMetadataRenderer;
+              const header = initialData?.header?.playlistHeaderRenderer;
+              const sidebar = initialData?.sidebar?.playlistSidebarRenderer?.items?.[0]?.playlistSidebarPrimaryInfoRenderer;
+
               if (metadata?.title) {
                 playlistTitle = metadata.title;
-                log(`Got playlist title from ytInitialData: ${playlistTitle}`);
+                log(`Got playlist title from ytInitialData.metadata: ${playlistTitle}`);
+              } else if (header?.title?.simpleText) {
+                playlistTitle = header.title.simpleText;
+                log(`Got playlist title from ytInitialData.header: ${playlistTitle}`);
+              } else if (sidebar?.title?.runs?.[0]?.text) {
+                playlistTitle = sidebar.title.runs[0].text;
+                log(`Got playlist title from ytInitialData.sidebar: ${playlistTitle}`);
+              } else {
+                log('ytInitialData structure:', JSON.stringify(Object.keys(initialData || {})));
               }
+            } else {
+              log('ytInitialData not available');
             }
           } catch (e) {
-            // ignore
+            log(`ytInitialData fallback failed: ${e.message}`);
           }
         }
 

@@ -111,7 +111,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           error: err.message,
           total: request.videos.length,
           completed: globalThis.currentDownloadProgress?.completed || 0,
-          failed: globalThis.currentDownloadProgress?.failed || 0
+          failed: globalThis.currentDownloadProgress?.failed || 0,
+          downloadId
         };
         chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
       });
@@ -380,7 +381,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       completed: results.success.length + results.errors.length,
       total: videos.length,
       failed: results.errors.length,
-      downloadId,
+      downloadId,  // Explicitly include for progress restoration
       autoDownloaded: false
     };
     chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});

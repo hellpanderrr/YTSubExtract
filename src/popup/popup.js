@@ -310,6 +310,7 @@ function updateSelectedCount() {
 
 let currentDownloadId = null;
 let progressCheckInterval = null;
+let isDownloadingZip = false; // Guard to prevent concurrent ZIP downloads
 
 async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
@@ -412,21 +413,34 @@ async function checkAndRestoreProgress() {
 
       // Handle different statuses
       if (progress.status === 'running') {
-        // Set guard to prevent concurrent downloads
-        currentDownloadId = progress.downloadId || 'restored';
+        // Set guard to prevent concurrent downloads (only if we have a valid downloadId)
+        if (progress.downloadId) {
+          currentDownloadId = progress.downloadId;
+        }
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
         // Completed — download ZIP (auto-download flow not implemented)
-        currentDownloadId = null;
-        await downloadCompletedZip(progress.downloadId);
-        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        // Prevent race: skip if already downloading from polling
+        if (isDownloadingZip) {
+          console.log('[Popup] ZIP download already in progress from polling, skipping');
+          return;
+        }
+        try {
+          isDownloadingZip = true;
+          await downloadCompletedZip(progress.downloadId);
+        } finally {
+          currentDownloadId = null;
+          isDownloadingZip = false;
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        }
       } else if (progress.status === 'error') {
         // Error occurred
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
         currentDownloadId = null;
+        isDownloadingZip = false; // Reset guard for consistency
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       }
     }
@@ -478,6 +492,12 @@ function startProgressPolling(totalVideos) {
         // Stop polling to prevent resource leak
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
+        // Reset download guard so user can start new downloads on this playlist
+        currentDownloadId = null;
+        isDownloadingZip = false;
+        btnDownloadZip.disabled = currentPlaylistVideos.filter(v => v.selected).length === 0;
+        // Hide progress UI since we're on wrong playlist
+        playlistProgressEl.classList.add('hidden');
         return;
       }
 
@@ -502,8 +522,19 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
+        // Prevent race: skip if already downloading from checkAndRestoreProgress
+        if (isDownloadingZip) {
+          console.log('[Popup] ZIP download already in progress from restore, skipping');
+          return;
+        }
+
         // Download ZIP (auto-download flow not implemented)
-        await downloadCompletedZip(progress.downloadId);
+        try {
+          isDownloadingZip = true;
+          await downloadCompletedZip(progress.downloadId);
+        } finally {
+          isDownloadingZip = false;
+        }
 
         // Clear the progress
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
@@ -518,6 +549,7 @@ function startProgressPolling(totalVideos) {
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
         currentDownloadId = null;
+        isDownloadingZip = false; // Reset guard for consistency
 
         console.error('[Popup] Download error:', progress);
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
@@ -555,7 +587,8 @@ async function downloadCompletedZip(downloadId) {
     a.click();
     document.body.removeChild(a);
     // Defer revocation to avoid race with download start in popup context
-    setTimeout(() => URL.revokeObjectURL(url), 100);
+    // Use 30s to ensure download has started even on slow connections
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
 
     setStatus(
       `Downloaded successfully!`,
@@ -861,7 +894,8 @@ function downloadFile(content, filename, mimeType) {
   a.click();
   document.body.removeChild(a);
   // Defer revocation to avoid race with download start in popup context
-  setTimeout(() => URL.revokeObjectURL(url), 100);
+  // Use 30s to ensure download has started even on slow connections
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 // Event Listeners
