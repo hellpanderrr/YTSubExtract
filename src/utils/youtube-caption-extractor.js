@@ -21,20 +21,20 @@ const INNERTUBE_CONFIG = {
     },
     ANDROID: {
       NAME: 'ANDROID',
-      VERSION: '19.50.40',
-      USER_AGENT: 'com.google.android.youtube/19.50.40 (Linux; U; Android 14; US; Pixel 8 Build/AP2A.240905.003)',
+      VERSION: '20.05.41',
+      USER_AGENT: 'com.google.android.youtube/20.05.41 (Linux; U; Android 15; US; Pixel 9 Build/AP4A.250205.002)',
       CLIENT_ID: '3',
     },
     IOS: {
       NAME: 'IOS',
-      VERSION: '19.49.4',
-      USER_AGENT: 'com.google.ios.youtube/19.49.4 (iPhone15,2; iOS 17.6.1; scale/3.00)',
+      VERSION: '20.04.3',
+      USER_AGENT: 'com.google.ios.youtube/20.04.3 (iPhone16,2; iOS 18.2.1; scale/3.00)',
       CLIENT_ID: '5',
     },
     TVHTML5: {
       NAME: 'TVHTML5',
-      VERSION: '7.20250224.08.01',
-      USER_AGENT: 'Mozilla/5.0 (Chromecast; GoogleTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.0 Safari/537.36',
+      VERSION: '7.20250401.10.00',
+      USER_AGENT: 'Mozilla/5.0 (Chromecast; GoogleTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       CLIENT_ID: '7',
     }
   },
@@ -92,9 +92,13 @@ function generateVisitorData() {
   return result;
 }
 
-export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
+export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', timeoutMs = 10000) {
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
-  
+
+  if (!clientConfig) {
+    throw new Error(`Invalid client type: ${clientType}`);
+  }
+
   const headers = {
     'Content-Type': 'application/json',
     Accept: '*/*',
@@ -116,11 +120,23 @@ export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID') {
 
   debug(`Calling InnerTube endpoint: ${endpoint} with client: ${clientType}`);
 
-  return await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(data),
-  });
+  // Add timeout to prevent hanging
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
 }
 
 export async function getVideoInfo(videoID) {

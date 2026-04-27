@@ -166,11 +166,69 @@ async function loadPlaylistVideos(playlistId) {
     updateSelectedCount();
     btnDownloadZip.disabled = videos.length === 0;
 
+    // Fetch languages from first video to populate playlist language dropdown
+    if (videos.length > 0) {
+      await fetchPlaylistLanguages(videos[0].videoId);
+    }
+
+    // Populate target language dropdown for translation
+    populatePlaylistTargetLanguageSelect();
+
   } catch (e) {
     console.error('[Popup] Failed to load playlist:', e);
     setStatus('Failed to load playlist: ' + e.message, 'error');
     playlistCountEl.textContent = 'Error';
   }
+}
+
+async function fetchPlaylistLanguages(videoId) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'GET_VIDEO_METADATA',
+      videoId
+    });
+
+    if (response && response.success) {
+      const { languages } = response.data;
+      populatePlaylistLanguageSelect(languages);
+    }
+  } catch (e) {
+    console.log('[Popup] Could not fetch languages for playlist:', e);
+    // Fallback to SUPPORTED_LANGUAGES
+    populatePlaylistLanguageSelect(SUPPORTED_LANGUAGES.map(l => ({ code: l.code, name: l.name })));
+  }
+}
+
+function populatePlaylistLanguageSelect(languages) {
+  // Keep the "Auto" option
+  playlistLangSelect.innerHTML = '<option value="auto" selected>Auto (first available)</option>';
+
+  if (languages && languages.length > 0) {
+    languages.forEach(lang => {
+      const option = document.createElement('option');
+      option.value = lang.code;
+      option.text = `${lang.name} ${lang.isAuto ? '(Auto)' : ''}`;
+      playlistLangSelect.add(option);
+    });
+  }
+}
+
+function populatePlaylistTargetLanguageSelect() {
+  if (!playlistTranslateLang) return;
+
+  playlistTranslateLang.innerHTML = '';
+
+  // Default to Russian if available, otherwise English
+  let defaultLang = 'ru';
+
+  SUPPORTED_LANGUAGES.forEach(lang => {
+    const option = document.createElement('option');
+    option.value = lang.code;
+    option.text = lang.name;
+    playlistTranslateLang.add(option);
+  });
+
+  playlistTranslateLang.value = defaultLang;
 }
 
 function renderPlaylistVideos() {

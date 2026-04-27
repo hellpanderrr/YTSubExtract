@@ -190,59 +190,70 @@ export class TranslationManager {
 
     console.log(`[TranslationManager] Metadata cache miss for ${videoId}, fetching...`);
 
-    // Tier 0.5: Player API (first priority)
-    try {
-        const tier05Result = await this._getLanguagesTier0_5(videoId);
-        if (tier05Result.languages && tier05Result.languages.length > 0) {
-            console.log(`[TranslationManager] Tier 0.5 success: ${tier05Result.languages.length} languages`);
-            const result = {
-                title: tier05Result.title || 'YouTube Video',
-                languages: tier05Result.languages
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-    } catch (e05) {
-        console.warn('Tier 0.5 Metadata failed:', e05);
-    }
-
-    // Tier 1.5: Embed Page (Guest Mode / Age-Restricted Bypass)
-    // MOVED BEFORE Tier 1 - Embed works for guests!
-    try {
-        const tier15Result = await this._getLanguagesTier1_5(videoId);
-        if (tier15Result.languages && tier15Result.languages.length > 0) {
-            console.log(`[TranslationManager] Tier 1.5 success: ${tier15Result.languages.length} languages`);
-            const result = {
-                title: tier15Result.title || 'YouTube Video',
-                languages: tier15Result.languages
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-    } catch (e15) {
-        console.warn('Tier 1.5 Metadata failed:', e15);
-    }
-
-    // Tier 1: Android/iOS/TVHTML5 API (requires auth for some videos)
-    try {
+    // Parallel batch: Tier 0.5, 1.5, 1 (independent operations)
+    console.log('[TranslationManager] Starting parallel tier batch: 0.5, 1.5, 1');
+    const parallelResults = await Promise.allSettled([
+      this._getLanguagesTier0_5(videoId),
+      this._getLanguagesTier1_5(videoId),
+      (async () => {
         const { languages, title } = await getLanguages(videoId);
-        if (languages && languages.length > 0) {
-            const result = {
-                title: title || 'YouTube Video',
-                languages: languages.map(l => ({
-                    code: l.languageCode,
-                    name: l.languageName,
-                    isAuto: l.kind === 'asr'
-                }))
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-        // If Tier 1 returned no languages, log it
-        console.warn('Tier 1 Metadata returned no languages');
-    } catch (e1) {
-        // If Tier 1 failed (e.g. Sign in required), log it
-        console.warn('Tier 1 Metadata failed:', e1.message || e1);
+        return {
+          languages: languages?.map(l => ({
+            code: l.languageCode,
+            name: l.languageName,
+            isAuto: l.kind === 'asr'
+          })) || [],
+          title: title || 'YouTube Video'
+        };
+      })()
+    ]);
+
+    // Process results in priority order: 0.5 (fastest/best) → 1 (API) → 1.5 (slow)
+    const [tier05Result, tier15Result, tier1Result] = parallelResults;
+
+    // Tier 0.5: Player API (first priority - instant from active player)
+    if (tier05Result.status === 'fulfilled') {
+      const result = tier05Result.value;
+      if (result.languages && result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 0.5 success: ${result.languages.length} languages`);
+        const metadata = {
+          title: result.title || 'YouTube Video',
+          languages: result.languages
+        };
+        this.cache.set(cacheKey, metadata);
+        return metadata;
+      }
+    } else {
+      console.warn('Tier 0.5 Metadata failed:', tier05Result.reason?.message || tier05Result.reason);
+    }
+
+    // Tier 1: Android/iOS/TVHTML5 API (second priority - reliable API)
+    if (tier1Result.status === 'fulfilled') {
+      const result = tier1Result.value;
+      if (result.languages && result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 1 success: ${result.languages.length} languages`);
+        this.cache.set(cacheKey, result);
+        return result;
+      }
+      console.warn('Tier 1 Metadata returned no languages');
+    } else {
+      console.warn('Tier 1 Metadata failed:', tier1Result.reason?.message || tier1Result.reason);
+    }
+
+    // Tier 1.5: Embed Page (third priority - slow but works for age-restricted)
+    if (tier15Result.status === 'fulfilled') {
+      const result = tier15Result.value;
+      if (result.languages && result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 1.5 success: ${result.languages.length} languages`);
+        const metadata = {
+          title: result.title || 'YouTube Video',
+          languages: result.languages
+        };
+        this.cache.set(cacheKey, metadata);
+        return metadata;
+      }
+    } else {
+      console.warn('Tier 1.5 Metadata failed:', tier15Result.reason?.message || tier15Result.reason);
     }
 
     // Tier 2
@@ -326,14 +337,26 @@ export class TranslationManager {
   async _getLanguagesTier1_5(videoId) {
     try {
       console.log('[Tier 1.5] Attempting Embed page extraction...');
-      
-      const response = await fetch(`https://www.youtube.com/embed/${videoId}`);
+
+      // Add timeout to prevent hanging for 10+ seconds (covers fetch + body reading)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      let response;
+      try {
+        response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
       console.log(`[Tier 1.5] Fetch status: ${response.status}`);
-      
+
       if (!response.ok) {
         throw new Error(`Embed page fetch failed: ${response.status}`);
       }
-      
+
       const html = await response.text();
       console.log(`[Tier 1.5] HTML length: ${html.length}`);
       
@@ -434,8 +457,20 @@ export class TranslationManager {
   async _extractFromEmbed(videoId, lang, translate, targetLang) {
     try {
       console.log('[Tier 1.5] Extracting transcript from embed page...');
-      
-      const response = await fetch(`https://www.youtube.com/embed/${videoId}`);
+
+      // Add timeout to prevent hanging (covers fetch + body reading)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      let response;
+      try {
+        response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
       const html = await response.text();
       
       // Find caption track URL from embed page
