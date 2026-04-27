@@ -147,6 +147,44 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
     return true;
   }
+
+  // 8. Get Playlist Videos (Tier 0.5 DOM extraction first, then API fallback)
+  if (request.type === 'GET_PLAYLIST_VIDEOS') {
+    (async () => {
+      try {
+        // Try Tier 0.5 first (DOM extraction for private playlists)
+        console.log(`[Main] Trying Tier 0.5 for playlist: ${request.playlistId}`);
+        const tier05Result = await translationManager._getPlaylistVideosTier0_5(request.playlistId);
+
+        if (tier05Result && tier05Result.videos && tier05Result.videos.length > 0) {
+          console.log(`[Main] Tier 0.5 success: ${tier05Result.videos.length} videos`);
+          sendResponse({
+            success: true,
+            videos: tier05Result.videos.map((v, i) => ({ ...v, index: i + 1 })),
+            title: tier05Result.title,
+            source: 'tier0.5'
+          });
+          return;
+        }
+
+        // Fall back to API extraction
+        console.log(`[Main] Tier 0.5 failed or empty, falling back to API`);
+        const { fetchPlaylistVideosAPI } = await import('../utils/playlist-extractor.js');
+        const apiResult = await fetchPlaylistVideosAPI(request.playlistId, request.maxResults || 50);
+
+        sendResponse({
+          success: true,
+          videos: apiResult.videos,
+          title: apiResult.title,
+          source: 'api'
+        });
+      } catch (err) {
+        console.error('[Main] Failed to get playlist videos:', err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true;
+  }
 });
 
 async function handleGetVideoMetadata(videoId) {

@@ -70,6 +70,41 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
+  // TIER 0.5: Playlist DOM Extraction (for private playlists)
+  // ─────────────────────────────────────────────────────────────
+  async _getPlaylistVideosTier0_5(playlistId) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Playlist] No active YouTube tab');
+          return resolve(null);
+        }
+
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PLAYLIST_VIDEOS_FROM_DOM', playlistId }, (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Playlist] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            if (response?.logs) {
+              console.log('[Tier 0.5 Playlist] Logs:', response.logs);
+            }
+            console.log('[Tier 0.5 Playlist] Failed:', response?.error || 'Unknown error');
+            return resolve(null);
+          }
+
+          console.log(`[Tier 0.5 Playlist] Success: ${response.videos?.length || 0} videos, title: ${response.title}`);
+          resolve({
+            videos: response.videos || [],
+            title: response.title || ''
+          });
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // TIER 0: Network Sniffer (captured URLs)
   // ─────────────────────────────────────────────────────────────
   async _getCapturedUrl(videoId, lang) {
@@ -516,6 +551,13 @@ export class TranslationManager {
       
       // Build fetch URL
       let fetchUrl = track.baseUrl;
+      // Remove any existing tlang to avoid duplicates
+      if (fetchUrl.includes('tlang=')) {
+        fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
+          return (prefix === '?' && suffix) ? '?' : '';
+        });
+        fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+      }
       if (translate && targetLang) {
         fetchUrl += `&tlang=${targetLang}`;
       }
@@ -688,8 +730,12 @@ export class TranslationManager {
             // Remove any existing tlang parameter - we want original language, not translation
             if (fetchUrl.includes('tlang=')) {
                 log('[Tier 0] Removing existing tlang parameter to get original language');
-                // Remove all tlang parameters globally, matching optional leading ?/& and trailing &
-                fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]*&?/g, '');
+                // Remove tlang with capture groups to preserve correct separators
+                fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
+                  // If prefix was '?' and there's a suffix '&', keep '?'
+                  // Otherwise remove entirely
+                  return (prefix === '?' && suffix) ? '?' : '';
+                });
                 // Clean up any leftover ?& or trailing & patterns
                 fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
             }
@@ -1308,8 +1354,12 @@ export class TranslationManager {
 
         if (track?.baseUrl) {
           let fetchUrl = track.baseUrl;
-          // Remove all tlang parameters globally, matching optional leading ?/& and trailing &
-          fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]*&?/g, '');
+          // Remove tlang with capture groups to preserve correct separators
+          fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
+            // If prefix was '?' and there's a suffix '&', keep '?'
+            // Otherwise remove entirely
+            return (prefix === '?' && suffix) ? '?' : '';
+          });
           // Clean up any leftover ?& or trailing & patterns
           fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
           if (translate && targetLang) {

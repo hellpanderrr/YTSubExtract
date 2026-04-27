@@ -1,7 +1,6 @@
 import { toSRT, toVTT, toTXT } from '../utils/subtitle-formats.js';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import { isPlaylistUrl, extractPlaylistId, fetchPlaylistVideos } from '../utils/playlist-extractor.js';
-import { downloadZip } from '../utils/zip-generator.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
@@ -117,6 +116,10 @@ async function init() {
 
       // Check if there's an active download for this playlist
       await checkAndRestoreProgress();
+
+      // Enable download button only after confirming no active download
+      const selected = currentPlaylistVideos.filter(v => v.selected).length;
+      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
       return;
     }
     
@@ -164,7 +167,8 @@ async function loadPlaylistVideos(playlistId) {
 
     renderPlaylistVideos();
     updateSelectedCount();
-    btnDownloadZip.disabled = videos.length === 0;
+    // Keep button disabled initially - will enable after checkAndRestoreProgress confirms no active download
+    btnDownloadZip.disabled = true;
 
     // Fetch languages from first video to populate playlist language dropdown
     if (videos.length > 0) {
@@ -265,6 +269,9 @@ function renderPlaylistVideos() {
     checkbox.addEventListener('change', (e) => {
       video.selected = e.target.checked;
       updateSelectedCount();
+      // Sync master checkbox: checked only if ALL videos are selected
+      const allSelected = currentPlaylistVideos.every(v => v.selected);
+      selectAllCheck.checked = allSelected;
     });
     
     const indexSpan = document.createElement('span');
@@ -305,6 +312,12 @@ let currentDownloadId = null;
 let progressCheckInterval = null;
 
 async function downloadPlaylistSubtitles() {
+  // Prevent concurrent downloads
+  if (currentDownloadId !== null) {
+    console.log('[Popup] Download already in progress, ignoring click');
+    return;
+  }
+
   const selectedVideos = currentPlaylistVideos.filter(v => v.selected);
   if (selectedVideos.length === 0) return;
 
@@ -393,6 +406,7 @@ async function checkAndRestoreProgress() {
         const percent = (progress.completed / progress.total) * 100;
         progressFillEl.style.width = `${percent}%`;
         progressFillEl.setAttribute('aria-valuenow', Math.round(percent));
+        progressFillEl.setAttribute('aria-valuetext', `${progress.completed} of ${progress.total}`);
         progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
       }
 
@@ -432,6 +446,7 @@ function startProgressPolling(totalVideos) {
   const initialTotal = totalVideos || 0;
   progressFillEl.style.width = '0%';
   progressFillEl.setAttribute('aria-valuenow', '0');
+  progressFillEl.setAttribute('aria-valuetext', `0 of ${initialTotal || '?'}`);
   progressTextEl.textContent = `0 / ${initialTotal || '?'}`;
   console.log('[Popup] Initial progress set to: 0 /', initialTotal || '?');
 
@@ -468,6 +483,7 @@ function startProgressPolling(totalVideos) {
         const percent = (progress.completed / progress.total) * 100;
         progressFillEl.style.width = `${percent}%`;
         progressFillEl.setAttribute('aria-valuenow', Math.round(percent));
+        progressFillEl.setAttribute('aria-valuetext', `${progress.completed} of ${progress.total}`);
         progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
         console.log(`[Popup] UI updated: ${progress.completed}/${progress.total} (${percent.toFixed(1)}%)`);
 
@@ -587,12 +603,13 @@ function savePlaylistSettings() {
   chrome.storage.local.set({
     playlistTranslateChecked: playlistTranslateCheck?.checked,
     playlistTargetLanguage: playlistTranslateLang?.value,
-    playlistSourceLanguage: playlistLangSelect?.value
+    playlistSourceLanguage: playlistLangSelect?.value,
+    playlistFormat: playlistFormatSelect?.value
   });
 }
 
 function loadPlaylistSettings() {
-  chrome.storage.local.get(['playlistTranslateChecked', 'playlistTargetLanguage', 'playlistSourceLanguage'], (result) => {
+  chrome.storage.local.get(['playlistTranslateChecked', 'playlistTargetLanguage', 'playlistSourceLanguage', 'playlistFormat'], (result) => {
     if (result.playlistTranslateChecked !== undefined && playlistTranslateCheck) {
       playlistTranslateCheck.checked = result.playlistTranslateChecked;
       updatePlaylistTranslationState();
@@ -609,6 +626,12 @@ function loadPlaylistSettings() {
         playlistLangSelect.value = result.playlistSourceLanguage;
       }
     }
+    if (result.playlistFormat && playlistFormatSelect) {
+      const option = Array.from(playlistFormatSelect.options).find(o => o.value === result.playlistFormat);
+      if (option) {
+        playlistFormatSelect.value = result.playlistFormat;
+      }
+    }
   });
 }
 
@@ -619,6 +642,7 @@ playlistTranslateCheck?.addEventListener('change', () => {
 
 playlistTranslateLang?.addEventListener('change', savePlaylistSettings);
 playlistLangSelect?.addEventListener('change', savePlaylistSettings);
+playlistFormatSelect?.addEventListener('change', savePlaylistSettings);
 
 // Note: loadPlaylistSettings is now called after dropdowns are populated in loadPlaylistVideos
 
@@ -846,32 +870,58 @@ translateLang.addEventListener('change', saveSettings);
 
 // Reset Button Logic
 btnReset.addEventListener('click', async () => {
-  if (!currentVideoId) return;
-  
   // Animate button
   const icon = btnReset.querySelector('svg');
   icon.style.transition = 'transform 0.5s ease';
   icon.style.transform = 'rotate(360deg)';
   setTimeout(() => icon.style.transform = '', 500);
 
+  // Handle playlist mode
+  if (isPlaylistMode && currentPlaylistId) {
+    setStatus('Reloading playlist...', 'info', true);
+    try {
+      // Clear playlist UI
+      playlistVideosEl.innerHTML = '';
+      currentPlaylistVideos = [];
+      currentDownloadId = null;
+
+      // Re-fetch playlist
+      await loadPlaylistVideos(currentPlaylistId);
+      await checkAndRestoreProgress();
+
+      // Enable download button if appropriate
+      const selected = currentPlaylistVideos.filter(v => v.selected).length;
+      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
+
+      setStatus(`Reloaded ${currentPlaylistVideos.length} videos`, 'success');
+    } catch (e) {
+      setStatus('Reload failed: ' + e.message, 'error');
+      console.error(e);
+    }
+    return;
+  }
+
+  // Handle single video mode
+  if (!currentVideoId) return;
+
   setStatus('Resetting cache...', 'info', true);
   enableControls(false);
-  
+
   try {
     // 1. Clear cache in background
     await chrome.runtime.sendMessage({
       type: 'CLEAR_CACHE',
       videoId: currentVideoId
     });
-    
+
     // 2. Clear local state
     currentVideoTitle = null;
     currentTranscript = null;
     langSelect.innerHTML = '<option disabled selected>Reloading...</option>';
-    
+
     // 3. Re-fetch languages (force refresh)
     await fetchLanguages(currentVideoId);
-    
+
   } catch (e) {
     setStatus('Reset failed: ' + e.message, 'error');
     console.error(e);

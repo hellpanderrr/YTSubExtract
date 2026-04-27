@@ -145,11 +145,9 @@ export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', tim
       result = await response.text();
     }
 
-    clearTimeout(timeoutId);
     return result;
-  } catch (err) {
+  } finally {
     clearTimeout(timeoutId);
-    throw err;
   }
 }
 
@@ -209,6 +207,7 @@ export async function getVideoInfo(videoID) {
   try {
       iosData = await fetchInnerTube('/player', iosPayload, 'IOS');
   } catch (e) {
+      debug(`iOS client failed: ${e.message}`);
       iosData = null;
   }
   if (iosData) {

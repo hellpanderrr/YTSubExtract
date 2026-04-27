@@ -9,12 +9,49 @@ const createLogger = (namespace) => {
 const debug = createLogger('playlist-extractor');
 
 /**
- * Extract video list from YouTube playlist
+ * Main entry point: Extract video list from YouTube playlist
+ * Uses background script which tries Tier 0.5 (DOM) first, then API fallback
  * @param {string} playlistId - YouTube playlist ID (e.g., "PL...")
  * @param {number} maxResults - Maximum number of videos to fetch (default: 50)
- * @returns {Promise<Array<{videoId: string, title: string, duration: string, index: number}>>}
+ * @returns {Promise<{videos: Array<{videoId: string, title: string, duration: string, index: number}>, title: string}>}
  */
 export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
+  debug(`Fetching playlist via background: ${playlistId}`);
+
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({
+      type: 'GET_PLAYLIST_VIDEOS',
+      playlistId,
+      maxResults
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        debug('Runtime error:', chrome.runtime.lastError.message);
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      if (!response?.success) {
+        reject(new Error(response?.error || 'Failed to fetch playlist'));
+        return;
+      }
+
+      debug(`Got ${response.videos?.length || 0} videos from ${response.source || 'unknown'}`);
+      resolve({
+        videos: response.videos || [],
+        title: response.title || ''
+      });
+    });
+  });
+}
+
+/**
+ * API-only fallback for playlist extraction
+ * Used by background script when Tier 0.5 fails
+ * @param {string} playlistId - YouTube playlist ID (e.g., "PL...")
+ * @param {number} maxResults - Maximum number of videos to fetch (default: 50)
+ * @returns {Promise<{videos: Array<{videoId: string, title: string, duration: string, index: number}>, title: string}>}
+ */
+export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
   const videos = [];
   let continuationToken = null;
   let pageCount = 0;
@@ -22,7 +59,7 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
   let lastData = null;
   const maxPages = Math.ceil(maxResults / 100); // YouTube returns ~100 videos per page
 
-  debug(`Fetching playlist: ${playlistId}, maxResults: ${maxResults}`);
+  debug(`Fetching playlist via API: ${playlistId}, maxResults: ${maxResults}`);
 
   try {
     while (videos.length < maxResults && pageCount < maxPages) {
@@ -53,7 +90,7 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 
       // Parse videos from response
       const pageVideos = parsePlaylistVideos(data);
-      
+
       if (pageVideos.length === 0 && !continuationToken) {
         // First page has no videos - might be invalid playlist
         throw new Error('No videos found in playlist');
@@ -75,13 +112,13 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 
       // Check for continuation
       continuationToken = extractContinuationToken(data);
-      
+
       if (!continuationToken || videos.length >= maxResults) {
         break;
       }
 
       pageCount++;
-      
+
       // Small delay between pages to be respectful
       if (continuationToken && pageCount < maxPages) {
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -133,6 +170,16 @@ function parsePlaylistVideos(data) {
     // Navigate through the nested structure
     debug('Parsing response, top-level keys:', Object.keys(data || {}));
 
+    // Check for alerts at top level first (private playlist, auth required)
+    const topLevelAlert = data?.alerts?.[0]?.alertRenderer;
+    if (topLevelAlert) {
+      debug('Top-level alert found:', JSON.stringify(topLevelAlert));
+      const alertText = topLevelAlert.text?.simpleText || topLevelAlert.text?.runs?.map(r => r.text).join('');
+      if (alertText) {
+        throw new Error(`Playlist unavailable: ${alertText}`);
+      }
+    }
+
     const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs;
     if (!tabs) {
       debug('No tabs found. Checking alternative structures...');
@@ -141,10 +188,14 @@ function parsePlaylistVideos(data) {
       if (singleColumn) {
         debug('Found singleColumnBrowseResultsRenderer');
       }
-      // Check for alertRenderer (error message)
+      // Check for alertRenderer inside twoColumnBrowseResultsRenderer too
       const alert = data?.contents?.twoColumnBrowseResultsRenderer?.alerts?.[0]?.alertRenderer;
       if (alert) {
-        debug('Alert found:', JSON.stringify(alert));
+        debug('Alert found in twoColumn:', JSON.stringify(alert));
+        const alertText = alert.text?.simpleText || alert.text?.runs?.map(r => r.text).join('');
+        if (alertText) {
+          throw new Error(`Playlist unavailable: ${alertText}`);
+        }
       }
       return videos;
     }
@@ -177,34 +228,10 @@ function parsePlaylistVideos(data) {
       if (!videoItems) continue;
 
       for (const item of videoItems) {
-        const videoRenderer = item?.playlistVideoRenderer;
-        if (!videoRenderer) continue;
-
-        const videoId = videoRenderer.videoId;
-        if (!videoId) continue;
-
-        // Extract title
-        let title = 'Unknown';
-        const titleRuns = videoRenderer.title?.runs;
-        if (titleRuns && titleRuns.length > 0) {
-          title = titleRuns.map(run => run.text).join('');
-        } else if (videoRenderer.title?.simpleText) {
-          title = videoRenderer.title.simpleText;
+        const video = parseVideoRenderer(item?.playlistVideoRenderer);
+        if (video) {
+          videos.push(video);
         }
-
-        // Extract duration
-        let duration = '';
-        if (videoRenderer.lengthText?.simpleText) {
-          duration = videoRenderer.lengthText.simpleText;
-        } else if (videoRenderer.lengthText?.runs) {
-          duration = videoRenderer.lengthText.runs.map(run => run.text).join('');
-        }
-
-        videos.push({
-          videoId,
-          title: title.trim(),
-          duration: duration.trim()
-        });
       }
     }
 
@@ -217,6 +244,40 @@ function parsePlaylistVideos(data) {
   }
 
   return videos;
+}
+
+/**
+ * Parse a single playlistVideoRenderer into video object
+ * Returns null if invalid
+ */
+function parseVideoRenderer(videoRenderer) {
+  if (!videoRenderer) return null;
+
+  const videoId = videoRenderer.videoId;
+  if (!videoId) return null;
+
+  // Extract title
+  let title = 'Unknown';
+  const titleRuns = videoRenderer.title?.runs;
+  if (titleRuns && titleRuns.length > 0) {
+    title = titleRuns.map(run => run.text).join('');
+  } else if (videoRenderer.title?.simpleText) {
+    title = videoRenderer.title.simpleText;
+  }
+
+  // Extract duration
+  let duration = '';
+  if (videoRenderer.lengthText?.simpleText) {
+    duration = videoRenderer.lengthText.simpleText;
+  } else if (videoRenderer.lengthText?.runs) {
+    duration = videoRenderer.lengthText.runs.map(run => run.text).join('');
+  }
+
+  return {
+    videoId,
+    title: title.trim(),
+    duration: duration.trim()
+  };
 }
 
 /**
@@ -238,30 +299,10 @@ function extractContinuationVideos(data) {
       if (!continuationItems) continue;
 
       for (const item of continuationItems) {
-        const videoRenderer = item?.playlistVideoRenderer;
-        if (!videoRenderer) continue;
-
-        const videoId = videoRenderer.videoId;
-        if (!videoId) continue;
-
-        let title = 'Unknown';
-        const titleRuns = videoRenderer.title?.runs;
-        if (titleRuns && titleRuns.length > 0) {
-          title = titleRuns.map(run => run.text).join('');
-        } else if (videoRenderer.title?.simpleText) {
-          title = videoRenderer.title.simpleText;
+        const video = parseVideoRenderer(item?.playlistVideoRenderer);
+        if (video) {
+          videos.push(video);
         }
-
-        let duration = '';
-        if (videoRenderer.lengthText?.simpleText) {
-          duration = videoRenderer.lengthText.simpleText;
-        }
-
-        videos.push({
-          videoId,
-          title: title.trim(),
-          duration: duration.trim()
-        });
       }
     }
   } catch (err) {
@@ -329,9 +370,14 @@ function extractContinuationToken(data) {
 export function isPlaylistUrl(url) {
   try {
     const urlObj = new URL(url);
-    return urlObj.hostname.includes('youtube.com') && 
+    const isYouTubeHost = urlObj.hostname.includes('youtube.com') ||
+                          urlObj.hostname.includes('youtu.be') ||
+                          urlObj.hostname.includes('youtube-nocookie.com');
+    const list = urlObj.searchParams.get('list');
+    return isYouTubeHost &&
            urlObj.searchParams.has('list') &&
-           !urlObj.searchParams.get('list').startsWith('RD'); // Exclude radio mixes
+           list &&
+           !list.startsWith('RD'); // Exclude radio mixes
   } catch {
     return false;
   }

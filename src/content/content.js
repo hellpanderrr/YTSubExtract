@@ -519,24 +519,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 title = response.videoDetails.title;
             }
         }
-        sendResponse({ success: true, title });
-    } catch (err) {
-        sendResponse({ success: false, error: err.message });
+
+        // Fallback: meta tag
+        if (!title) {
+            const metaTitle = document.querySelector('meta[name="title"]') ||
+                             document.querySelector('meta[property="og:title"]');
+            if (metaTitle) {
+                title = metaTitle.content;
+            }
+        }
+
+        // Final fallback: document.title
+        if (!title) {
+            title = document.title.replace(' - YouTube', '').trim();
+        }
+
+        sendResponse({ title });
+    } catch (e) {
+        sendResponse({ title: null, error: e.message });
     }
-    return true;
-  }
-
-  if (msg.type === 'FETCH_TRANSLATED') {
-    fetchTranslatedSubtitles(msg.videoId, msg.sourceLang, msg.targetLang, msg.translate)
-      .then(result => sendResponse({ success: true, result: result.data, logs: result.logs }))
-      .catch(err => sendResponse({ success: false, error: err.message, logs: err.logs || [] }));
-    return true; // Keep channel open for async response
-  }
-
-  if (msg.type === 'GET_BEST_CAPTION_URL') {
-    getBestCaptionUrl(msg.videoId, msg.sourceLang, msg.targetLang, msg.translate, msg.forceRefresh)
-      .then(result => sendResponse({ success: true, ...result }))
-      .catch(err => sendResponse({ success: false, error: err.message, logs: err.logs || [] }));
     return true;
   }
 
@@ -1021,12 +1022,186 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             log(`Parsed ${segments.length} segments.`);
             sendResponse({ success: true, result: segments, logs });
-            
+
         } catch (err) {
             sendResponse({ success: false, error: err.message, logs });
         }
     })();
     return true;
+  }
+
+  // === TIER 0.5: Playlist DOM Extraction ===
+  if (msg.type === 'GET_PLAYLIST_VIDEOS_FROM_DOM') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[PlaylistDOM] ${m}`);
+
+      try {
+        // Check if we're on a playlist page
+        const url = new URL(window.location.href);
+        const listId = url.searchParams.get('list');
+        if (!listId) {
+          log('Not on a playlist page');
+          sendResponse({ success: false, error: 'Not on playlist page', logs });
+          return;
+        }
+
+        // Check if playlist ID matches
+        if (listId !== msg.playlistId) {
+          log(`Playlist ID mismatch: expected ${msg.playlistId}, found ${listId}`);
+          sendResponse({ success: false, error: 'Playlist ID mismatch', logs });
+          return;
+        }
+
+        log(`Extracting videos for playlist: ${listId}`);
+
+        // Try multiple selectors for playlist video items
+        const selectors = [
+          'ytd-playlist-video-renderer',
+          'ytd-playlist-panel-video-renderer',
+          '.ytd-playlist-video-list-renderer > .ytd-playlist-video-renderer',
+          '[data-playlist-item]'
+        ];
+
+        let videoElements = [];
+        for (const selector of selectors) {
+          videoElements = document.querySelectorAll(selector);
+          if (videoElements.length > 0) {
+            log(`Found ${videoElements.length} videos using selector: ${selector}`);
+            break;
+          }
+        }
+
+        if (videoElements.length === 0) {
+          // Try to find in ytInitialData
+          if (typeof window.ytInitialData !== 'undefined') {
+            log('Trying ytInitialData...');
+            try {
+              const initialData = window.ytInitialData;
+              const contents = initialData?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents;
+              if (contents) {
+                for (const section of contents) {
+                  const itemSection = section?.itemSectionRenderer;
+                  const videoList = itemSection?.contents?.[0]?.playlistVideoListRenderer;
+                  if (videoList?.contents) {
+                    const videos = [];
+                    for (const item of videoList.contents) {
+                      const renderer = item?.playlistVideoRenderer;
+                      if (renderer?.videoId) {
+                        let title = 'Unknown';
+                        if (renderer.title?.runs?.length > 0) {
+                          title = renderer.title.runs.map(r => r.text).join('');
+                        } else if (renderer.title?.simpleText) {
+                          title = renderer.title.simpleText;
+                        }
+                        let duration = '';
+                        if (renderer.lengthText?.simpleText) {
+                          duration = renderer.lengthText.simpleText;
+                        } else if (renderer.lengthText?.runs) {
+                          duration = renderer.lengthText.runs.map(r => r.text).join('');
+                        }
+                        videos.push({
+                          videoId: renderer.videoId,
+                          title: title.trim(),
+                          duration: duration.trim()
+                        });
+                      }
+                    }
+                    if (videos.length > 0) {
+                      log(`Extracted ${videos.length} videos from ytInitialData`);
+                      // Get playlist title
+                      let playlistTitle = '';
+                      const metadata = initialData?.metadata?.playlistMetadataRenderer;
+                      if (metadata?.title) {
+                        playlistTitle = metadata.title;
+                      }
+                      sendResponse({ success: true, videos, title: playlistTitle, logs });
+                      return;
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              log(`ytInitialData extraction failed: ${e.message}`);
+            }
+          }
+          log('No videos found in DOM or ytInitialData');
+          sendResponse({ success: false, error: 'No videos found', logs });
+          return;
+        }
+
+        // Extract from DOM elements
+        const videos = [];
+        for (const el of videoElements) {
+          try {
+            // Find video link
+            const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
+            if (!link) continue;
+
+            const href = link.getAttribute('href');
+            if (!href) continue;
+
+            // Extract video ID from href
+            const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+            if (!videoIdMatch) continue;
+            const videoId = videoIdMatch[1];
+
+            // Extract title
+            let title = 'Unknown';
+            const titleEl = el.querySelector('#video-title') ||
+                           el.querySelector('a[title]') ||
+                           el.querySelector('.ytd-video-meta-block #video-title') ||
+                           link;
+            if (titleEl) {
+              title = titleEl.getAttribute('title') ||
+                     titleEl.textContent?.trim() ||
+                     'Unknown';
+            }
+
+            // Extract duration
+            let duration = '';
+            const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                              el.querySelector('.badge-shape-wiz__text') ||
+                              el.querySelector('[class*="duration"]');
+            if (durationEl) {
+              duration = durationEl.textContent?.trim() || '';
+            }
+
+            videos.push({ videoId, title, duration });
+          } catch (e) {
+            log(`Error extracting video: ${e.message}`);
+          }
+        }
+
+        log(`Successfully extracted ${videos.length} videos from DOM`);
+
+        // Try to get playlist title
+        let playlistTitle = '';
+        const titleEl = document.querySelector('ytd-playlist-header-renderer h1 yt-formatted-string') ||
+                       document.querySelector('ytd-playlist-header-renderer h1') ||
+                       document.querySelector('.ytd-playlist-header-renderer #title');
+        if (titleEl) {
+          playlistTitle = titleEl.textContent?.trim() || '';
+        }
+        // Fallback to ytInitialData
+        if (!playlistTitle && typeof window.ytInitialData !== 'undefined') {
+          try {
+            const metadata = window.ytInitialData?.metadata?.playlistMetadataRenderer;
+            if (metadata?.title) {
+              playlistTitle = metadata.title;
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        sendResponse({ success: true, videos, title: playlistTitle, logs });
+      } catch (e) {
+        log(`Fatal error: ${e.message}`);
+        sendResponse({ success: false, error: e.message, logs });
+      }
+    })();
+    return true; // Keep channel open for async
   }
 });
 
