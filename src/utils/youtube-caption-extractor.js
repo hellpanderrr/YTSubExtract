@@ -92,7 +92,7 @@ function generateVisitorData() {
   return result;
 }
 
-export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', timeoutMs = 10000) {
+export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', timeoutMs = 10000, parseAs = 'json') {
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
 
   if (!clientConfig) {
@@ -120,7 +120,7 @@ export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', tim
 
   debug(`Calling InnerTube endpoint: ${endpoint} with client: ${clientType}`);
 
-  // Add timeout to prevent hanging
+  // Add timeout to prevent hanging (covers fetch + body reading)
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -131,8 +131,22 @@ export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', tim
       body: JSON.stringify(data),
       signal: controller.signal,
     });
+
+    // Check for HTTP errors before parsing
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    // Parse body while AbortController is still active
+    let result;
+    if (parseAs === 'json') {
+      result = await response.json();
+    } else {
+      result = await response.text();
+    }
+
     clearTimeout(timeoutId);
-    return response;
+    return result;
   } catch (err) {
     clearTimeout(timeoutId);
     throw err;
@@ -156,12 +170,10 @@ export async function getVideoInfo(videoID) {
     }
   };
 
-  const response = await fetchInnerTube('/player', payload, 'ANDROID');
-  if (!response.ok) {
-      throw new Error(`InnerTube API failed with status: ${response.status}`);
+  let data = await fetchInnerTube('/player', payload, 'ANDROID');
+  if (!data) {
+      throw new Error(`InnerTube API failed: no data returned`);
   }
-
-  let data = await response.json();
 
   // Helper to check if we have captions
   const hasCaptions = (d) => d?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length > 0;
@@ -193,9 +205,13 @@ export async function getVideoInfo(videoID) {
       }
   };
 
-  const iosResponse = await fetchInnerTube('/player', iosPayload, 'IOS');
-  if (iosResponse.ok) {
-      const iosData = await iosResponse.json();
+  let iosData;
+  try {
+      iosData = await fetchInnerTube('/player', iosPayload, 'IOS');
+  } catch (e) {
+      iosData = null;
+  }
+  if (iosData) {
       if (hasCaptions(iosData) || hasOverlayCaptions(iosData)) {
           debug('iOS client found captions!');
           return iosData;
@@ -215,9 +231,8 @@ export async function getVideoInfo(videoID) {
   };
 
   try {
-    const tvResponse = await fetchInnerTube('/player', tvPayload, 'TVHTML5');
-    if (tvResponse.ok) {
-      const tvData = await tvResponse.json();
+    const tvData = await fetchInnerTube('/player', tvPayload, 'TVHTML5');
+    if (tvData) {
       const tvPlayability = getPlayabilityStatus(tvData);
       
       debug(`TVHTML5 playability: ${tvPlayability}`);
@@ -316,18 +331,21 @@ async function getTranscriptFromEngagementPanel(videoID, nextData) {
     params: token,
   };
 
-  const transcriptResponse = await fetchInnerTube(
-    '/get_transcript',
-    transcriptPayload
-  );
-
-  if (!transcriptResponse.ok) {
+  let transcriptData;
+  try {
+    transcriptData = await fetchInnerTube(
+      '/get_transcript',
+      transcriptPayload
+    );
+  } catch (e) {
     throw new Error(
-      `Transcript API failed: ${transcriptResponse.status} ${transcriptResponse.statusText}`
+      `Transcript API failed: ${e.message}`
     );
   }
 
-  const transcriptData = await transcriptResponse.json();
+  if (!transcriptData) {
+    throw new Error('Transcript API returned no data');
+  }
   const segments =
     transcriptData?.actions?.[0]?.updateEngagementPanelAction?.content
       ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body

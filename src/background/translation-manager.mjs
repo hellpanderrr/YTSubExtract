@@ -190,26 +190,14 @@ export class TranslationManager {
 
     console.log(`[TranslationManager] Metadata cache miss for ${videoId}, fetching...`);
 
-    // Parallel batch: Tier 0.5, 1.5, 1 (independent operations)
-    console.log('[TranslationManager] Starting parallel tier batch: 0.5, 1.5, 1');
-    const parallelResults = await Promise.allSettled([
+    // Phase 1: Try cheap tiers first (0.5 and 1.5) - these are fast and don't require API calls
+    console.log('[TranslationManager] Starting cheap tier batch: 0.5, 1.5');
+    const cheapResults = await Promise.allSettled([
       this._getLanguagesTier0_5(videoId),
-      this._getLanguagesTier1_5(videoId),
-      (async () => {
-        const { languages, title } = await getLanguages(videoId);
-        return {
-          languages: languages?.map(l => ({
-            code: l.languageCode,
-            name: l.languageName,
-            isAuto: l.kind === 'asr'
-          })) || [],
-          title: title || 'YouTube Video'
-        };
-      })()
+      this._getLanguagesTier1_5(videoId)
     ]);
 
-    // Process results in priority order: 0.5 (fastest/best) → 1 (API) → 1.5 (slow)
-    const [tier05Result, tier15Result, tier1Result] = parallelResults;
+    const [tier05Result, tier15Result] = cheapResults;
 
     // Tier 0.5: Player API (first priority - instant from active player)
     if (tier05Result.status === 'fulfilled') {
@@ -227,20 +215,7 @@ export class TranslationManager {
       console.warn('Tier 0.5 Metadata failed:', tier05Result.reason?.message || tier05Result.reason);
     }
 
-    // Tier 1: Android/iOS/TVHTML5 API (second priority - reliable API)
-    if (tier1Result.status === 'fulfilled') {
-      const result = tier1Result.value;
-      if (result.languages && result.languages.length > 0) {
-        console.log(`[TranslationManager] Tier 1 success: ${result.languages.length} languages`);
-        this.cache.set(cacheKey, result);
-        return result;
-      }
-      console.warn('Tier 1 Metadata returned no languages');
-    } else {
-      console.warn('Tier 1 Metadata failed:', tier1Result.reason?.message || tier1Result.reason);
-    }
-
-    // Tier 1.5: Embed Page (third priority - slow but works for age-restricted)
+    // Tier 1.5: Embed Page (second priority - slow but works for age-restricted)
     if (tier15Result.status === 'fulfilled') {
       const result = tier15Result.value;
       if (result.languages && result.languages.length > 0) {
@@ -254,6 +229,29 @@ export class TranslationManager {
       }
     } else {
       console.warn('Tier 1.5 Metadata failed:', tier15Result.reason?.message || tier15Result.reason);
+    }
+
+    // Phase 2: Try API tier only if cheap tiers failed
+    console.log('[TranslationManager] Cheap tiers failed, trying Tier 1 (API)...');
+    try {
+      const { languages, title } = await getLanguages(videoId);
+      const tier1Result = {
+        languages: languages?.map(l => ({
+          code: l.languageCode,
+          name: l.languageName,
+          isAuto: l.kind === 'asr'
+        })) || [],
+        title: title || 'YouTube Video'
+      };
+
+      if (tier1Result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 1 success: ${tier1Result.languages.length} languages`);
+        this.cache.set(cacheKey, tier1Result);
+        return tier1Result;
+      }
+      console.warn('Tier 1 Metadata returned no languages');
+    } catch (tier1Err) {
+      console.warn('Tier 1 Metadata failed:', tier1Err?.message || tier1Err);
     }
 
     // Tier 2
@@ -690,9 +688,10 @@ export class TranslationManager {
             // Remove any existing tlang parameter - we want original language, not translation
             if (fetchUrl.includes('tlang=')) {
                 log('[Tier 0] Removing existing tlang parameter to get original language');
-                fetchUrl = fetchUrl.replace(/tlang=[^&]+&?/, '');
-                // Clean up trailing &
-                fetchUrl = fetchUrl.replace(/&$/, '');
+                // Remove all tlang parameters globally, matching optional leading ?/& and trailing &
+                fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]*&?/g, '');
+                // Clean up any leftover ?& or trailing & patterns
+                fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
             }
             
             if (translate && targetLang && !fetchUrl.includes('tlang=')) {
@@ -1301,16 +1300,18 @@ export class TranslationManager {
           // Prefer English for auto mode, fallback to first track (match _extractFromEmbed)
           track = tracks.find(t => t.languageCode === 'en') || tracks[0];
         } else {
-          track = tracks.find(t => t.languageCode === sourceLang) || tracks[0];
+          track = tracks.find(t => t.languageCode === sourceLang);
+          if (!track) {
+            throw new Error(`Language ${sourceLang} not found`);
+          }
         }
 
         if (track?.baseUrl) {
           let fetchUrl = track.baseUrl;
-          // Remove existing tlang parameter to avoid duplicates
-          fetchUrl = fetchUrl.replace(/tlang=[^&]+&?/, '');
-          // Clean up trailing & and ?& patterns (match extractWithTranslation behavior)
-          fetchUrl = fetchUrl.replace(/&$/, '');
-          fetchUrl = fetchUrl.replace(/\?&/, '?');
+          // Remove all tlang parameters globally, matching optional leading ?/& and trailing &
+          fetchUrl = fetchUrl.replace(/[?&]tlang=[^&]*&?/g, '');
+          // Clean up any leftover ?& or trailing & patterns
+          fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
           if (translate && targetLang) {
             fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
           }
@@ -1320,12 +1321,8 @@ export class TranslationManager {
             fetchUrl = fetchUrl.replace(/fmt=[^&]+/, 'fmt=json3');
           }
 
-          const response = await fetch(fetchUrl, {
-            headers: {
-              'User-Agent': 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
-              'Referer': `https://www.youtube.com/watch?v=${videoId}`,
-            }
-          });
+          // Browser sets User-Agent and Referer automatically; MV3 service workers strip manual overrides anyway
+          const response = await fetch(fetchUrl);
 
           if (response.ok) {
             const text = await response.text();

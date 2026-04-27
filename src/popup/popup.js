@@ -401,15 +401,8 @@ async function checkAndRestoreProgress() {
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
-        // Completed — download ZIP if not already auto-downloaded
-        if (!progress.autoDownloaded) {
-          await downloadCompletedZip(progress.downloadId);
-        } else {
-          setStatus('Downloaded successfully!', 'success');
-          btnDownloadZip.disabled = false;
-          playlistProgressEl.classList.add('hidden');
-          currentDownloadId = null;
-        }
+        // Completed — download ZIP (auto-download flow not implemented)
+        await downloadCompletedZip(progress.downloadId);
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       } else if (progress.status === 'error') {
         // Error occurred
@@ -464,6 +457,9 @@ function startProgressPolling(totalVideos) {
 
       if (progress.playlistId !== currentPlaylistId) {
         console.log('[Popup] Playlist ID mismatch:', progress.playlistId, '!==', currentPlaylistId);
+        // Stop polling to prevent resource leak
+        clearInterval(progressCheckInterval);
+        progressCheckInterval = null;
         return;
       }
 
@@ -487,15 +483,8 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
-        // Only download if background didn't already auto-download via offscreen
-        if (!progress.autoDownloaded) {
-          await downloadCompletedZip(progress.downloadId);
-        } else {
-          setStatus('Downloaded successfully!', 'success');
-          btnDownloadZip.disabled = false;
-          playlistProgressEl.classList.add('hidden');
-          currentDownloadId = null;
-        }
+        // Download ZIP (auto-download flow not implemented)
+        await downloadCompletedZip(progress.downloadId);
 
         // Clear the progress
         await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });

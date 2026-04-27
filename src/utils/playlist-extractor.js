@@ -38,13 +38,16 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 
       debug(`Fetching page ${pageCount + 1}, current videos: ${videos.length}`);
 
-      const response = await fetchInnerTube('/browse', payload, 'WEB');
-
-      if (!response.ok) {
-        throw new Error(`Browse API failed: ${response.status} ${response.statusText}`);
+      let data;
+      try {
+        data = await fetchInnerTube('/browse', payload, 'WEB');
+      } catch (e) {
+        throw new Error(`Browse API failed: ${e.message}`);
       }
 
-      const data = await response.json();
+      if (!data) {
+        throw new Error('Browse API returned no data');
+      }
       lastData = data;
       if (!firstData) firstData = data;
 
