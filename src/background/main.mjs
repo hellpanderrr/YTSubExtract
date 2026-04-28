@@ -11,7 +11,7 @@ if (typeof URL !== 'undefined' && !URL.createObjectURL) {
   URL.revokeObjectURL = function() {};
 }
 
-import { zip, strToU8 } from 'fflate';
+import { zipSync, strToU8 } from 'fflate';
 
 // More polyfills for library compatibility
 if (typeof document === 'undefined') {
@@ -349,7 +349,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
 
   try {
     const processor = new BatchProcessor({
-      concurrency: 2,
+      concurrency: 3,
       delayMs: 300,
       onProgress: async (progress) => {
         // Atomic state update: read, merge, write
@@ -586,14 +586,14 @@ function formatTranscript(transcript, format) {
   }
 }
 
-// Helper to create ZIP in background (async — non-blocking for MV3 service worker)
+// Helper to create ZIP synchronously (Web Workers not supported in Service Worker)
 function createZipInBackground(zipData) {
-  return new Promise((resolve, reject) => {
-    zip(zipData, { level: 6 }, (err, data) => {
-      if (err) reject(err);
-      else resolve(new Blob([data], { type: 'application/zip' }));
-    });
-  });
+  try {
+    const data = zipSync(zipData, { level: 6 });
+    return Promise.resolve(new Blob([data], { type: 'application/zip' }));
+  } catch (err) {
+    return Promise.reject(err);
+  }
 }
 
 function generateSubtitleFilename(index, videoId, title, language, format) {

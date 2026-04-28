@@ -1,6 +1,6 @@
 {
   "name": "youtube-subtitle-downloader-mv3",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "YouTube Subtitle Downloader with 3-tier fallback",
   "type": "module",
   "scripts": {

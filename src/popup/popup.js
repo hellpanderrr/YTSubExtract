@@ -65,6 +65,28 @@ function showLogs(logs) {
   }
 }
 
+/**
+ * Append a log entry for playlist operations
+ * @param {string} message - Log message to append
+ */
+function appendPlaylistLog(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  const logLine = `[${timestamp}] ${message}`;
+
+  logsContainer.classList.remove('hidden');
+
+  // Append to existing logs or start fresh
+  const currentLogs = logsEl.value;
+  if (currentLogs) {
+    logsEl.value = currentLogs + '\n' + logLine;
+  } else {
+    logsEl.value = logLine;
+  }
+
+  // Scroll to bottom
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+
 function enableControls(enabled) {
   langSelect.disabled = !enabled;
   btnSrt.disabled = !enabled;
@@ -354,6 +376,7 @@ async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
   if (currentDownloadId !== null) {
     console.log('[Popup] Download already in progress, ignoring click');
+    appendPlaylistLog('Download already in progress, ignoring click');
     return;
   }
 
@@ -374,6 +397,12 @@ async function downloadPlaylistSubtitles() {
     translate: shouldTranslate,
     targetLang
   });
+
+  // Log playlist download start
+  appendPlaylistLog(`=== Playlist Download Started ===`);
+  appendPlaylistLog(`Playlist ID: ${currentPlaylistId}`);
+  appendPlaylistLog(`Videos: ${selectedVideos.length}`);
+  appendPlaylistLog(`Format: ${format}, Source: ${sourceLang}${shouldTranslate ? ` → Target: ${targetLang}` : ''}`);
 
   setStatus(`Starting download of ${selectedVideos.length} subtitles...`, 'info', true);
   btnDownloadZip.disabled = true;
@@ -415,6 +444,8 @@ async function downloadPlaylistSubtitles() {
 
   } catch (err) {
     console.error('[Popup] Download start error:', err);
+    appendPlaylistLog(`=== Download Start Failed ===`);
+    appendPlaylistLog(`Error: ${err.message}`);
     setStatus('Failed to start download: ' + err.message, 'error');
     btnDownloadZip.disabled = false;
     playlistProgressEl.classList.add('hidden');
@@ -549,7 +580,16 @@ function startProgressPolling(totalVideos) {
         progressTextEl.textContent = `${progress.completed} / ${progress.total}`;
         console.log(`[Popup] UI updated: ${progress.completed}/${progress.total} (${percent.toFixed(1)}%)`);
 
+        // Log progress every 10% or on status change
         if (progress.status === 'running') {
+          const prevPercent = parseInt(progressFillEl.getAttribute('data-last-logged') || '0');
+          if (percent - prevPercent >= 10 || progress.current) {
+            appendPlaylistLog(`Progress: ${progress.completed}/${progress.total} (${percent.toFixed(0)}%) - ${progress.failed || 0} failed`);
+            if (progress.current) {
+              appendPlaylistLog(`  Processing: ${progress.current}`);
+            }
+            progressFillEl.setAttribute('data-last-logged', Math.floor(percent / 10) * 10);
+          }
           setStatus(`Downloading... ${progress.completed}/${progress.total} (${progress.failed || 0} failed)`, 'info', true);
         }
       } else {
@@ -561,18 +601,28 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
+        appendPlaylistLog(`=== Download Completed ===`);
+        appendPlaylistLog(`Success: ${progress.completed - (progress.failed || 0)} / ${progress.total}`);
+        if (progress.failed > 0) {
+          appendPlaylistLog(`Failed: ${progress.failed}`);
+        }
+
         // Atomic guard: acquire lock or skip
         if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress, skipping');
+          appendPlaylistLog('ZIP download already in progress, skipping');
           return;
         }
 
         try {
+          appendPlaylistLog('Downloading ZIP file...');
           await downloadCompletedZip(progress.downloadId);
+          appendPlaylistLog('ZIP download completed');
           // Only clear if download initiated successfully
           await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
         } catch (err) {
           console.error('[Popup] Polling completion error:', err);
+          appendPlaylistLog(`Error downloading ZIP: ${err.message}`);
         } finally {
           resetDownloadState();
         }
@@ -582,6 +632,10 @@ function startProgressPolling(totalVideos) {
       if (progress.status === 'error') {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
+
+        appendPlaylistLog(`=== Download Failed ===`);
+        appendPlaylistLog(`Error: ${progress.error || 'Unknown error'}`);
+        appendPlaylistLog(`Progress at failure: ${progress.completed}/${progress.total}`);
 
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;

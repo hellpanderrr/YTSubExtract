@@ -1,4 +1,4 @@
-import { zip, strToU8 } from 'fflate';
+import { zipSync, strToU8 } from 'fflate';
 
 /**
  * Create ZIP archive from files
@@ -6,29 +6,26 @@ import { zip, strToU8 } from 'fflate';
  * @returns {Promise<Blob>} - ZIP file as Blob
  */
 export async function createZip(files) {
-  return new Promise((resolve, reject) => {
-    // Convert files to the format expected by fflate
-    const zipData = {};
-    
-    for (const file of files) {
-      // Sanitize filename
-      const safeName = sanitizeFilename(file.name);
-      // Convert string to Uint8Array
-      zipData[safeName] = strToU8(file.content);
-    }
+  // Convert files to the format expected by fflate
+  const zipData = {};
 
-    // Create ZIP with compression level 6 (good balance)
-    zip(zipData, { level: 6 }, (err, data) => {
-      if (err) {
-        reject(new Error(`ZIP creation failed: ${err.message}`));
-        return;
-      }
-      
-      // Create Blob from compressed data
-      const blob = new Blob([data], { type: 'application/zip' });
-      resolve(blob);
-    });
-  });
+  for (const file of files) {
+    // Sanitize filename
+    const safeName = sanitizeFilename(file.name);
+    // Convert string to Uint8Array
+    zipData[safeName] = strToU8(file.content);
+  }
+
+  // Create ZIP with compression level 6 (good balance)
+  // Using zipSync to avoid Web Worker issues in Service Worker context
+  try {
+    const data = zipSync(zipData, { level: 6 });
+    // Create Blob from compressed data
+    const blob = new Blob([data], { type: 'application/zip' });
+    return blob;
+  } catch (err) {
+    throw new Error(`ZIP creation failed: ${err.message}`);
+  }
 }
 
 /**

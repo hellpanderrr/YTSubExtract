@@ -115,7 +115,7 @@ background.js (Service Worker)
 
 ## Performance
 
-- **Parallel Tier Execution**: Tiers 0.5, 1.5, 1 run simultaneously for 2-8s initialization (was 10-15s sequential).
+- **Parallel Tier Execution**: Tiers 0.5 and 1.5 run in parallel (2-8s). Tier 1 is fallback if both fail.
 - **Format Switching**: Raw transcript cached in memory (`metadata:${videoId}`). SRT/VTT/TXT conversion is instant.
 - **State Persistence**: `chrome.storage.local` for user preferences including per-playlist language selections.
 - **URL Expiration**: Sniffer-captured URLs checked before use.

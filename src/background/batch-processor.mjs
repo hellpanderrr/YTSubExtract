@@ -1,6 +1,37 @@
 import { translationManager } from './translation-manager.mjs';
 
 /**
+ * Semaphore for controlling concurrent async operations
+ */
+class Semaphore {
+  constructor(maxConcurrency) {
+    this.maxConcurrency = maxConcurrency;
+    this.currentCount = 0;
+    this.waitQueue = [];
+  }
+
+  async acquire() {
+    if (this.currentCount < this.maxConcurrency) {
+      this.currentCount++;
+      return;
+    }
+
+    return new Promise(resolve => {
+      this.waitQueue.push(resolve);
+    });
+  }
+
+  release() {
+    if (this.waitQueue.length > 0) {
+      const next = this.waitQueue.shift();
+      next();
+    } else {
+      this.currentCount--;
+    }
+  }
+}
+
+/**
  * Batch processor for playlist video processing
  * Handles multiple videos with rate limiting and concurrency control
  */
@@ -43,67 +74,80 @@ export class BatchProcessor {
 
       this.onProgress({ completed: 0, total, failed: 0, current: null });
 
-      // Process videos sequentially for better progress tracking
-      // (even though it's slower, it gives accurate 0->1->2->3 progress)
-      for (let i = 0; i < videos.length; i++) {
-        if (this.shouldStop) {
-          break;
-        }
+      // Process videos in parallel with concurrency control
+      // Uses semaphore pattern for rate limiting and controlled parallelism
+      const semaphore = new Semaphore(this.concurrency);
 
-        const video = videos[i];
-
-        // Initial delay to show "processing video X"
-        await this._delay(200);
+      // Create processing tasks for all videos
+      const tasks = videos.map(async (video, index) => {
+        // Wait for semaphore slot (controls concurrency)
+        await semaphore.acquire();
 
         try {
-          // Report progress BEFORE processing (shows "processing X/Y")
-          this.onProgress({
-            completed,
-            total,
-            failed: results.errors.length,
-            current: video.videoId
-          });
+          if (this.shouldStop) {
+            return; // Skip processing if stopped
+          }
 
-          const transcript = await this._processVideo(video.videoId, options);
+          // Initial delay with jitter for staggered start
+          await this._delay(200, 100);
 
-          const result = {
-            videoId: video.videoId,
-            title: video.title,
-            index: video.index,
-            transcript,
-            format: options.format || 'srt'
-          };
+          try {
+            // Report progress BEFORE processing (shows "processing X/Y")
+            this.onProgress({
+              completed,
+              total,
+              failed: results.errors.length,
+              current: video.videoId
+            });
 
-          results.success.push(result);
-          this.onVideoComplete(result);
+            const transcript = await this._processVideo(video.videoId, options);
 
-        } catch (err) {
-          const error = {
-            videoId: video.videoId,
-            title: video.title,
-            index: video.index,
-            error: err.message,
-            logs: err.logs || []
-          };
+            const result = {
+              videoId: video.videoId,
+              title: video.title,
+              index: video.index,
+              transcript,
+              format: options.format || 'srt'
+            };
 
-          results.errors.push(error);
-          this.onVideoError(error);
+            results.success.push(result);
+            this.onVideoComplete(result);
+
+          } catch (err) {
+            const error = {
+              videoId: video.videoId,
+              title: video.title,
+              index: video.index,
+              error: err.message,
+              logs: err.logs || []
+            };
+
+            results.errors.push(error);
+            this.onVideoError(error);
+          } finally {
+            // Update progress after each video (atomic increment)
+            completed++;
+            this.onProgress({
+              completed: Math.min(completed, total),
+              total,
+              failed: results.errors.length,
+              current: null
+            });
+          }
+
+          // Rate limiting delay between videos with jitter
+          if (index < videos.length - 1 && !this.shouldStop) {
+            await this._delay(this.delayMs, 100);
+          }
+
+        } finally {
+          // Always release semaphore slot
+          semaphore.release();
         }
+      });
 
-        // Update progress after each video
-        completed++;
-        this.onProgress({
-          completed: Math.min(completed, total),
-          total,
-          failed: results.errors.length,
-          current: null
-        });
-
-        // Rate limiting delay between videos
-        if (i < videos.length - 1 && !this.shouldStop) {
-          await this._delay(this.delayMs);
-        }
-      }
+      // Wait for all tasks to complete
+      await Promise.all(tasks);
       return results;
     } finally {
       this.isRunning = false;
@@ -140,10 +184,13 @@ export class BatchProcessor {
   }
 
   /**
-   * Delay helper
+   * Delay helper with optional jitter for rate limit distribution
+   * @param {number} ms - Base delay in milliseconds
+   * @param {number} jitter - Random jitter to add (0-100ms default)
    */
-  _delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  _delay(ms, jitter = 0) {
+    const actualDelay = ms + (jitter > 0 ? Math.floor(Math.random() * jitter) : 0);
+    return new Promise(resolve => setTimeout(resolve, actualDelay));
   }
 }
 
