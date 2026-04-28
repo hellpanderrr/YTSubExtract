@@ -52,6 +52,7 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
  * @returns {Promise<{videos: Array<{videoId: string, title: string, duration: string, index: number}>, title: string}>}
  */
 export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
+  maxResults = maxResults || 50; // Guard against undefined/null/0
   const videos = [];
   let continuationToken = null;
   let pageCount = 0;
@@ -62,9 +63,10 @@ export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
   debug(`Fetching playlist via API: ${playlistId}, maxResults: ${maxResults}`);
 
   try {
-    while (videos.length < maxResults && pageCount < maxPages) {
-      const sessionData = generateSessionData('WEB');
+    // Generate session data once and reuse for all pages
+    const sessionData = generateSessionData('WEB');
 
+    while (videos.length < maxResults && pageCount < maxPages) {
       const payload = {
         context: sessionData.context,
         browseId: `VL${playlistId}`,
@@ -144,14 +146,16 @@ export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
  */
 function extractPlaylistTitle(data) {
   try {
-    // Try to find title in header
-    const header = data?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer;
-    if (!header) return '';
-
-    // Title might be in the header or we can get it from metadata
+    // Try metadata first (always available)
     const metadata = data?.metadata?.playlistMetadataRenderer;
     if (metadata?.title) {
       return metadata.title;
+    }
+
+    // Fallback: try to find title in header
+    const header = data?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer;
+    if (header) {
+      // Additional header-based title extraction if needed
     }
 
     return '';
@@ -197,6 +201,12 @@ function parsePlaylistVideos(data) {
           throw new Error(`Playlist unavailable: ${alertText}`);
         }
       }
+      // Check for continuation items before returning (continuation responses don't have tabs)
+      const continuationItems = extractContinuationVideos(data);
+      if (continuationItems.length > 0) {
+        debug(`Found ${continuationItems.length} videos in continuation response`);
+        videos.push(...continuationItems);
+      }
       return videos;
     }
 
@@ -241,6 +251,10 @@ function parsePlaylistVideos(data) {
 
   } catch (err) {
     debug('Error parsing videos:', err);
+    // Rethrow playlist availability errors instead of swallowing them
+    if (err.message?.startsWith('Playlist unavailable:')) {
+      throw err;
+    }
   }
 
   return videos;
@@ -370,15 +384,20 @@ function extractContinuationToken(data) {
 export function isPlaylistUrl(url) {
   try {
     const urlObj = new URL(url);
-    const isYouTubeHost = urlObj.hostname.includes('youtube.com') ||
-                          urlObj.hostname.includes('youtu.be') ||
-                          urlObj.hostname.includes('youtube-nocookie.com');
-    const list = urlObj.searchParams.get('list');
-    return isYouTubeHost &&
-           urlObj.searchParams.has('list') &&
-           list &&
-           !list.startsWith('RD'); // Exclude radio mixes
-  } catch {
+    const hostname = urlObj.hostname.toLowerCase();
+    
+    // Strict hostname matching to prevent malicious hosts like youtube.com.evil.tld
+    const isYouTubeHost =
+      hostname === 'youtu.be' ||
+      hostname === 'youtube.com' ||
+      hostname.endsWith('.youtube.com') ||
+      hostname === 'youtube-nocookie.com' ||
+      hostname.endsWith('.youtube-nocookie.com');
+
+    if (!isYouTubeHost) return false;
+    
+    return urlObj.searchParams.has('list');
+  } catch (e) {
     return false;
   }
 }

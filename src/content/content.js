@@ -11,6 +11,10 @@ const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
 // Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
 const capturedUrls = new Map();
 
+// === REQUEST DEDUPLICATION ===
+// Lock for player tracks requests to prevent concurrent duplicate operations
+const playerTracksLocks = new Map(); // videoId -> Promise
+
 // Listen for messages from sniffer.js (MAIN world)
 window.addEventListener('message', (event) => {
     if (event.source !== window) return;
@@ -141,26 +145,46 @@ setInterval(() => {
 // === MAIN WORLD FETCHER ===
 // Storage for pending Main World Fetch requests
 const mainWorldFetchPending = new Map();
+const MAX_PENDING_FETCHES = 50; // Prevent memory leaks from stuck requests
 
-// Listen for responses from Main World Fetcher (sniffer.js)
-window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    
-    if (event.data?.type === 'MAIN_WORLD_FETCH_RESPONSE') {
-        const { requestId, success, status, statusText, body, error, url } = event.data;
+function cleanupOldestPendingFetches() {
+  if (mainWorldFetchPending.size > MAX_PENDING_FETCHES) {
+    // Remove oldest entries (first 10%)
+    const entriesToRemove = Math.floor(MAX_PENDING_FETCHES * 0.1);
+    const keys = Array.from(mainWorldFetchPending.keys()).slice(0, entriesToRemove);
+    for (const key of keys) {
+      const pending = mainWorldFetchPending.get(key);
+      if (pending) {
+        pending.reject(new Error('Request evicted due to memory pressure'));
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+      }
+      mainWorldFetchPending.delete(key);
+    }
+    console.warn(`[Content] Cleaned up ${entriesToRemove} old pending fetches due to memory pressure`);
+  }
+}
+
+    // Listen for responses from Main World Fetcher (sniffer.js)
+    const mwfListener = (event) => {
+        if (event.source !== window) return;
         
-        const pending = mainWorldFetchPending.get(requestId);
-        if (pending) {
-            mainWorldFetchPending.delete(requestId);
+        if (event.data?.type === 'MAIN_WORLD_FETCH_RESPONSE') {
+            const { requestId, success, status, statusText, body, error, url } = event.data;
             
-            if (success) {
-                pending.resolve({ status, statusText, body, url });
-            } else {
-                pending.reject(new Error(error || 'Main World Fetch failed'));
+            const pending = mainWorldFetchPending.get(requestId);
+            if (pending) {
+                if (pending.timeoutId) clearTimeout(pending.timeoutId);
+                mainWorldFetchPending.delete(requestId);
+                
+                if (success) {
+                    pending.resolve({ status, statusText, body, url });
+                } else {
+                    pending.reject(new Error(error || 'Main World Fetch failed'));
+                }
             }
         }
-    }
-});
+    };
+    window.addEventListener('message', mwfListener);
 
 /**
  * Fetch via MAIN world context
@@ -173,20 +197,23 @@ async function fetchViaMainWorld(url, timeout = 10000) {
     const requestId = `mwf_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     
     return new Promise((resolve, reject) => {
-        mainWorldFetchPending.set(requestId, { resolve, reject });
+        // Cleanup old requests to prevent memory leaks
+        cleanupOldestPendingFetches();
+
+        const timeoutId = setTimeout(() => {
+            if (mainWorldFetchPending.has(requestId)) {
+                mainWorldFetchPending.delete(requestId);
+                reject(new Error('Main World Fetch timeout'));
+            }
+        }, timeout);
+
+        mainWorldFetchPending.set(requestId, { resolve, reject, timeoutId });
         
         window.postMessage({
             type: 'REQUEST_MAIN_WORLD_FETCH',
             url,
             requestId
         }, '*');
-        
-        setTimeout(() => {
-            if (mainWorldFetchPending.has(requestId)) {
-                mainWorldFetchPending.delete(requestId);
-                reject(new Error('Main World Fetch timeout'));
-            }
-        }, timeout);
     });
 }
 
@@ -381,7 +408,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // === TIER 0.5: Player API ===
   if (msg.type === 'GET_PLAYER_TRACKS') {
     (async () => {
-      const result = await getPlayerCaptionTracksWithRetry(msg.videoId, 3, 500);
+      const videoId = msg.videoId;
+
+      // DEDUPLICATION: Check if there's already a pending request for this video
+      if (playerTracksLocks.has(videoId)) {
+        console.log(`[Content] Reusing pending player tracks request for ${videoId}`);
+        const result = await playerTracksLocks.get(videoId);
+        sendResponse(result);
+        return;
+      }
+
+      // Create the request promise
+      const requestPromise = getPlayerCaptionTracksWithRetry(videoId, 3, 500);
+
+      // Store in locks map
+      playerTracksLocks.set(videoId, requestPromise);
+
+      // Clean up when done
+      requestPromise.finally(() => {
+        playerTracksLocks.delete(videoId);
+      });
+
+      const result = await requestPromise;
       sendResponse(result);
     })();
     return true;
@@ -858,7 +906,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         
         // Try SRV3 (XML-based but different)
-        let srv3Url = urlToUse.replace(/fmt=[^&]+/, '') + '&fmt=srv3';
+        let srv3Url = urlToUse.replace(/fmt=[^&]+/, 'fmt=srv3');
         log(`Fetching SRV3 from: ${srv3Url}`);
         try {
             const srv3Resp = await fetch(srv3Url);
@@ -872,8 +920,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                  const segs = [];
                  for (let i = 0; i < texts.length; i++) {
                      const node = texts[i];
-                     const start = parseFloat(node.getAttribute('start') || node.getAttribute('t') / 1000);
-                     const dur = parseFloat(node.getAttribute('dur') || node.getAttribute('d') / 1000);
+                     const startAttr = node.getAttribute('start');
+                     const tAttr = node.getAttribute('t');
+                     const start = startAttr ? parseFloat(startAttr) : (tAttr ? parseFloat(tAttr) / 1000 : 0);
+                     const durAttr = node.getAttribute('dur');
+                     const dAttr = node.getAttribute('d');
+                     const dur = durAttr ? parseFloat(durAttr) : (dAttr ? parseFloat(dAttr) / 1000 : 0);
                      let text = node.textContent;
                      if (text) segs.push({ start, duration: dur, text });
                  }
@@ -1110,6 +1162,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     }
                     if (videos.length > 0) {
                       log(`Extracted ${videos.length} videos from ytInitialData`);
+                      // Check for continuations (more videos available via API)
+                      const hasContinuations = videoList?.continuations?.length > 0 ||
+                        videoList?.contents?.some(item => item?.continuationItemRenderer);
+                      if (hasContinuations) {
+                        log(`Warning: Playlist has more videos available. Only first ${videos.length} loaded from DOM.`);
+                        log(`Full playlist extraction requires API fallback.`);
+                      }
                       // Get playlist title from multiple sources
                       let playlistTitle = '';
                       const metadata = initialData?.metadata?.playlistMetadataRenderer;
@@ -1129,7 +1188,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                         playlistTitle = sidebar.title.simpleText;
                         log(`Got playlist title from sidebar simpleText: ${playlistTitle}`);
                       }
-                      sendResponse({ success: true, videos, title: playlistTitle, logs });
+                      sendResponse({ success: true, videos, title: playlistTitle, logs, hasMoreVideos: hasContinuations });
                       return;
                     }
                   }
@@ -1264,11 +1323,17 @@ function getPageVariable(variableName) {
       if (event.source === window && 
           event.data.type === 'PAGE_VARIABLE_RESULT' && 
           event.data.requestId === requestId) {
+        if (timeoutId) clearTimeout(timeoutId);
         window.removeEventListener('message', listener);
         resolve(event.data.value);
       }
     };
     window.addEventListener('message', listener);
+    
+    const timeoutId = setTimeout(() => {
+        window.removeEventListener('message', listener);
+        resolve(null);
+    }, 1000);
 
     script.textContent = `
       (function() {
@@ -1291,11 +1356,6 @@ function getPageVariable(variableName) {
     `;
     (document.head || document.documentElement).appendChild(script);
     script.remove();
-    
-    setTimeout(() => {
-        window.removeEventListener('message', listener);
-        resolve(null);
-    }, 1000);
   });
 }
 
@@ -1347,7 +1407,7 @@ async function getRobustPlayerResponse(log, forceRefresh = false) {
     return playerResponse;
 }
 
-function getPlayerResponse() {
+async function getPlayerResponse() {
     try {
         // Try to find the script tag containing ytInitialPlayerResponse
         const scripts = document.querySelectorAll('script');
@@ -1367,7 +1427,7 @@ function getPlayerResponse() {
     } catch (e) {
         console.error('[Content] Failed to scan DOM for player response:', e);
     }
-    return Promise.resolve(null);
+    return null;
 }
 
 async function getCaptionTracks(videoId, log = console.log, forceRefresh = false) {

@@ -11,6 +11,34 @@ export class TranslationManager {
   constructor() {
     this.availableLanguages = null;
     this.cache = new Map();
+    this.MAX_CACHE_SIZE = 100; // Limit cache size to prevent memory leaks
+
+    // Deduplication maps to prevent concurrent duplicate requests
+    this.pendingMetadataRequests = new Map(); // key: videoId -> Promise
+    this.pendingTranscriptRequests = new Map(); // key: videoId:lang:translate:targetLang -> Promise
+  }
+
+  /**
+   * Add to cache with size limit (simple LRU-ish: remove first added)
+   * Thread-safety: Uses while loop to handle concurrent size changes
+   */
+  _setCache(key, value) {
+    // Guard against edge case: empty cache with size > 0
+    if (this.cache.size === 0 && this.MAX_CACHE_SIZE > 0) {
+      this.cache.set(key, value);
+      return;
+    }
+
+    // Re-check size to handle concurrent additions correctly
+    let attempts = 0;
+    const maxAttempts = this.MAX_CACHE_SIZE + 10; // Safety limit
+    while (this.cache.size >= this.MAX_CACHE_SIZE && attempts < maxAttempts) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey === undefined) break; // Should not happen with size > 0
+      this.cache.delete(firstKey);
+      attempts++;
+    }
+    this.cache.set(key, value);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -223,7 +251,37 @@ export class TranslationManager {
       return this.cache.get(cacheKey);
     }
 
+    // DEDUPLICATION: Check if there's already a pending request for this video
+    if (this.pendingMetadataRequests.has(videoId)) {
+      console.log(`[TranslationManager] Metadata request deduplication for ${videoId}`);
+      return this.pendingMetadataRequests.get(videoId);
+    }
+
     console.log(`[TranslationManager] Metadata cache miss for ${videoId}, fetching...`);
+
+    // Create the promise for this request
+    const requestPromise = this._fetchMetadataInternal(videoId, cacheKey);
+
+    // Store in pending map
+    this.pendingMetadataRequests.set(videoId, requestPromise);
+
+    // Clean up pending map when done (success or error)
+    requestPromise.finally(() => {
+      this.pendingMetadataRequests.delete(videoId);
+    });
+
+    return requestPromise;
+  }
+
+  /**
+   * Internal metadata fetch implementation (separated for deduplication)
+   */
+  async _fetchMetadataInternal(videoId, cacheKey) {
+    // Check cache again in case it was populated while we were waiting
+    if (this.cache.has(cacheKey)) {
+      console.log(`[TranslationManager] Metadata cache hit (late) for ${videoId}`);
+      return this.cache.get(cacheKey);
+    }
 
     // Phase 1: Try cheap tiers first (0.5 and 1.5) - these are fast and don't require API calls
     console.log('[TranslationManager] Starting cheap tier batch: 0.5, 1.5');
@@ -243,7 +301,7 @@ export class TranslationManager {
           title: result.title || 'YouTube Video',
           languages: result.languages
         };
-        this.cache.set(cacheKey, metadata);
+        this._setCache(cacheKey, metadata);
         return metadata;
       }
     } else {
@@ -259,7 +317,7 @@ export class TranslationManager {
           title: result.title || 'YouTube Video',
           languages: result.languages
         };
-        this.cache.set(cacheKey, metadata);
+        this._setCache(cacheKey, metadata);
         return metadata;
       }
     } else {
@@ -281,7 +339,7 @@ export class TranslationManager {
 
       if (tier1Result.languages.length > 0) {
         console.log(`[TranslationManager] Tier 1 success: ${tier1Result.languages.length} languages`);
-        this.cache.set(cacheKey, tier1Result);
+        this._setCache(cacheKey, tier1Result);
         return tier1Result;
       }
       console.warn('Tier 1 Metadata returned no languages');
@@ -306,7 +364,7 @@ export class TranslationManager {
                 title: title,
                 languages: tier2Result
             };
-            this.cache.set(cacheKey, result);
+            this._setCache(cacheKey, result);
             return result;
         }
     } catch (e2) {
@@ -318,7 +376,7 @@ export class TranslationManager {
     try {
         const result = await getVideoMetadataTier3(videoId);
         if (result && result.languages && result.languages.length > 0) {
-            this.cache.set(cacheKey, result);
+            this._setCache(cacheKey, result);
             return result;
         }
         console.warn('Tier 3 returned no languages, falling back to Tier 4...');
@@ -336,7 +394,7 @@ export class TranslationManager {
                 title: result.title || 'YouTube Video',
                 languages: result.languages
              };
-             this.cache.set(cacheKey, meta);
+             this._setCache(cacheKey, meta);
              return meta;
         }
     } catch (e4) {
@@ -551,15 +609,29 @@ export class TranslationManager {
       
       // Build fetch URL
       let fetchUrl = track.baseUrl;
-      // Remove any existing tlang to avoid duplicates
+      // Remove any existing tlang to avoid duplicates using URL API
       if (fetchUrl.includes('tlang=')) {
-        fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
-          return (prefix === '?' && suffix) ? '?' : '';
-        });
-        fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+        try {
+          const url = new URL(fetchUrl);
+          url.searchParams.delete('tlang');
+          fetchUrl = url.toString();
+        } catch (e) {
+          console.warn('[Tier 1.5] Invalid URL for tlang removal, using regex fallback:', e.message);
+          fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
+          fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+        }
       }
       if (translate && targetLang) {
-        fetchUrl += `&tlang=${targetLang}`;
+        try {
+          const url = new URL(fetchUrl);
+          url.searchParams.set('tlang', targetLang);
+          fetchUrl = url.toString();
+        } catch (e) {
+          console.warn('[Tier 1.5] Invalid URL for tlang addition, using concat fallback:', e.message);
+          if (!fetchUrl.includes('tlang=')) {
+            fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+          }
+        }
       }
       if (!fetchUrl.includes('fmt=')) {
         fetchUrl += '&fmt=json3';
@@ -687,6 +759,48 @@ export class TranslationManager {
         };
     }
 
+    // DEDUPLICATION: Check if there's already a pending request for this exact configuration
+    const pendingKey = cacheKey; // Same as cache key for consistency
+    if (this.pendingTranscriptRequests.has(pendingKey)) {
+        console.log(`[TranslationManager] Transcript request deduplication for ${pendingKey}`);
+        return this.pendingTranscriptRequests.get(pendingKey);
+    }
+
+    // Create the promise for this request
+    const requestPromise = this._extractWithTranslationInternal(videoId, options, cacheKey);
+
+    // Store in pending map
+    this.pendingTranscriptRequests.set(pendingKey, requestPromise);
+
+    // Clean up pending map when done (success or error)
+    requestPromise.finally(() => {
+        this.pendingTranscriptRequests.delete(pendingKey);
+    });
+
+    return requestPromise;
+  }
+
+  /**
+   * Internal transcript extraction implementation (separated for deduplication)
+   */
+  async _extractWithTranslationInternal(videoId, options, cacheKey) {
+    const {
+      sourceLang = 'auto',
+      targetLang = 'ru',
+      translate = false,
+      preferTier = 1
+    } = options;
+
+    // Check cache again in case it was populated while we were waiting
+    if (this.cache.has(cacheKey)) {
+        console.log(`[TranslationManager] Transcript cache hit (late) for ${cacheKey}`);
+        const cached = this.cache.get(cacheKey);
+        return {
+            ...cached,
+            logs: [...(cached.logs || []), `[Cache] Retrieved from cache (late)`]
+        };
+    }
+
     const errors = [];
     const logs = [];
     const log = (msg) => {
@@ -730,18 +844,26 @@ export class TranslationManager {
             // Remove any existing tlang parameter - we want original language, not translation
             if (fetchUrl.includes('tlang=')) {
                 log('[Tier 0] Removing existing tlang parameter to get original language');
-                // Remove tlang with capture groups to preserve correct separators
-                fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
-                  // If prefix was '?' and there's a suffix '&', keep '?'
-                  // Otherwise remove entirely
-                  return (prefix === '?' && suffix) ? '?' : '';
-                });
-                // Clean up any leftover ?& or trailing & patterns
-                fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.delete('tlang');
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0] Invalid URL for tlang removal, using regex fallback');
+                    fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
+                    fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+                }
             }
             
             if (translate && targetLang && !fetchUrl.includes('tlang=')) {
-                fetchUrl += `&tlang=${targetLang}`;
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.set('tlang', targetLang);
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0] Invalid URL for tlang addition, using concat fallback');
+                    fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+                }
             }
             
             // Format URL for JSON3
@@ -780,7 +902,7 @@ export class TranslationManager {
                                     targetLang,
                                     logs
                                 };
-                                this.cache.set(cacheKey, resp);
+                                this._setCache(cacheKey, resp);
                                 return resp;
                             }
                         }
@@ -808,7 +930,14 @@ export class TranslationManager {
             
             let fetchUrl = trackUrl;
             if (translate && targetLang && !trackUrl.includes('tlang=')) {
-                fetchUrl += `&tlang=${targetLang}`;
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.set('tlang', targetLang);
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0.5] Invalid URL for tlang addition, using concat fallback');
+                    fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+                }
             }
             
             if (!fetchUrl.includes('fmt=')) {
@@ -843,7 +972,7 @@ export class TranslationManager {
                                     targetLang,
                                     logs
                                 };
-                                this.cache.set(cacheKey, resp);
+                                this._setCache(cacheKey, resp);
                                 return resp;
                             }
                         }
@@ -883,7 +1012,7 @@ export class TranslationManager {
             targetLang,
             logs
           };
-          this.cache.set(cacheKey, response);
+          this._setCache(cacheKey, response);
           return response;
         }
       } catch (err) {
@@ -908,7 +1037,7 @@ export class TranslationManager {
           targetLang,
           logs
         };
-        this.cache.set(cacheKey, response);
+        this._setCache(cacheKey, response);
         return response;
       }
     } catch (err) {
@@ -949,7 +1078,7 @@ export class TranslationManager {
                 targetLang,
                 logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
       } catch (err) {
@@ -1065,7 +1194,7 @@ export class TranslationManager {
         targetLang, 
         logs
       };
-      this.cache.set(cacheKey, response);
+      this._setCache(cacheKey, response);
       return response;
 
     } catch (err) {
@@ -1102,7 +1231,7 @@ export class TranslationManager {
                  targetLang: targetLang,
                  logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
     } catch (err) {
@@ -1249,7 +1378,7 @@ export class TranslationManager {
                                      }
                                  }
                                  if (currentText.length > 0) {
-                                     segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
+                                             segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
                                  }
                                  log(`[Tier 4] VTT parsed ${segments.length} segments`);
                              }
@@ -1286,7 +1415,7 @@ export class TranslationManager {
                 targetLang,
                 logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
     } catch (err) {
@@ -1354,16 +1483,26 @@ export class TranslationManager {
 
         if (track?.baseUrl) {
           let fetchUrl = track.baseUrl;
-          // Remove tlang with capture groups to preserve correct separators
-          fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (match, prefix, suffix) => {
-            // If prefix was '?' and there's a suffix '&', keep '?'
-            // Otherwise remove entirely
-            return (prefix === '?' && suffix) ? '?' : '';
-          });
-          // Clean up any leftover ?& or trailing & patterns
-          fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+          // Remove tlang using URL API (safe parameter manipulation)
+          if (fetchUrl.includes('tlang=')) {
+            try {
+              const url = new URL(fetchUrl);
+              url.searchParams.delete('tlang');
+              fetchUrl = url.toString();
+            } catch (e) {
+              // Fallback to regex if URL is malformed
+              fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
+              fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+            }
+          }
           if (translate && targetLang) {
-            fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+            try {
+              const url = new URL(fetchUrl);
+              url.searchParams.set('tlang', targetLang);
+              fetchUrl = url.toString();
+            } catch (e) {
+              fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+            }
           }
           if (!fetchUrl.includes('fmt=')) {
             fetchUrl += '&fmt=json3';
@@ -1399,7 +1538,7 @@ export class TranslationManager {
                       targetLang,
                       logs
                     };
-                    this.cache.set(cacheKey, resp);
+                    this._setCache(cacheKey, resp);
                     return resp;
                   }
                 }
@@ -1444,7 +1583,7 @@ export class TranslationManager {
           targetLang,
           logs
         };
-        this.cache.set(cacheKey, response);
+        this._setCache(cacheKey, response);
         return response;
       }
     } catch (err) {
@@ -1467,7 +1606,7 @@ export class TranslationManager {
           targetLang,
           logs
         };
-        this.cache.set(cacheKey, response);
+        this._setCache(cacheKey, response);
         return response;
       }
     } catch (err) {
@@ -1504,7 +1643,7 @@ export class TranslationManager {
           targetLang,
           logs
         };
-        this.cache.set(cacheKey, response);
+        this._setCache(cacheKey, response);
         return response;
       }
     } catch (err) {

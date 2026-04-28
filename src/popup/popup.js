@@ -276,7 +276,9 @@ function renderPlaylistVideos() {
     
     const indexSpan = document.createElement('span');
     indexSpan.className = 'video-index';
-    indexSpan.textContent = String(video.index).padStart(2, '0');
+    const arrayIndex = currentPlaylistVideos.indexOf(video);
+    const indexValue = video.index ?? (arrayIndex >= 0 ? arrayIndex + 1 : '?');
+    indexSpan.textContent = String(indexValue).padStart(2, '0');
     
     const infoDiv = document.createElement('div');
     infoDiv.className = 'video-info';
@@ -311,6 +313,42 @@ function updateSelectedCount() {
 let currentDownloadId = null;
 let progressCheckInterval = null;
 let isDownloadingZip = false; // Guard to prevent concurrent ZIP downloads
+
+/**
+ * Centralized cleanup for download-related state.
+ * Ensures consistent state reset across all code paths.
+ */
+function resetDownloadState() {
+  // Stop any active polling
+  if (progressCheckInterval) {
+    clearInterval(progressCheckInterval);
+    progressCheckInterval = null;
+  }
+  // Reset download tracking
+  currentDownloadId = null;
+  releaseZipDownloadLock();
+}
+
+/**
+ * Atomic guard for ZIP download operations.
+ * Returns true if lock was acquired, false if already downloading.
+ * This prevents race conditions between checkAndRestoreProgress and polling.
+ */
+function tryAcquireZipDownloadLock() {
+  if (isDownloadingZip) {
+    return false;
+  }
+  isDownloadingZip = true;
+  return true;
+}
+
+/**
+ * Release the ZIP download lock.
+ * Should be called in finally blocks to ensure cleanup.
+ */
+function releaseZipDownloadLock() {
+  isDownloadingZip = false;
+}
 
 async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
@@ -421,27 +459,32 @@ async function checkAndRestoreProgress() {
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
         // Completed — download ZIP (auto-download flow not implemented)
-        // Prevent race: skip if already downloading from polling
-        if (isDownloadingZip) {
+        // Atomic guard: acquire lock or skip
+        if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress from polling, skipping');
           return;
         }
+
         try {
-          isDownloadingZip = true;
           await downloadCompletedZip(progress.downloadId);
-        } finally {
-          currentDownloadId = null;
-          isDownloadingZip = false;
+          // Only clear if download initiated successfully
           await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } catch (err) {
+          console.error('[Popup] Failed to handle completed ZIP:', err);
+        } finally {
+          resetDownloadState();
         }
       } else if (progress.status === 'error') {
         // Error occurred
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
-        currentDownloadId = null;
-        isDownloadingZip = false; // Reset guard for consistency
-        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        
+        try {
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } finally {
+          resetDownloadState();
+        }
       }
     }
   } catch (err) {
@@ -489,12 +532,8 @@ function startProgressPolling(totalVideos) {
 
       if (progress.playlistId !== currentPlaylistId) {
         console.log('[Popup] Playlist ID mismatch:', progress.playlistId, '!==', currentPlaylistId);
-        // Stop polling to prevent resource leak
-        clearInterval(progressCheckInterval);
-        progressCheckInterval = null;
-        // Reset download guard so user can start new downloads on this playlist
-        currentDownloadId = null;
-        isDownloadingZip = false;
+        // Stop polling and reset state
+        resetDownloadState();
         btnDownloadZip.disabled = currentPlaylistVideos.filter(v => v.selected).length === 0;
         // Hide progress UI since we're on wrong playlist
         playlistProgressEl.classList.add('hidden');
@@ -522,22 +561,21 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
-        // Prevent race: skip if already downloading from checkAndRestoreProgress
-        if (isDownloadingZip) {
-          console.log('[Popup] ZIP download already in progress from restore, skipping');
+        // Atomic guard: acquire lock or skip
+        if (!tryAcquireZipDownloadLock()) {
+          console.log('[Popup] ZIP download already in progress, skipping');
           return;
         }
 
-        // Download ZIP (auto-download flow not implemented)
         try {
-          isDownloadingZip = true;
           await downloadCompletedZip(progress.downloadId);
+          // Only clear if download initiated successfully
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } catch (err) {
+          console.error('[Popup] Polling completion error:', err);
         } finally {
-          isDownloadingZip = false;
+          resetDownloadState();
         }
-
-        // Clear the progress
-        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       }
 
       // Check if error occurred
@@ -548,11 +586,14 @@ function startProgressPolling(totalVideos) {
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
-        currentDownloadId = null;
-        isDownloadingZip = false; // Reset guard for consistency
+
+        try {
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } finally {
+          resetDownloadState();
+        }
 
         console.error('[Popup] Download error:', progress);
-        await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
       }
     } catch (err) {
       console.error('Progress polling error:', err);
@@ -586,6 +627,7 @@ async function downloadCompletedZip(downloadId) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    
     // Defer revocation to avoid race with download start in popup context
     // Use 30s to ensure download has started even on slow connections
     setTimeout(() => URL.revokeObjectURL(url), 30000);
@@ -595,15 +637,23 @@ async function downloadCompletedZip(downloadId) {
       'success'
     );
 
-    // Clean up storage
-    await chrome.storage.local.remove(downloadId);
+    // DEFERRED CLEANUP: Wait 5 minutes before removing from storage 
+    // to ensure user had time to save it even if OS was slow.
+    setTimeout(async () => {
+      try {
+        await chrome.storage.local.remove(downloadId);
+        console.log(`[Popup] Cleaned up storage for ${downloadId}`);
+      } catch (e) {
+        console.warn(`[Popup] Failed to clean up ${downloadId}:`, e);
+      }
+    }, 300000);
 
   } catch (err) {
     setStatus('Failed to download ZIP: ' + err.message, 'error');
   } finally {
     btnDownloadZip.disabled = false;
     playlistProgressEl.classList.add('hidden');
-    currentDownloadId = null;
+    resetDownloadState();
   }
 }
 
@@ -731,7 +781,7 @@ async function fetchLanguages(videoId) {
       
       // Set full title as tooltip for hover
       setStatus(`Ready: ${currentVideoTitle ? currentVideoTitle.substring(0, 50) : 'Video'}...`);
-      statusEl.title = currentVideoTitle || 'Video';;
+      statusEl.title = currentVideoTitle || 'Video';
       populateLanguageSelect(languages);
       enableControls(true);
     } else {
@@ -939,10 +989,10 @@ btnReset.addEventListener('click', async () => {
   if (isPlaylistMode && currentPlaylistId) {
     setStatus('Reloading playlist...', 'info', true);
     try {
-      // Clear playlist UI
+      // Clear playlist UI and reset state
       playlistVideosEl.innerHTML = '';
       currentPlaylistVideos = [];
-      currentDownloadId = null;
+      resetDownloadState();
 
       // Re-fetch playlist
       await loadPlaylistVideos(currentPlaylistId);

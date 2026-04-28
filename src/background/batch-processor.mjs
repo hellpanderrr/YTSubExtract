@@ -23,24 +23,26 @@ export class BatchProcessor {
    * @returns {Promise<{success: Array, errors: Array}>}
    */
   async process(videos, options) {
+    // Atomic check-and-set using isRunning flag
     if (this.isRunning) {
+      console.warn('[BatchProcessor] Already running, ignoring request');
       throw new Error('Batch processor is already running');
     }
 
-    this.isRunning = true;
-    this.shouldStop = false;
-
-    const results = {
-      success: [],
-      errors: []
-    };
-
-    const total = videos.length;
-    let completed = 0;
-
-    this.onProgress({ completed: 0, total, failed: 0, current: null });
-
     try {
+      this.isRunning = true;
+      this.shouldStop = false;
+
+      const results = {
+        success: [],
+        errors: []
+      };
+
+      const total = videos.length;
+      let completed = 0;
+
+      this.onProgress({ completed: 0, total, failed: 0, current: null });
+
       // Process videos sequentially for better progress tracking
       // (even though it's slower, it gives accurate 0->1->2->3 progress)
       for (let i = 0; i < videos.length; i++) {
@@ -102,11 +104,10 @@ export class BatchProcessor {
           await this._delay(this.delayMs);
         }
       }
+      return results;
     } finally {
       this.isRunning = false;
     }
-
-    return results;
   }
 
   /**

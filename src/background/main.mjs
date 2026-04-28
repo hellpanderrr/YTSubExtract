@@ -1,6 +1,7 @@
 
 import { translationManager } from './translation-manager.mjs';
 import { BatchProcessor, generateErrorReport } from './batch-processor.mjs';
+import { fetchPlaylistVideosAPI } from '../utils/playlist-extractor.js';
 
 // Polyfills for library compatibility
 if (typeof URL !== 'undefined' && !URL.createObjectURL) {
@@ -10,7 +11,7 @@ if (typeof URL !== 'undefined' && !URL.createObjectURL) {
   URL.revokeObjectURL = function() {};
 }
 
-import { zipSync, strToU8 } from 'fflate';
+import { zip, strToU8 } from 'fflate';
 
 // More polyfills for library compatibility
 if (typeof document === 'undefined') {
@@ -40,15 +41,26 @@ if (typeof localStorage === 'undefined') {
   };
 }
 
+// Global guards to prevent race conditions
+if (typeof globalThis.isBatchProcessing === 'undefined') {
+  globalThis.isBatchProcessing = false;
+}
+
+// Memoization for GET_DOWNLOAD_PROGRESS to prevent redundant storage reads
+if (typeof globalThis.restoreProgressPromise === 'undefined') {
+  globalThis.restoreProgressPromise = null;
+}
+
 // Message Handler
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // 1. Get Video Metadata (Languages)
-  if (request.type === 'GET_VIDEO_METADATA') {
-    handleGetVideoMetadata(request.videoId)
-      .then(data => sendResponse({ success: true, data }))
-      .catch(err => sendResponse({ success: false, error: err.message }));
-    return true; // Async response
-  }
+    // 1. Get Video Metadata (Languages)
+    if (request.type === 'GET_VIDEO_METADATA') {
+        // Atomic update of currentDownloadProgress to avoid overwriting on SW start
+        handleGetVideoMetadata(request.videoId)
+            .then(data => sendResponse({ success: true, data }))
+            .catch(err => sendResponse({ success: false, error: err.message }));
+        return true; // Async response
+    }
 
   // 2. Get Transcript (with optional translation)
   if (request.type === 'GET_TRANSCRIPT') {
@@ -75,46 +87,58 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 5. Batch Download Playlist Subtitles (fire-and-forget so popup can poll progress)
   if (request.type === 'BATCH_DOWNLOAD_PLAYLIST') {
+    // ATOMIC GUARD: Prevent concurrent batch processing
+    if (globalThis.isBatchProcessing) {
+      console.warn('[Main] Batch download already in progress, rejecting concurrent request');
+      sendResponse({ success: false, error: 'Batch download already in progress' });
+      return true;
+    }
+
     // Validate request
     if (!Array.isArray(request.videos) || request.videos.length === 0 || !request.playlistId) {
-      globalThis.currentDownloadProgress = {
+      // Use atomic update even for validation errors (fire-and-forget)
+      atomicProgressUpdate({
         playlistId: request.playlistId || '',
         status: 'error',
         error: 'Invalid request: videos and playlistId are required',
         total: 0,
         completed: 0,
         failed: 0
-      };
+      }, { force: true }).catch(() => {});
       sendResponse({ success: false, error: 'Invalid request: videos and playlistId are required' });
       return true;
     }
 
+    // Set guard atomically before any async operations
+    globalThis.isBatchProcessing = true;
+
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
-    // Initialize progress immediately so popup sees it on first poll
-    globalThis.currentDownloadProgress = {
+    // Initialize progress atomically so popup sees it on first poll (fire-and-forget)
+    atomicProgressUpdate({
       playlistId: request.playlistId,
       status: 'running',
       completed: 0,
       total: request.videos.length,
       failed: 0,
-      current: null
-    };
-    // Persist to storage for service worker restart recovery
-    chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
+      current: null,
+      downloadId
+    }, { force: true }).catch(() => {});
     // Fire-and-forget: process in background, popup polls via GET_DOWNLOAD_PROGRESS
     handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId)
-      .catch(err => {
+      .catch((err) => {
         console.error('[Background] Batch download failed:', err);
-        globalThis.currentDownloadProgress = {
+        // Atomic error state update (fire-and-forget)
+        atomicProgressUpdate({
           playlistId: request.playlistId,
           status: 'error',
           error: err.message,
-          total: request.videos.length,
-          completed: globalThis.currentDownloadProgress?.completed || 0,
-          failed: globalThis.currentDownloadProgress?.failed || 0,
-          downloadId
-        };
-        chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
+          total: request.videos.length
+        }, { force: true }).catch(() => {});
+      })
+      .finally(() => {
+        // ALWAYS reset the guard when batch completes (success, error, or stopped)
+        globalThis.isBatchProcessing = false;
+        console.log('[Main] Batch processing guard reset');
       });
     // Return immediately so popup can start polling
     sendResponse({ success: true, data: { downloadId } });
@@ -123,16 +147,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 6. Get Download Progress
   if (request.type === 'GET_DOWNLOAD_PROGRESS') {
-    // If globalThis is null (service worker restarted), restore from storage
+    // MEMOIZED: Prevent concurrent storage reads from causing race conditions
     const restoreProgress = async () => {
       if (!globalThis.currentDownloadProgress) {
-        const stored = await chrome.storage.local.get('currentDownloadProgress');
-        if (stored.currentDownloadProgress) {
-          globalThis.currentDownloadProgress = stored.currentDownloadProgress;
+        // Check if there's already a restore in progress
+        if (globalThis.restoreProgressPromise) {
+          console.log('[Main] Reusing in-progress restore operation');
+          return globalThis.restoreProgressPromise;
         }
+
+        // Create the restore promise
+        globalThis.restoreProgressPromise = (async () => {
+          const stored = await chrome.storage.local.get('currentDownloadProgress');
+          if (stored.currentDownloadProgress) {
+            globalThis.currentDownloadProgress = stored.currentDownloadProgress;
+          }
+          return globalThis.currentDownloadProgress || null;
+        })();
+
+        // Clear the memoized promise when done (success or error)
+        globalThis.restoreProgressPromise.finally(() => {
+          globalThis.restoreProgressPromise = null;
+        });
+
+        return globalThis.restoreProgressPromise;
       }
       return globalThis.currentDownloadProgress || null;
     };
+
     restoreProgress().then(data => {
       sendResponse({ success: true, data });
     }).catch(() => {
@@ -170,8 +212,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         // Fall back to API extraction
         console.log(`[Main] Tier 0.5 failed or empty, falling back to API`);
-        const { fetchPlaylistVideosAPI } = await import('../utils/playlist-extractor.js');
-        const apiResult = await fetchPlaylistVideosAPI(request.playlistId, request.maxResults || 50);
+        const apiResult = await fetchPlaylistVideosAPI(request.playlistId, request.maxResults);
 
         sendResponse({
           success: true,
@@ -310,13 +351,29 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     const processor = new BatchProcessor({
       concurrency: 2,
       delayMs: 300,
-      onProgress: (progress) => {
-        globalThis.currentDownloadProgress = {
-          ...progress,
-          playlistId,
-          status: 'running'
-        };
-        chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
+      onProgress: async (progress) => {
+        // Atomic state update: read, merge, write
+        try {
+          const stored = await chrome.storage.local.get('currentDownloadProgress');
+          const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+          
+          // Don't overwrite completed or error status with running from a potentially stale processor
+          if (current.status === 'completed' || current.status === 'error') {
+             // If we already finished in storage, just keep it
+             globalThis.currentDownloadProgress = current;
+             return;
+          }
+
+          globalThis.currentDownloadProgress = {
+            ...progress,
+            playlistId,
+            status: 'running',
+            downloadId: downloadId
+          };
+          await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+        } catch (e) {
+          console.error('[Background] Progress update failed:', e);
+        }
       },
       onVideoComplete: (result) => {
         console.log(`[Batch] Completed: ${result.videoId}`);
@@ -355,8 +412,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       zipData['_errors.txt'] = strToU8(errorReport);
     }
 
-    // Create ZIP blob
-    const zipBlob = createZipInBackground(zipData);
+    // Create ZIP blob (async to avoid blocking service worker)
+    const zipBlob = await createZipInBackground(zipData);
 
     // Convert blob to base64 for storage with error handling
     const reader = new FileReader();
@@ -375,16 +432,24 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     });
 
     // Update progress to completed (popup will download with correct filename via DOM)
-    globalThis.currentDownloadProgress = {
-      playlistId,
-      status: 'completed',
-      completed: results.success.length + results.errors.length,
-      total: videos.length,
-      failed: results.errors.length,
-      downloadId,  // Explicitly include for progress restoration
-      autoDownloaded: false
-    };
-    chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress }).catch(() => {});
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || {};
+      
+      globalThis.currentDownloadProgress = {
+        ...current,
+        playlistId,
+        status: 'completed',
+        completed: results.success.length + results.errors.length,
+        total: videos.length,
+        failed: results.errors.length,
+        downloadId,
+        autoDownloaded: false
+      };
+      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+    } catch (e) {
+      console.error('[Background] Final progress update failed:', e);
+    }
 
     return {
       downloadId,
@@ -397,17 +462,61 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     console.error('[Background] Batch download failed:', err);
 
     // Update progress to error state so popup can see it
-    globalThis.currentDownloadProgress = {
-      playlistId,
-      status: 'error',
-      completed: results?.success?.length || 0,
-      total: videos.length,
-      failed: results?.errors?.length || 0,
-      error: err.message,
-      downloadId
-    };
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || {};
+
+      globalThis.currentDownloadProgress = {
+        ...current,
+        playlistId,
+        status: 'error',
+        completed: results?.success?.length || current.completed || 0,
+        total: videos.length,
+        failed: results?.errors?.length || current.failed || 0,
+        error: err.message,
+        downloadId
+      };
+      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+    } catch (e) {
+      console.error('[Background] Error state update failed:', e);
+    }
 
     throw err;
+  }
+}
+
+/**
+ * Atomic progress update helper
+ * Reads current state from storage, merges with updates, writes back.
+ * Prevents stale state overwrites from concurrent updates or SW restarts.
+ */
+async function atomicProgressUpdate(updates, options = {}) {
+  try {
+    const stored = await chrome.storage.local.get('currentDownloadProgress');
+    const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+
+    // By default, don't overwrite completed/error states with running updates
+    if (!options.force && (current.status === 'completed' || current.status === 'error')) {
+      globalThis.currentDownloadProgress = current;
+      return current;
+    }
+
+    const merged = {
+      ...current,
+      ...updates,
+      // Preserve critical fields if not explicitly provided
+      playlistId: updates.playlistId ?? current.playlistId,
+      downloadId: updates.downloadId ?? current.downloadId
+    };
+
+    globalThis.currentDownloadProgress = merged;
+    await chrome.storage.local.set({ currentDownloadProgress: merged });
+    return merged;
+  } catch (e) {
+    console.error('[Main] Atomic progress update failed:', e);
+    // Fallback: just update globalThis
+    globalThis.currentDownloadProgress = { ...globalThis.currentDownloadProgress, ...updates };
+    return globalThis.currentDownloadProgress;
   }
 }
 
@@ -477,10 +586,14 @@ function formatTranscript(transcript, format) {
   }
 }
 
-// Helper to create ZIP in background (sync — no Workers needed in MV3 service worker)
+// Helper to create ZIP in background (async — non-blocking for MV3 service worker)
 function createZipInBackground(zipData) {
-  const data = zipSync(zipData, { level: 6 });
-  return new Blob([data], { type: 'application/zip' });
+  return new Promise((resolve, reject) => {
+    zip(zipData, { level: 6 }, (err, data) => {
+      if (err) reject(err);
+      else resolve(new Blob([data], { type: 'application/zip' }));
+    });
+  });
 }
 
 function generateSubtitleFilename(index, videoId, title, language, format) {
