@@ -212,7 +212,12 @@ export async function getVideoMetadata(videoId) {
   try {
     const yt = await getInnertube();
     const info = await yt.getInfo(videoId);
-    
+
+    // DEBUG: Log the full structure
+    console.log('[Tier 3 Debug] info keys:', Object.keys(info || {}).join(', '));
+    console.log('[Tier 3 Debug] info.captions:', JSON.stringify(info.captions, null, 2));
+    console.log('[Tier 3 Debug] info.basic_info:', JSON.stringify(info.basic_info, null, 2));
+
     let languages = [];
     const captionTracks = info.captions?.caption_tracks;
 

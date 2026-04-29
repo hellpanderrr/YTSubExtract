@@ -64,7 +64,7 @@ export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
 
   try {
     // Generate session data once and reuse for all pages
-    const sessionData = generateSessionData('WEB');
+    const sessionData = await generateSessionData('WEB');
 
     while (videos.length < maxResults && pageCount < maxPages) {
       const payload = {

@@ -347,8 +347,22 @@ export class TranslationManager {
       console.warn('Tier 1 Metadata failed:', tier1Err?.message || tier1Err);
     }
 
-    // Tier 2
-    console.log('[TranslationManager] Trying Tier 2...');
+    // Tier 3: Innertube (reliable, works without active tab)
+    console.log('[TranslationManager] Trying Tier 3 (Innertube)...');
+    try {
+        const result = await getVideoMetadataTier3(videoId);
+        if (result && result.languages && result.languages.length > 0) {
+            console.log(`[TranslationManager] Tier 3 success: ${result.languages.length} languages`);
+            this._setCache(cacheKey, result);
+            return result;
+        }
+        console.warn('Tier 3 returned no languages, falling back...');
+    } catch (e3) {
+        console.warn('Tier 3 Metadata failed:', e3?.message || e3);
+    }
+
+    // Tier 2: Page context (requires active YouTube tab)
+    console.log('[TranslationManager] Trying Tier 2 (Page Context)...');
     try {
         const tier2Result = await this._getLanguagesTier2(videoId);
         if (tier2Result && tier2Result.length > 0) {
@@ -368,20 +382,7 @@ export class TranslationManager {
             return result;
         }
     } catch (e2) {
-        console.warn('Tier 2 Metadata failed:', e2);
-    }
-
-    // Tier 3
-    console.log('[TranslationManager] Trying Tier 3...');
-    try {
-        const result = await getVideoMetadataTier3(videoId);
-        if (result && result.languages && result.languages.length > 0) {
-            this._setCache(cacheKey, result);
-            return result;
-        }
-        console.warn('Tier 3 returned no languages, falling back to Tier 4...');
-    } catch (e3) {
-        console.error('Tier 3 Metadata failed:', e3);
+        console.warn('Tier 2 Metadata failed:', e2?.message || e2);
     }
 
     // Tier 4 (Page Context / Age Restricted Fallback)
@@ -670,19 +671,34 @@ export class TranslationManager {
   }
 
   async _getLanguagesTier2(videoId) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Timeout to prevent hanging
+      const timeout = setTimeout(() => {
+        reject(new Error('Tier 2 timeout - no response from content script'));
+      }, 3000);
+
       chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) return resolve([]);
-        
+        if (tabs.length === 0) {
+          clearTimeout(timeout);
+          return reject(new Error('Tier 2: No active YouTube tab found'));
+        }
+
         chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_TIER2_LANGUAGES', videoId }, (response) => {
-          if (chrome.runtime.lastError || !response?.success) {
-            return resolve([]);
+          clearTimeout(timeout);
+          if (chrome.runtime.lastError) {
+            return reject(new Error(`Tier 2 communication error: ${chrome.runtime.lastError.message}`));
+          }
+          if (!response?.success) {
+            return reject(new Error('Tier 2: Content script returned no success'));
           }
           // Also capture title if returned
           if (response.title) {
             this._cachedTitle = response.title;
           }
-          resolve(response.languages || []);
+          if (!response.languages || response.languages.length === 0) {
+            return reject(new Error('Tier 2: No languages found'));
+          }
+          resolve(response.languages);
         });
       });
     });
@@ -712,26 +728,39 @@ export class TranslationManager {
   }
 
   async _getLanguagesTier4(videoId) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Timeout to prevent hanging
+      const timeout = setTimeout(() => {
+        reject(new Error('Tier 4 timeout - no response from content script'));
+      }, 5000);
+
       chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) return resolve({ languages: [] });
-        
+        if (tabs.length === 0) {
+          clearTimeout(timeout);
+          return reject(new Error('Tier 4: No active YouTube tab found'));
+        }
+
         chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_CONTEXT_LANGUAGES', videoId }, (response) => {
+          clearTimeout(timeout);
+
           if (chrome.runtime.lastError) {
-              console.error('[Tier 4] Runtime error:', chrome.runtime.lastError.message);
-              return resolve({ languages: [] });
+            return reject(new Error(`Tier 4 runtime error: ${chrome.runtime.lastError.message}`));
           }
 
           if (response?.logs) {
-              console.groupCollapsed('[Tier 4] Page Context Logs');
-              response.logs.forEach(l => console.log(l));
-              console.groupEnd();
+            console.groupCollapsed('[Tier 4] Page Context Logs');
+            response.logs.forEach(l => console.log(l));
+            console.groupEnd();
           }
 
           if (!response?.success) {
-            console.error('[Tier 4] Failed:', response?.error || 'Unknown error');
-            return resolve({ languages: [] });
+            return reject(new Error(`Tier 4 failed: ${response?.error || 'Unknown error'}`));
           }
+
+          if (!response.languages || response.languages.length === 0) {
+            return reject(new Error('Tier 4: No languages found'));
+          }
+
           resolve(response);
         });
       });
@@ -1430,7 +1459,8 @@ export class TranslationManager {
 
   // ─────────────────────────────────────────────────────────────
   // API-Only Tiers for Playlist Processing
-  // Uses tiers 0.5, 1, 1.5, 3 Legacy (no active tab required)
+  // Optimized: Start with Tier 3 (youtubei.js) as primary - it's the only reliable method
+  // Tier 0.5/1/1.5 are deprecated as they all fail with PoToken requirements
   // ─────────────────────────────────────────────────────────────
   async getTranscriptForPlaylist(videoId, options = {}) {
     const { 
@@ -1445,7 +1475,7 @@ export class TranslationManager {
       logs.push(`[Playlist] ${msg}`);
     };
 
-    log(`Processing ${videoId} (API-only tiers)...`);
+    log(`Processing ${videoId} (optimized - Tier 3 primary)...`);
     log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
 
     const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${translate ? targetLang : ''}`;
@@ -1458,106 +1488,47 @@ export class TranslationManager {
 
     const errors = [];
 
-    // === TIER 0.5: Player API URL (without active tab - direct fetch) ===
+    // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
     try {
-      log('[Tier 0.5] Attempting Player API...');
+      log('[Tier 3] Attempting Innertube (primary)...');
       
-      // Get video info first
-      const videoInfo = await getVideoInfo(videoId);
+      const tier3Options = {
+        lang: sourceLang,
+        translate: translate,
+        targetLang: targetLang
+      };
       
-      const captionTracks = videoInfo?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      // Fallback: Check inside playerOverlays (common in Android/Mobile)
-      const overlayTracks = videoInfo?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
-      const tracks = (captionTracks?.length > 0) ? captionTracks : overlayTracks;
-      if (tracks && tracks.length > 0) {
-        let track;
-        if (sourceLang === 'auto') {
-          // Prefer English for auto mode, fallback to first track (match _extractFromEmbed)
-          track = tracks.find(t => t.languageCode === 'en') || tracks[0];
-        } else {
-          track = tracks.find(t => t.languageCode === sourceLang);
-          if (!track) {
-            throw new Error(`Language ${sourceLang} not found`);
-          }
-        }
-
-        if (track?.baseUrl) {
-          let fetchUrl = track.baseUrl;
-          // Remove tlang using URL API (safe parameter manipulation)
-          if (fetchUrl.includes('tlang=')) {
-            try {
-              const url = new URL(fetchUrl);
-              url.searchParams.delete('tlang');
-              fetchUrl = url.toString();
-            } catch (e) {
-              // Fallback to regex if URL is malformed
-              fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
-              fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
-            }
-          }
-          if (translate && targetLang) {
-            try {
-              const url = new URL(fetchUrl);
-              url.searchParams.set('tlang', targetLang);
-              fetchUrl = url.toString();
-            } catch (e) {
-              fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
-            }
-          }
-          if (!fetchUrl.includes('fmt=')) {
-            fetchUrl += '&fmt=json3';
-          } else {
-            fetchUrl = fetchUrl.replace(/fmt=[^&]+/, 'fmt=json3');
-          }
-
-          // Browser sets User-Agent and Referer automatically; MV3 service workers strip manual overrides anyway
-          const response = await fetch(fetchUrl);
-
-          if (response.ok) {
-            const text = await response.text();
-            if (text && text.trim().length > 0) {
-              try {
-                const json = JSON.parse(text);
-                if (json.events) {
-                  const result = json.events
-                    .filter(e => e.segs)
-                    .map(e => ({
-                      start: (e.tStartMs || 0) / 1000,
-                      duration: (e.dDurationMs || 0) / 1000,
-                      text: e.segs.map(s => s.utf8 || '').join('')
-                    }))
-                    .filter(e => e.text.trim().length > 0);
-                  
-                  if (result.length > 0) {
-                    log(`[Tier 0.5] Success! ${result.length} segments`);
-                    const resp = {
-                      source: 'tier0.5-playlist',
-                      result,
-                      translated: translate,
-                      sourceLang: track.languageCode,
-                      targetLang,
-                      logs
-                    };
-                    this._setCache(cacheKey, resp);
-                    return resp;
-                  }
-                }
-              } catch (parseErr) {
-                log(`[Tier 0.5] JSON parse failed: ${parseErr.message}`);
-              }
-            }
-          }
-        }
+      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
+      
+      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
+        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
+        
+        const normalized = tier3Result.segments.map(s => ({
+          start: s.start,
+          duration: s.end - s.start,
+          text: s.text
+        }));
+        
+        const response = {
+          source: 'tier3-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang: tier3Result.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
       }
-      log('[Tier 0.5] No success, falling back...');
     } catch (err) {
-      errors.push({ tier: '0.5', error: err.message });
-      log(`[Tier 0.5] Failed: ${err.message}`);
+      errors.push({ tier: 3, error: err.message });
+      log(`[Tier 3] Failed: ${err.message}`);
     }
 
-    // === TIER 1: youtube-caption-extractor ===
+    // === FALLBACK: Try Tier 1 (updated client chain: IOS -> MWEB -> WEB_EMBEDDED) ===
+    // Only used if Tier 3 fails, for edge cases
     try {
-      log('[Tier 1] Attempting youtube-caption-extractor...');
+      log('[Tier 1 Fallback] Attempting updated client chain...');
       
       const result = await getSubtitles({
         videoID: videoId,
@@ -1567,7 +1538,6 @@ export class TranslationManager {
       });
 
       if (result && result.length > 0) {
-        // Convert to standard format
         const normalized = result.map(s => ({
           start: s.start,
           duration: s.duration,
@@ -1591,9 +1561,9 @@ export class TranslationManager {
       log(`[Tier 1] Failed: ${err.message}`);
     }
 
-    // === TIER 1.5: Embed Page ===
+    // === LAST RESORT: Embed Page ===
     try {
-      log('[Tier 1.5] Attempting embed page...');
+      log('[Tier 1.5] Attempting embed page (last resort)...');
       const result = await this._extractFromEmbed(videoId, sourceLang, translate, targetLang);
       
       if (result && result.length > 0) {
@@ -1614,44 +1584,7 @@ export class TranslationManager {
       log(`[Tier 1.5] Failed: ${err.message}`);
     }
 
-    // === TIER 3 Legacy ===
-    try {
-      log('[Tier 3 Legacy] Attempting Innertube...');
-      
-      const legacyOptions = {
-        lang: sourceLang,
-        translate: translate,
-        targetLang: targetLang
-      };
-      
-      const legacyResult = await fetchTier3Transcript(videoId, legacyOptions);
-      
-      if (legacyResult && legacyResult.segments && legacyResult.segments.length > 0) {
-        log(`[Tier 3 Legacy] Success! ${legacyResult.segments.length} segments`);
-        
-        const normalized = legacyResult.segments.map(s => ({
-          start: s.start,
-          duration: s.end - s.start,
-          text: s.text
-        }));
-        
-        const response = {
-          source: 'tier3-legacy-playlist',
-          result: normalized,
-          translated: translate,
-          sourceLang: legacyResult.language || sourceLang,
-          targetLang,
-          logs
-        };
-        this._setCache(cacheKey, response);
-        return response;
-      }
-    } catch (err) {
-      errors.push({ tier: '3-legacy', error: err.message });
-      log(`[Tier 3 Legacy] Failed: ${err.message}`);
-    }
-
-    // All API-only tiers failed
+    // All tiers failed
     const finalError = new Error(`All API-only tiers failed for ${videoId}`);
     finalError.logs = logs;
     finalError.errors = errors;
