@@ -906,7 +906,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         
         // Try SRV3 (XML-based but different)
-        let srv3Url = urlToUse.replace(/fmt=[^&]+/, 'fmt=srv3');
+        let srv3Url;
+        if (urlToUse.includes('fmt=')) {
+          srv3Url = urlToUse.replace(/fmt=[^&]+/, 'fmt=srv3');
+        } else {
+          const separator = urlToUse.includes('?') ? '&' : '?';
+          srv3Url = urlToUse + separator + 'fmt=srv3';
+        }
         log(`Fetching SRV3 from: ${srv3Url}`);
         try {
             const srv3Resp = await fetch(srv3Url);

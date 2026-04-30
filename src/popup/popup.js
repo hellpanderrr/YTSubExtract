@@ -462,6 +462,8 @@ async function checkAndRestoreProgress() {
 
     const progress = response.data;
     if (!progress || progress.playlistId !== currentPlaylistId) return;
+    // Also verify downloadId to avoid restoring stale batches
+    if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return;
 
     // If there's an active or completed download, restore UI
     if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error') {

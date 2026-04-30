@@ -21,13 +21,13 @@ const INNERTUBE_CONFIG = {
     },
     MWEB: {
       NAME: 'MWEB',
-      VERSION: '2.20260401.00.00',
+      VERSION: '2.20260428.00.00',
       USER_AGENT: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
       CLIENT_ID: '2',
     },
     WEB_EMBEDDED: {
       NAME: 'WEB_EMBEDDED_PLAYER',
-      VERSION: '2.20260401.00.00',
+      VERSION: '2.20260428.00.00',
       CLIENT_ID: '56',
     },
     ANDROID: {
@@ -44,7 +44,7 @@ const INNERTUBE_CONFIG = {
     },
     TVHTML5: {
       NAME: 'TVHTML5',
-      VERSION: '7.20250401.10.00',
+      VERSION: '7.20260428.10.00',
       USER_AGENT: 'Mozilla/5.0 (Chromecast; GoogleTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       CLIENT_ID: '7',
     }
@@ -52,7 +52,7 @@ const INNERTUBE_CONFIG = {
 };
 
 // Generate proper session data
-export async function generateSessionData(clientType = 'ANDROID') {
+export async function generateSessionData(clientType = 'IOS') {
   const visitorData = await getCachedVisitorData();
   
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
@@ -69,7 +69,7 @@ export async function generateSessionData(clientType = 'ANDROID') {
   // Client-specific additions
   const clientAdditions = {
     ANDROID: { androidSdkVersion: 34 },
-    IOS: { osName: 'iOS', osVersion: '17.5.1.21F90', deviceMake: 'Apple', deviceModel: 'iPhone14,5' },
+    IOS: { osName: 'iOS', osVersion: '18.4.1.22E252', deviceMake: 'Apple', deviceModel: 'iPhone17,2' },
     TVHTML5: { 
       tvAppInfo: { appQuality: 'LARGE' },
       clientScreen: 'WATCH'
@@ -131,7 +131,7 @@ export async function getCachedVisitorData() {
   return cachedVisitorData;
 }
 
-export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', timeoutMs = 10000, parseAs = 'json') {
+export async function fetchInnerTube(endpoint, data, clientType = 'IOS', timeoutMs = 10000, parseAs = 'json') {
   const clientConfig = INNERTUBE_CONFIG.CLIENT[clientType];
 
   if (!clientConfig) {
@@ -148,11 +148,14 @@ export async function fetchInnerTube(endpoint, data, clientType = 'ANDROID', tim
     Referer: 'https://www.youtube.com/',
   };
 
-  // Set User-Agent based on client type
+  // Set User-Agent based on client type.
+  // WEB should use the browser's default desktop UA (don't override).
+  // Mobile clients (IOS, ANDROID, MWEB, TVHTML5) need their specific UAs.
   if (clientConfig.USER_AGENT) {
     headers['User-Agent'] = clientConfig.USER_AGENT;
-  } else {
-    headers['User-Agent'] = 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)';
+  } else if (clientType !== 'WEB') {
+    // Fallback generic mobile UA for any mobile client missing a specific one
+    headers['User-Agent'] = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
   }
 
   const url = `${INNERTUBE_CONFIG.API_BASE}${endpoint}?key=${INNERTUBE_CONFIG.API_KEY}`;
@@ -200,64 +203,85 @@ export async function getVideoInfo(videoID) {
     return status === 'UNPLAYABLE' || status === 'ERROR' || status === 'LOGIN_REQUIRED';
   };
 
-  // yt-dlp priority: IOS -> MWEB -> WEB_EMBEDDED -> ANDROID -> TVHTML5
-  // IOS and MWEB often work without PoToken for captions
-  const CLIENT_PRIORITY = ['IOS', 'MWEB', 'WEB_EMBEDDED', 'ANDROID', 'TVHTML5'];
-  
+  // Priority: IOS and MWEB often work without PoToken for captions.
+  // WEB added because youtubei.js proves it works for metadata.
+  // ANDROID deprecated by YouTube in early 2026 for programmatic access.
+  const CLIENT_PRIORITY = ['IOS', 'MWEB', 'WEB', 'WEB_EMBEDDED', 'TVHTML5', 'ANDROID'];
+
   for (const clientType of CLIENT_PRIORITY) {
     try {
       debug(`Trying ${clientType} client...`);
-      
+
       const sessionData = await generateSessionData(clientType);
+
+      // Build client-specific payload. YouTube strictly validates payload
+      // fields per client. Sending Android protobuf params to iOS causes
+      // "not available on this app". Sending stale signatureTimestamp to
+      // MWEB causes "page needs to be reloaded".
       const payload = {
         context: sessionData.context,
         videoId: videoID,
-        contentCheckOk: true,
-        racyCheckOk: true,
-        playbackContext: {
+      };
+
+      if (clientType === 'ANDROID') {
+        // ANDROID client requires full legacy payload, but YouTube has
+        // deprecated it for programmatic access since early 2026.
+        payload.contentCheckOk = true;
+        payload.racyCheckOk = true;
+        payload.params = 'CgIQBg==';
+        payload.playbackContext = {
           contentPlaybackContext: {
             html5Preference: 'HTML5_PREF_WANTS',
-            signatureTimestamp: 19894
-          }
-        }
-      };
-      
-      // Add params for mobile clients (not for WEB/MWEB/WEB_EMBEDDED)
-      if (['ANDROID', 'IOS', 'TVHTML5'].includes(clientType)) {
-        payload.params = 'CgIQBg==';
-        payload.playbackContext.contentPlaybackContext.vis = 0;
-        payload.playbackContext.contentPlaybackContext.splay = false;
-        payload.playbackContext.contentPlaybackContext.autoCaptionsDefaultOn = false;
-        payload.playbackContext.contentPlaybackContext.autonavState = 'STATE_NONE';
-        payload.playbackContext.contentPlaybackContext.lactMilliseconds = '-1';
+            signatureTimestamp: 19894,
+            vis: 0,
+            splay: false,
+            autoCaptionsDefaultOn: false,
+            autonavState: 'STATE_NONE',
+            lactMilliseconds: '-1',
+          },
+        };
+      } else if (['WEB', 'MWEB', 'WEB_EMBEDDED'].includes(clientType)) {
+        // WEB clients need minimal payload.  Adding Android params or
+        // playbackContext here triggers playability errors.
+        payload.contentCheckOk = true;
+        payload.racyCheckOk = true;
+      } else if (clientType === 'IOS') {
+        // iOS client is very sensitive to extra fields.  Keep it minimal.
+        // Do NOT send params or playbackContext.
+        payload.contentCheckOk = true;
+        payload.racyCheckOk = true;
+      } else if (clientType === 'TVHTML5') {
+        // TVHTML5 also needs minimal payload.  No Android-specific fields.
+        payload.contentCheckOk = true;
+        payload.racyCheckOk = true;
       }
-      
+
       const data = await fetchInnerTube('/player', payload, clientType);
-      
+
       debug(`${clientType} client response keys: ${Object.keys(data || {}).join(', ')}`);
       if (data?.playabilityStatus) {
         debug(`${clientType} playabilityStatus: ${JSON.stringify(data.playabilityStatus)}`);
       }
-      
+
       // Fast-fail: if UNPLAYABLE/ERROR/LOGIN_REQUIRED, skip to next client immediately
       if (isUnplayable(data)) {
         debug(`${clientType} returned unplayable status, skipping to next client`);
         continue;
       }
-      
+
       // Check for captions
       if (hasCaptions(data) || hasOverlayCaptions(data)) {
         debug(`${clientType} client found captions!`);
         return data;
       }
-      
-      // If playable but no captions, still return the data (caller will handle)
+
+      // If playable but no captions, continue to next client (don't return early)
       const playability = getPlayabilityStatus(data);
       if (playability === 'OK' || playability === 'LIVE_STREAM_OFFLINE') {
-        debug(`${clientType}: Video playable but no captions available`);
-        return data;
+        debug(`${clientType}: Video playable but no captions available, trying next client`);
+        // Don't return here - let other clients attempt to get captions
       }
-      
+
     } catch (err) {
       debug(`${clientType} client failed: ${err.message}`);
       // Continue to next client
@@ -432,7 +456,7 @@ async function getSubtitlesFromCaptions(videoID, playerData, lang = 'en', option
 
   const response = await fetch(captionUrl, {
     headers: {
-      'User-Agent': 'com.google.android.youtube/19.35.36 (Linux; U; Android 11; US; Pixel 5 Build/RQ3A.210905.001)',
+      'User-Agent': INNERTUBE_CONFIG.CLIENT.IOS.USER_AGENT,
       Referer: `https://www.youtube.com/watch?v=${videoID}`,
     },
   });

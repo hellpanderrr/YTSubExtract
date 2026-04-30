@@ -31,7 +31,7 @@ The extension uses a priority fallback model with multiple extraction methods. *
 |------|--------|--------|---------------|
 | **Tier 0.5** | Player API from active tab | ✅ Works | User has YouTube video open in active tab |
 | **Tier 1.5** | Embed page scraping | ⚠️ Limited | Often blocked by CSP/redirects |
-| **Tier 1** | Direct InnerTube API | ❌ **DEAD** | All clients blocked by YouTube (PoToken required) |
+| **Tier 1** | Direct InnerTube API | ⚠️ **PARTIAL** | IOS works; MWEB/WEB_EMBEDDED require PoToken; ANDROID deprecated |
 | **Tier 2** | Content script injection | ⚠️ Timeout | Requires active tab, often hangs |
 | **Tier 3** | youtubei.js library | ✅ **PRIMARY** | Most reliable method, no active tab needed |
 | **Tier 4** | Page context extraction | ⚠️ Slow | Last resort, requires active tab |
@@ -40,15 +40,17 @@ The extension uses a priority fallback model with multiple extraction methods. *
 
 | Tier | Method | Status | Notes |
 |------|--------|--------|-------|
-| **Tier 1** (API clients) | youtube-caption-extractor | ❌ Broken | All clients return UNPLAYABLE/ERROR |
+| **Tier 1** (API clients) | youtube-caption-extractor | ⚠️ Partial | IOS works; others blocked or deprecated |
 | **Tier 1.5** | Embed page | ❌ Broken | No active tab in service worker context |
 | **Tier 3** | youtubei.js | ✅ **PRIMARY** | Only reliable method for playlists |
 
 ### Phase 1 Optimizations (Implemented)
 
-1. **New Client Priority** (IOS → MWEB → WEB_EMBEDDED → ANDROID → TVHTML5)
+1. **New Client Priority** (IOS → MWEB → WEB → WEB_EMBEDDED → TVHTML5 → ANDROID)
    - Based on yt-dlp's successful client fallback chain
+   - WEB client added; ANDROID moved to last (deprecated by YouTube in 2026)
    - Fast-fail on UNPLAYABLE/ERROR/LOGIN_REQUIRED responses
+   - Client-specific payloads: only ANDROID gets legacy params/playbackContext
 
 2. **VisitorData Caching** (24h)
    - Reduces bot-like behavior
@@ -58,6 +60,12 @@ The extension uses a priority fallback model with multiple extraction methods. *
    - Skips slow/broken Tier 0.5/1/1.5 for playlist downloads
    - ~2-3x faster per video in playlist mode
 
+### Phase 2 Fixes (Latest)
+
+4. **Client-Specific Payloads** — Only ANDROID gets legacy `params`/`playbackContext`; others use minimal payload
+5. **User-Agent Consistency** — Fixed DNR rules to match client type (removed forced ANDROID UA override)
+6. **IOS Metadata** — Updated device model (`iPhone17,2`) and OS version (`18.4.1`) to match current UA
+
 ### Tier Details
 
 #### Tier 0.5: Player API
@@ -65,10 +73,14 @@ The extension uses a priority fallback model with multiple extraction methods. *
 **Use Case**: Fastest method when user has YouTube open in active tab.  
 **Status**: ✅ Reliable when active tab available.
 
-#### Tier 1: Direct API Clients (DEPRECATED)
-**Mechanism**: HTTP requests to `youtubei/v1` masquerading as mobile apps.  
-**Status**: ❌ **DEAD** — YouTube requires PoToken (Proof-of-Origin) which can't be generated without JavaScript execution.  
-**Clients tried**: IOS, MWEB, WEB_EMBEDDED, ANDROID, TVHTML5 (all return UNPLAYABLE/ERROR).
+#### Tier 1: Direct API Clients (PARTIAL)
+**Mechanism**: HTTP requests to `youtubei/v1` with client-specific payloads.  
+**Status**: ⚠️ **IOS works**, others require PoToken or deprecated:
+- ✅ **IOS**: Minimal payload, works for most videos (primary Tier 1 client)
+- ❌ **MWEB/WEB**: Require PoToken (enforcement rolled out Apr 2026)
+- ❌ **WEB_EMBEDDED**: Requires embed auth + PoToken
+- ❌ **ANDROID**: Deprecated by YouTube for programmatic access (early 2026)
+- ❌ **TVHTML5**: HTTP 400 — payload incompatible
 
 #### Tier 3: InnerTube Emulation (PRIMARY)
 **Mechanism**: Full `youtubei.js` session with proper handshake.  
@@ -86,7 +98,7 @@ The extension uses a priority fallback model with multiple extraction methods. *
 ## Extraction Cascades
 
 ### Metadata Cascade (Single Video - Popup)
-```
+```text
 Parallel: [Tier 0.5, Tier 1.5] → Tier 1 (API) → Tier 2 → Tier 3 → Tier 4
 ```
 - Tiers 0.5 and 1.5 execute in parallel first (cheap, fast when available)
@@ -94,14 +106,14 @@ Parallel: [Tier 0.5, Tier 1.5] → Tier 1 (API) → Tier 2 → Tier 3 → Tier 4
 - **Tier 3 is primary fallback** and handles most cases reliably
 
 ### Download Cascade (Single Video - Popup)
-```
+```text
 Tier 0 (sniffer) → Tier 0.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
 ```
 - Tier 0: Uses captured URL from network sniffer (instant if available)
 - Falls back through tiers until one succeeds
 
 ### Playlist Cascade (Background Service Worker)
-```
+```text
 Tier 3 (PRIMARY) → Tier 1 (fallback) → Tier 1.5 (last resort)
 ```
 - **Optimized**: Starts with Tier 3 immediately (youtubei.js)
