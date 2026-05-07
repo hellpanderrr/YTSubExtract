@@ -2,7 +2,7 @@
 // === UNIVERSAL TRANSLATION MANAGER ===
 // Handles all 3 libraries + YouTube Native API
 
-import { getSubtitles, getLanguages } from '../utils/youtube-caption-extractor.js';
+import { getSubtitles, getLanguages, getVideoInfo } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import he from 'he';
@@ -11,6 +11,34 @@ export class TranslationManager {
   constructor() {
     this.availableLanguages = null;
     this.cache = new Map();
+    this.MAX_CACHE_SIZE = 100; // Limit cache size to prevent memory leaks
+
+    // Deduplication maps to prevent concurrent duplicate requests
+    this.pendingMetadataRequests = new Map(); // key: videoId -> Promise
+    this.pendingTranscriptRequests = new Map(); // key: videoId:lang:translate:targetLang -> Promise
+  }
+
+  /**
+   * Add to cache with size limit (simple LRU-ish: remove first added)
+   * Thread-safety: Uses while loop to handle concurrent size changes
+   */
+  _setCache(key, value) {
+    // Guard against edge case: empty cache with size > 0
+    if (this.cache.size === 0 && this.MAX_CACHE_SIZE > 0) {
+      this.cache.set(key, value);
+      return;
+    }
+
+    // Re-check size to handle concurrent additions correctly
+    let attempts = 0;
+    const maxAttempts = this.MAX_CACHE_SIZE + 10; // Safety limit
+    while (this.cache.size >= this.MAX_CACHE_SIZE && attempts < maxAttempts) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey === undefined) break; // Should not happen with size > 0
+      this.cache.delete(firstKey);
+      attempts++;
+    }
+    this.cache.set(key, value);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -64,6 +92,41 @@ export class TranslationManager {
           
           console.log(`[Tier 0.5] Success: ${languages.length} languages, title: ${response.title}`);
           resolve({ languages, title: response.title });
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // TIER 0.5: Playlist DOM Extraction (for private playlists)
+  // ─────────────────────────────────────────────────────────────
+  async _getPlaylistVideosTier0_5(playlistId) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Playlist] No active YouTube tab');
+          return resolve(null);
+        }
+
+        chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PLAYLIST_VIDEOS_FROM_DOM', playlistId }, (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Playlist] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            if (response?.logs) {
+              console.log('[Tier 0.5 Playlist] Logs:', response.logs);
+            }
+            console.log('[Tier 0.5 Playlist] Failed:', response?.error || 'Unknown error');
+            return resolve(null);
+          }
+
+          console.log(`[Tier 0.5 Playlist] Success: ${response.videos?.length || 0} videos, title: ${response.title}`);
+          resolve({
+            videos: response.videos || [],
+            title: response.title || ''
+          });
         });
       });
     });
@@ -188,65 +251,118 @@ export class TranslationManager {
       return this.cache.get(cacheKey);
     }
 
+    // DEDUPLICATION: Check if there's already a pending request for this video
+    if (this.pendingMetadataRequests.has(videoId)) {
+      console.log(`[TranslationManager] Metadata request deduplication for ${videoId}`);
+      return this.pendingMetadataRequests.get(videoId);
+    }
+
     console.log(`[TranslationManager] Metadata cache miss for ${videoId}, fetching...`);
 
-    // Tier 0.5: Player API (first priority)
-    try {
-        const tier05Result = await this._getLanguagesTier0_5(videoId);
-        if (tier05Result.languages && tier05Result.languages.length > 0) {
-            console.log(`[TranslationManager] Tier 0.5 success: ${tier05Result.languages.length} languages`);
-            const result = {
-                title: tier05Result.title || 'YouTube Video',
-                languages: tier05Result.languages
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-    } catch (e05) {
-        console.warn('Tier 0.5 Metadata failed:', e05);
+    // Create the promise for this request
+    const requestPromise = this._fetchMetadataInternal(videoId, cacheKey);
+
+    // Store in pending map
+    this.pendingMetadataRequests.set(videoId, requestPromise);
+
+    // Clean up pending map when done (success or error)
+    requestPromise.finally(() => {
+      this.pendingMetadataRequests.delete(videoId);
+    });
+
+    return requestPromise;
+  }
+
+  /**
+   * Internal metadata fetch implementation (separated for deduplication)
+   */
+  async _fetchMetadataInternal(videoId, cacheKey) {
+    // Check cache again in case it was populated while we were waiting
+    if (this.cache.has(cacheKey)) {
+      console.log(`[TranslationManager] Metadata cache hit (late) for ${videoId}`);
+      return this.cache.get(cacheKey);
     }
 
-    // Tier 1.5: Embed Page (Guest Mode / Age-Restricted Bypass)
-    // MOVED BEFORE Tier 1 - Embed works for guests!
-    try {
-        const tier15Result = await this._getLanguagesTier1_5(videoId);
-        if (tier15Result.languages && tier15Result.languages.length > 0) {
-            console.log(`[TranslationManager] Tier 1.5 success: ${tier15Result.languages.length} languages`);
-            const result = {
-                title: tier15Result.title || 'YouTube Video',
-                languages: tier15Result.languages
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-    } catch (e15) {
-        console.warn('Tier 1.5 Metadata failed:', e15);
+    // Phase 1: Try cheap tiers first (0.5 and 1.5) - these are fast and don't require API calls
+    console.log('[TranslationManager] Starting cheap tier batch: 0.5, 1.5');
+    const cheapResults = await Promise.allSettled([
+      this._getLanguagesTier0_5(videoId),
+      this._getLanguagesTier1_5(videoId)
+    ]);
+
+    const [tier05Result, tier15Result] = cheapResults;
+
+    // Tier 0.5: Player API (first priority - instant from active player)
+    if (tier05Result.status === 'fulfilled') {
+      const result = tier05Result.value;
+      if (result.languages && result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 0.5 success: ${result.languages.length} languages`);
+        const metadata = {
+          title: result.title || 'YouTube Video',
+          languages: result.languages
+        };
+        this._setCache(cacheKey, metadata);
+        return metadata;
+      }
+    } else {
+      console.warn('Tier 0.5 Metadata failed:', tier05Result.reason?.message || tier05Result.reason);
     }
 
-    // Tier 1: Android/iOS/TVHTML5 API (requires auth for some videos)
-    try {
-        const { languages, title } = await getLanguages(videoId);
-        if (languages && languages.length > 0) {
-            const result = {
-                title: title || 'YouTube Video',
-                languages: languages.map(l => ({
-                    code: l.languageCode,
-                    name: l.languageName,
-                    isAuto: l.kind === 'asr'
-                }))
-            };
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-        // If Tier 1 returned no languages, log it
-        console.warn('Tier 1 Metadata returned no languages');
-    } catch (e1) {
-        // If Tier 1 failed (e.g. Sign in required), log it
-        console.warn('Tier 1 Metadata failed:', e1.message || e1);
+    // Tier 1.5: Embed Page (second priority - slow but works for age-restricted)
+    if (tier15Result.status === 'fulfilled') {
+      const result = tier15Result.value;
+      if (result.languages && result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 1.5 success: ${result.languages.length} languages`);
+        const metadata = {
+          title: result.title || 'YouTube Video',
+          languages: result.languages
+        };
+        this._setCache(cacheKey, metadata);
+        return metadata;
+      }
+    } else {
+      console.warn('Tier 1.5 Metadata failed:', tier15Result.reason?.message || tier15Result.reason);
     }
 
-    // Tier 2
-    console.log('[TranslationManager] Trying Tier 2...');
+    // Phase 2: Try API tier only if cheap tiers failed
+    console.log('[TranslationManager] Cheap tiers failed, trying Tier 1 (API)...');
+    try {
+      const { languages, title } = await getLanguages(videoId);
+      const tier1Result = {
+        languages: languages?.map(l => ({
+          code: l.languageCode,
+          name: l.languageName,
+          isAuto: l.kind === 'asr'
+        })) || [],
+        title: title || 'YouTube Video'
+      };
+
+      if (tier1Result.languages.length > 0) {
+        console.log(`[TranslationManager] Tier 1 success: ${tier1Result.languages.length} languages`);
+        this._setCache(cacheKey, tier1Result);
+        return tier1Result;
+      }
+      console.warn('Tier 1 Metadata returned no languages');
+    } catch (tier1Err) {
+      console.warn('Tier 1 Metadata failed:', tier1Err?.message || tier1Err);
+    }
+
+    // Tier 3: Innertube (reliable, works without active tab)
+    console.log('[TranslationManager] Trying Tier 3 (Innertube)...');
+    try {
+        const result = await getVideoMetadataTier3(videoId);
+        if (result && result.languages && result.languages.length > 0) {
+            console.log(`[TranslationManager] Tier 3 success: ${result.languages.length} languages`);
+            this._setCache(cacheKey, result);
+            return result;
+        }
+        console.warn('Tier 3 returned no languages, falling back...');
+    } catch (e3) {
+        console.warn('Tier 3 Metadata failed:', e3?.message || e3);
+    }
+
+    // Tier 2: Page context (requires active YouTube tab)
+    console.log('[TranslationManager] Trying Tier 2 (Page Context)...');
     try {
         const tier2Result = await this._getLanguagesTier2(videoId);
         if (tier2Result && tier2Result.length > 0) {
@@ -262,24 +378,11 @@ export class TranslationManager {
                 title: title,
                 languages: tier2Result
             };
-            this.cache.set(cacheKey, result);
+            this._setCache(cacheKey, result);
             return result;
         }
     } catch (e2) {
-        console.warn('Tier 2 Metadata failed:', e2);
-    }
-
-    // Tier 3
-    console.log('[TranslationManager] Trying Tier 3...');
-    try {
-        const result = await getVideoMetadataTier3(videoId);
-        if (result && result.languages && result.languages.length > 0) {
-            this.cache.set(cacheKey, result);
-            return result;
-        }
-        console.warn('Tier 3 returned no languages, falling back to Tier 4...');
-    } catch (e3) {
-        console.error('Tier 3 Metadata failed:', e3);
+        console.warn('Tier 2 Metadata failed:', e2?.message || e2);
     }
 
     // Tier 4 (Page Context / Age Restricted Fallback)
@@ -292,7 +395,7 @@ export class TranslationManager {
                 title: result.title || 'YouTube Video',
                 languages: result.languages
              };
-             this.cache.set(cacheKey, meta);
+             this._setCache(cacheKey, meta);
              return meta;
         }
     } catch (e4) {
@@ -326,15 +429,28 @@ export class TranslationManager {
   async _getLanguagesTier1_5(videoId) {
     try {
       console.log('[Tier 1.5] Attempting Embed page extraction...');
-      
-      const response = await fetch(`https://www.youtube.com/embed/${videoId}`);
-      console.log(`[Tier 1.5] Fetch status: ${response.status}`);
-      
-      if (!response.ok) {
-        throw new Error(`Embed page fetch failed: ${response.status}`);
+
+      // Add timeout to prevent hanging for 10+ seconds (covers fetch + body reading)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      let response;
+      let html;
+      try {
+        response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
+          signal: controller.signal
+        });
+
+        console.log(`[Tier 1.5] Fetch status: ${response.status}`);
+
+        if (!response.ok) {
+          throw new Error(`Embed page fetch failed: ${response.status}`);
+        }
+
+        html = await response.text();
+      } finally {
+        clearTimeout(timeoutId);
       }
-      
-      const html = await response.text();
       console.log(`[Tier 1.5] HTML length: ${html.length}`);
       
       // Method 1: Look for ytcfg.set({ ... })
@@ -434,9 +550,22 @@ export class TranslationManager {
   async _extractFromEmbed(videoId, lang, translate, targetLang) {
     try {
       console.log('[Tier 1.5] Extracting transcript from embed page...');
-      
-      const response = await fetch(`https://www.youtube.com/embed/${videoId}`);
-      const html = await response.text();
+
+      // Add timeout to prevent hanging (covers fetch + body reading)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      let response;
+      let html;
+      try {
+        response = await fetch(`https://www.youtube.com/embed/${videoId}`, {
+          signal: controller.signal
+        });
+
+        html = await response.text();
+      } finally {
+        clearTimeout(timeoutId);
+      }
       
       // Find caption track URL from embed page
       const scriptMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
@@ -481,8 +610,29 @@ export class TranslationManager {
       
       // Build fetch URL
       let fetchUrl = track.baseUrl;
+      // Remove any existing tlang to avoid duplicates using URL API
+      if (fetchUrl.includes('tlang=')) {
+        try {
+          const url = new URL(fetchUrl);
+          url.searchParams.delete('tlang');
+          fetchUrl = url.toString();
+        } catch (e) {
+          console.warn('[Tier 1.5] Invalid URL for tlang removal, using regex fallback:', e.message);
+          fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
+          fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+        }
+      }
       if (translate && targetLang) {
-        fetchUrl += `&tlang=${targetLang}`;
+        try {
+          const url = new URL(fetchUrl);
+          url.searchParams.set('tlang', targetLang);
+          fetchUrl = url.toString();
+        } catch (e) {
+          console.warn('[Tier 1.5] Invalid URL for tlang addition, using concat fallback:', e.message);
+          if (!fetchUrl.includes('tlang=')) {
+            fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+          }
+        }
       }
       if (!fetchUrl.includes('fmt=')) {
         fetchUrl += '&fmt=json3';
@@ -521,19 +671,34 @@ export class TranslationManager {
   }
 
   async _getLanguagesTier2(videoId) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Timeout to prevent hanging
+      const timeout = setTimeout(() => {
+        reject(new Error('Tier 2 timeout - no response from content script'));
+      }, 3000);
+
       chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) return resolve([]);
-        
+        if (tabs.length === 0) {
+          clearTimeout(timeout);
+          return reject(new Error('Tier 2: No active YouTube tab found'));
+        }
+
         chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_TIER2_LANGUAGES', videoId }, (response) => {
-          if (chrome.runtime.lastError || !response?.success) {
-            return resolve([]);
+          clearTimeout(timeout);
+          if (chrome.runtime.lastError) {
+            return reject(new Error(`Tier 2 communication error: ${chrome.runtime.lastError.message}`));
+          }
+          if (!response?.success) {
+            return reject(new Error('Tier 2: Content script returned no success'));
           }
           // Also capture title if returned
           if (response.title) {
             this._cachedTitle = response.title;
           }
-          resolve(response.languages || []);
+          if (!response.languages || response.languages.length === 0) {
+            return reject(new Error('Tier 2: No languages found'));
+          }
+          resolve(response.languages);
         });
       });
     });
@@ -563,26 +728,39 @@ export class TranslationManager {
   }
 
   async _getLanguagesTier4(videoId) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      // Timeout to prevent hanging
+      const timeout = setTimeout(() => {
+        reject(new Error('Tier 4 timeout - no response from content script'));
+      }, 5000);
+
       chrome.tabs.query({ active: true, url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) return resolve({ languages: [] });
-        
+        if (tabs.length === 0) {
+          clearTimeout(timeout);
+          return reject(new Error('Tier 4: No active YouTube tab found'));
+        }
+
         chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_CONTEXT_LANGUAGES', videoId }, (response) => {
+          clearTimeout(timeout);
+
           if (chrome.runtime.lastError) {
-              console.error('[Tier 4] Runtime error:', chrome.runtime.lastError.message);
-              return resolve({ languages: [] });
+            return reject(new Error(`Tier 4 runtime error: ${chrome.runtime.lastError.message}`));
           }
 
           if (response?.logs) {
-              console.groupCollapsed('[Tier 4] Page Context Logs');
-              response.logs.forEach(l => console.log(l));
-              console.groupEnd();
+            console.groupCollapsed('[Tier 4] Page Context Logs');
+            response.logs.forEach(l => console.log(l));
+            console.groupEnd();
           }
 
           if (!response?.success) {
-            console.error('[Tier 4] Failed:', response?.error || 'Unknown error');
-            return resolve({ languages: [] });
+            return reject(new Error(`Tier 4 failed: ${response?.error || 'Unknown error'}`));
           }
+
+          if (!response.languages || response.languages.length === 0) {
+            return reject(new Error('Tier 4: No languages found'));
+          }
+
           resolve(response);
         });
       });
@@ -607,6 +785,48 @@ export class TranslationManager {
         return {
             ...cached,
             logs: [...(cached.logs || []), `[Cache] Retrieved from cache`]
+        };
+    }
+
+    // DEDUPLICATION: Check if there's already a pending request for this exact configuration
+    const pendingKey = cacheKey; // Same as cache key for consistency
+    if (this.pendingTranscriptRequests.has(pendingKey)) {
+        console.log(`[TranslationManager] Transcript request deduplication for ${pendingKey}`);
+        return this.pendingTranscriptRequests.get(pendingKey);
+    }
+
+    // Create the promise for this request
+    const requestPromise = this._extractWithTranslationInternal(videoId, options, cacheKey);
+
+    // Store in pending map
+    this.pendingTranscriptRequests.set(pendingKey, requestPromise);
+
+    // Clean up pending map when done (success or error)
+    requestPromise.finally(() => {
+        this.pendingTranscriptRequests.delete(pendingKey);
+    });
+
+    return requestPromise;
+  }
+
+  /**
+   * Internal transcript extraction implementation (separated for deduplication)
+   */
+  async _extractWithTranslationInternal(videoId, options, cacheKey) {
+    const {
+      sourceLang = 'auto',
+      targetLang = 'ru',
+      translate = false,
+      preferTier = 1
+    } = options;
+
+    // Check cache again in case it was populated while we were waiting
+    if (this.cache.has(cacheKey)) {
+        console.log(`[TranslationManager] Transcript cache hit (late) for ${cacheKey}`);
+        const cached = this.cache.get(cacheKey);
+        return {
+            ...cached,
+            logs: [...(cached.logs || []), `[Cache] Retrieved from cache (late)`]
         };
     }
 
@@ -653,13 +873,26 @@ export class TranslationManager {
             // Remove any existing tlang parameter - we want original language, not translation
             if (fetchUrl.includes('tlang=')) {
                 log('[Tier 0] Removing existing tlang parameter to get original language');
-                fetchUrl = fetchUrl.replace(/tlang=[^&]+&?/, '');
-                // Clean up trailing &
-                fetchUrl = fetchUrl.replace(/&$/, '');
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.delete('tlang');
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0] Invalid URL for tlang removal, using regex fallback');
+                    fetchUrl = fetchUrl.replace(/([?&])tlang=[^&]*(&?)/g, (m, p, s) => (p === '?' && s) ? '?' : '');
+                    fetchUrl = fetchUrl.replace(/\?&/, '?').replace(/&$/, '');
+                }
             }
             
             if (translate && targetLang && !fetchUrl.includes('tlang=')) {
-                fetchUrl += `&tlang=${targetLang}`;
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.set('tlang', targetLang);
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0] Invalid URL for tlang addition, using concat fallback');
+                    fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+                }
             }
             
             // Format URL for JSON3
@@ -698,7 +931,7 @@ export class TranslationManager {
                                     targetLang,
                                     logs
                                 };
-                                this.cache.set(cacheKey, resp);
+                                this._setCache(cacheKey, resp);
                                 return resp;
                             }
                         }
@@ -726,7 +959,14 @@ export class TranslationManager {
             
             let fetchUrl = trackUrl;
             if (translate && targetLang && !trackUrl.includes('tlang=')) {
-                fetchUrl += `&tlang=${targetLang}`;
+                try {
+                    const url = new URL(fetchUrl);
+                    url.searchParams.set('tlang', targetLang);
+                    fetchUrl = url.toString();
+                } catch (e) {
+                    log('[Tier 0.5] Invalid URL for tlang addition, using concat fallback');
+                    fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + `tlang=${targetLang}`;
+                }
             }
             
             if (!fetchUrl.includes('fmt=')) {
@@ -761,7 +1001,7 @@ export class TranslationManager {
                                     targetLang,
                                     logs
                                 };
-                                this.cache.set(cacheKey, resp);
+                                this._setCache(cacheKey, resp);
                                 return resp;
                             }
                         }
@@ -801,7 +1041,7 @@ export class TranslationManager {
             targetLang,
             logs
           };
-          this.cache.set(cacheKey, response);
+          this._setCache(cacheKey, response);
           return response;
         }
       } catch (err) {
@@ -826,7 +1066,7 @@ export class TranslationManager {
           targetLang,
           logs
         };
-        this.cache.set(cacheKey, response);
+        this._setCache(cacheKey, response);
         return response;
       }
     } catch (err) {
@@ -867,7 +1107,7 @@ export class TranslationManager {
                 targetLang,
                 logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
       } catch (err) {
@@ -983,7 +1223,7 @@ export class TranslationManager {
         targetLang, 
         logs
       };
-      this.cache.set(cacheKey, response);
+      this._setCache(cacheKey, response);
       return response;
 
     } catch (err) {
@@ -1020,7 +1260,7 @@ export class TranslationManager {
                  targetLang: targetLang,
                  logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
     } catch (err) {
@@ -1167,7 +1407,7 @@ export class TranslationManager {
                                      }
                                  }
                                  if (currentText.length > 0) {
-                                     segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
+                                             segments.push({ start: currentStart, duration: currentDur, text: currentText.join(' ') });
                                  }
                                  log(`[Tier 4] VTT parsed ${segments.length} segments`);
                              }
@@ -1204,7 +1444,7 @@ export class TranslationManager {
                 targetLang,
                 logs
              };
-             this.cache.set(cacheKey, response);
+             this._setCache(cacheKey, response);
              return response;
         }
     } catch (err) {
@@ -1214,6 +1454,140 @@ export class TranslationManager {
 
     const finalError = new Error(`All extraction tiers failed: ${JSON.stringify(errors)}`);
     finalError.logs = logs;
+    throw finalError;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // API-Only Tiers for Playlist Processing
+  // Optimized: Start with Tier 3 (youtubei.js) as primary - it's the only reliable method
+  // Tier 0.5/1/1.5 are deprecated as they all fail with PoToken requirements
+  // ─────────────────────────────────────────────────────────────
+  async getTranscriptForPlaylist(videoId, options = {}) {
+    const { 
+      sourceLang = 'auto', 
+      translate = false, 
+      targetLang = 'en'
+    } = options;
+
+    const logs = [];
+    const log = (msg) => {
+      console.log(`[Playlist] ${msg}`);
+      logs.push(`[Playlist] ${msg}`);
+    };
+
+    log(`Processing ${videoId} (optimized - Tier 3 primary)...`);
+    log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
+
+    const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${translate ? targetLang : ''}`;
+    
+    // Check cache
+    if (this.cache.has(cacheKey)) {
+      log('Cache hit');
+      return this.cache.get(cacheKey);
+    }
+
+    const errors = [];
+
+    // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
+    try {
+      log('[Tier 3] Attempting Innertube (primary)...');
+      
+      const tier3Options = {
+        lang: sourceLang,
+        translate: translate,
+        targetLang: targetLang
+      };
+      
+      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
+      
+      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
+        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
+        
+        const normalized = tier3Result.segments.map(s => ({
+          start: s.start,
+          duration: s.end - s.start,
+          text: s.text
+        }));
+        
+        const response = {
+          source: 'tier3-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang: tier3Result.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 3, error: err.message });
+      log(`[Tier 3] Failed: ${err.message}`);
+    }
+
+    // === FALLBACK: Try Tier 1 (updated client chain: IOS -> MWEB -> WEB_EMBEDDED) ===
+    // Only used if Tier 3 fails, for edge cases
+    try {
+      log('[Tier 1 Fallback] Attempting updated client chain...');
+      
+      const result = await getSubtitles({
+        videoID: videoId,
+        lang: sourceLang !== 'auto' ? sourceLang : 'en',
+        translate: translate,
+        translateLang: translate ? targetLang : undefined
+      });
+
+      if (result && result.length > 0) {
+        const normalized = result.map(s => ({
+          start: s.start,
+          duration: s.duration,
+          text: s.text
+        }));
+        
+        log(`[Tier 1] Success! ${normalized.length} segments`);
+        const response = {
+          source: 'tier1-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 1, error: err.message });
+      log(`[Tier 1] Failed: ${err.message}`);
+    }
+
+    // === LAST RESORT: Embed Page ===
+    try {
+      log('[Tier 1.5] Attempting embed page (last resort)...');
+      const result = await this._extractFromEmbed(videoId, sourceLang, translate, targetLang);
+      
+      if (result && result.length > 0) {
+        log(`[Tier 1.5] Success! ${result.length} segments`);
+        const response = {
+          source: 'tier1.5-playlist',
+          result,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '1.5', error: err.message });
+      log(`[Tier 1.5] Failed: ${err.message}`);
+    }
+
+    // All tiers failed
+    const finalError = new Error(`All API-only tiers failed for ${videoId}`);
+    finalError.logs = logs;
+    finalError.errors = errors;
     throw finalError;
   }
 

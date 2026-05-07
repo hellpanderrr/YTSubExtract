@@ -11,6 +11,10 @@ const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
 // Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
 const capturedUrls = new Map();
 
+// === REQUEST DEDUPLICATION ===
+// Lock for player tracks requests to prevent concurrent duplicate operations
+const playerTracksLocks = new Map(); // videoId -> Promise
+
 // Listen for messages from sniffer.js (MAIN world)
 window.addEventListener('message', (event) => {
     if (event.source !== window) return;
@@ -141,26 +145,46 @@ setInterval(() => {
 // === MAIN WORLD FETCHER ===
 // Storage for pending Main World Fetch requests
 const mainWorldFetchPending = new Map();
+const MAX_PENDING_FETCHES = 50; // Prevent memory leaks from stuck requests
 
-// Listen for responses from Main World Fetcher (sniffer.js)
-window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    
-    if (event.data?.type === 'MAIN_WORLD_FETCH_RESPONSE') {
-        const { requestId, success, status, statusText, body, error, url } = event.data;
+function cleanupOldestPendingFetches() {
+  if (mainWorldFetchPending.size > MAX_PENDING_FETCHES) {
+    // Remove oldest entries (first 10%)
+    const entriesToRemove = Math.floor(MAX_PENDING_FETCHES * 0.1);
+    const keys = Array.from(mainWorldFetchPending.keys()).slice(0, entriesToRemove);
+    for (const key of keys) {
+      const pending = mainWorldFetchPending.get(key);
+      if (pending) {
+        pending.reject(new Error('Request evicted due to memory pressure'));
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+      }
+      mainWorldFetchPending.delete(key);
+    }
+    console.warn(`[Content] Cleaned up ${entriesToRemove} old pending fetches due to memory pressure`);
+  }
+}
+
+    // Listen for responses from Main World Fetcher (sniffer.js)
+    const mwfListener = (event) => {
+        if (event.source !== window) return;
         
-        const pending = mainWorldFetchPending.get(requestId);
-        if (pending) {
-            mainWorldFetchPending.delete(requestId);
+        if (event.data?.type === 'MAIN_WORLD_FETCH_RESPONSE') {
+            const { requestId, success, status, statusText, body, error, url } = event.data;
             
-            if (success) {
-                pending.resolve({ status, statusText, body, url });
-            } else {
-                pending.reject(new Error(error || 'Main World Fetch failed'));
+            const pending = mainWorldFetchPending.get(requestId);
+            if (pending) {
+                if (pending.timeoutId) clearTimeout(pending.timeoutId);
+                mainWorldFetchPending.delete(requestId);
+                
+                if (success) {
+                    pending.resolve({ status, statusText, body, url });
+                } else {
+                    pending.reject(new Error(error || 'Main World Fetch failed'));
+                }
             }
         }
-    }
-});
+    };
+    window.addEventListener('message', mwfListener);
 
 /**
  * Fetch via MAIN world context
@@ -173,20 +197,23 @@ async function fetchViaMainWorld(url, timeout = 10000) {
     const requestId = `mwf_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     
     return new Promise((resolve, reject) => {
-        mainWorldFetchPending.set(requestId, { resolve, reject });
+        // Cleanup old requests to prevent memory leaks
+        cleanupOldestPendingFetches();
+
+        const timeoutId = setTimeout(() => {
+            if (mainWorldFetchPending.has(requestId)) {
+                mainWorldFetchPending.delete(requestId);
+                reject(new Error('Main World Fetch timeout'));
+            }
+        }, timeout);
+
+        mainWorldFetchPending.set(requestId, { resolve, reject, timeoutId });
         
         window.postMessage({
             type: 'REQUEST_MAIN_WORLD_FETCH',
             url,
             requestId
         }, '*');
-        
-        setTimeout(() => {
-            if (mainWorldFetchPending.has(requestId)) {
-                mainWorldFetchPending.delete(requestId);
-                reject(new Error('Main World Fetch timeout'));
-            }
-        }, timeout);
     });
 }
 
@@ -381,7 +408,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // === TIER 0.5: Player API ===
   if (msg.type === 'GET_PLAYER_TRACKS') {
     (async () => {
-      const result = await getPlayerCaptionTracksWithRetry(msg.videoId, 3, 500);
+      const videoId = msg.videoId;
+
+      // DEDUPLICATION: Check if there's already a pending request for this video
+      if (playerTracksLocks.has(videoId)) {
+        console.log(`[Content] Reusing pending player tracks request for ${videoId}`);
+        const result = await playerTracksLocks.get(videoId);
+        sendResponse(result);
+        return;
+      }
+
+      // Create the request promise
+      const requestPromise = getPlayerCaptionTracksWithRetry(videoId, 3, 500);
+
+      // Store in locks map
+      playerTracksLocks.set(videoId, requestPromise);
+
+      // Clean up when done
+      requestPromise.finally(() => {
+        playerTracksLocks.delete(videoId);
+      });
+
+      const result = await requestPromise;
       sendResponse(result);
     })();
     return true;
@@ -519,24 +567,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 title = response.videoDetails.title;
             }
         }
+
+        // Fallback: meta tag
+        if (!title) {
+            const metaTitle = document.querySelector('meta[name="title"]') ||
+                             document.querySelector('meta[property="og:title"]');
+            if (metaTitle) {
+                title = metaTitle.content;
+            }
+        }
+
+        // Final fallback: document.title
+        if (!title) {
+            title = document.title.replace(' - YouTube', '').trim();
+        }
+
         sendResponse({ success: true, title });
-    } catch (err) {
-        sendResponse({ success: false, error: err.message });
+    } catch (e) {
+        sendResponse({ success: false, title: null, error: e.message });
     }
-    return true;
-  }
-
-  if (msg.type === 'FETCH_TRANSLATED') {
-    fetchTranslatedSubtitles(msg.videoId, msg.sourceLang, msg.targetLang, msg.translate)
-      .then(result => sendResponse({ success: true, result: result.data, logs: result.logs }))
-      .catch(err => sendResponse({ success: false, error: err.message, logs: err.logs || [] }));
-    return true; // Keep channel open for async response
-  }
-
-  if (msg.type === 'GET_BEST_CAPTION_URL') {
-    getBestCaptionUrl(msg.videoId, msg.sourceLang, msg.targetLang, msg.translate, msg.forceRefresh)
-      .then(result => sendResponse({ success: true, ...result }))
-      .catch(err => sendResponse({ success: false, error: err.message, logs: err.logs || [] }));
     return true;
   }
 
@@ -857,7 +906,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         
         // Try SRV3 (XML-based but different)
-        let srv3Url = urlToUse.replace(/fmt=[^&]+/, '') + '&fmt=srv3';
+        let srv3Url;
+        if (urlToUse.includes('fmt=')) {
+          srv3Url = urlToUse.replace(/fmt=[^&]+/, 'fmt=srv3');
+        } else {
+          const separator = urlToUse.includes('?') ? '&' : '?';
+          srv3Url = urlToUse + separator + 'fmt=srv3';
+        }
         log(`Fetching SRV3 from: ${srv3Url}`);
         try {
             const srv3Resp = await fetch(srv3Url);
@@ -871,8 +926,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                  const segs = [];
                  for (let i = 0; i < texts.length; i++) {
                      const node = texts[i];
-                     const start = parseFloat(node.getAttribute('start') || node.getAttribute('t') / 1000);
-                     const dur = parseFloat(node.getAttribute('dur') || node.getAttribute('d') / 1000);
+                     const startAttr = node.getAttribute('start');
+                     const tAttr = node.getAttribute('t');
+                     const start = startAttr ? parseFloat(startAttr) : (tAttr ? parseFloat(tAttr) / 1000 : 0);
+                     const durAttr = node.getAttribute('dur');
+                     const dAttr = node.getAttribute('d');
+                     const dur = durAttr ? parseFloat(durAttr) : (dAttr ? parseFloat(dAttr) / 1000 : 0);
                      let text = node.textContent;
                      if (text) segs.push({ start, duration: dur, text });
                  }
@@ -1021,12 +1080,242 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             log(`Parsed ${segments.length} segments.`);
             sendResponse({ success: true, result: segments, logs });
-            
+
         } catch (err) {
             sendResponse({ success: false, error: err.message, logs });
         }
     })();
     return true;
+  }
+
+  // === TIER 0.5: Playlist DOM Extraction ===
+  if (msg.type === 'GET_PLAYLIST_VIDEOS_FROM_DOM') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[PlaylistDOM] ${m}`);
+
+      try {
+        // Check if we're on a playlist page
+        const url = new URL(window.location.href);
+        const listId = url.searchParams.get('list');
+        if (!listId) {
+          log('Not on a playlist page');
+          sendResponse({ success: false, error: 'Not on playlist page', logs });
+          return;
+        }
+
+        // Check if playlist ID matches
+        if (listId !== msg.playlistId) {
+          log(`Playlist ID mismatch: expected ${msg.playlistId}, found ${listId}`);
+          sendResponse({ success: false, error: 'Playlist ID mismatch', logs });
+          return;
+        }
+
+        log(`Extracting videos for playlist: ${listId}`);
+
+        // Try multiple selectors for playlist video items
+        const selectors = [
+          'ytd-playlist-video-renderer',
+          'ytd-playlist-panel-video-renderer',
+          '.ytd-playlist-video-list-renderer > .ytd-playlist-video-renderer',
+          '[data-playlist-item]'
+        ];
+
+        let videoElements = [];
+        for (const selector of selectors) {
+          videoElements = document.querySelectorAll(selector);
+          if (videoElements.length > 0) {
+            log(`Found ${videoElements.length} videos using selector: ${selector}`);
+            break;
+          }
+        }
+
+        if (videoElements.length === 0) {
+          // Try to find in ytInitialData via page context
+          log('Trying ytInitialData via getPageVariable...');
+          try {
+            const initialData = await getPageVariable('ytInitialData');
+            if (initialData) {
+              log('Got ytInitialData from page context');
+              const contents = initialData?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents;
+              if (contents) {
+                for (const section of contents) {
+                  const itemSection = section?.itemSectionRenderer;
+                  const videoList = itemSection?.contents?.[0]?.playlistVideoListRenderer;
+                  if (videoList?.contents) {
+                    const videos = [];
+                    for (const item of videoList.contents) {
+                      const renderer = item?.playlistVideoRenderer;
+                      if (renderer?.videoId) {
+                        let title = 'Unknown';
+                        if (renderer.title?.runs?.length > 0) {
+                          title = renderer.title.runs.map(r => r.text).join('');
+                        } else if (renderer.title?.simpleText) {
+                          title = renderer.title.simpleText;
+                        }
+                        let duration = '';
+                        if (renderer.lengthText?.simpleText) {
+                          duration = renderer.lengthText.simpleText;
+                        } else if (renderer.lengthText?.runs) {
+                          duration = renderer.lengthText.runs.map(r => r.text).join('');
+                        }
+                        videos.push({
+                          videoId: renderer.videoId,
+                          title: title.trim(),
+                          duration: duration.trim()
+                        });
+                      }
+                    }
+                    if (videos.length > 0) {
+                      log(`Extracted ${videos.length} videos from ytInitialData`);
+                      // Check for continuations (more videos available via API)
+                      const hasContinuations = videoList?.continuations?.length > 0 ||
+                        videoList?.contents?.some(item => item?.continuationItemRenderer);
+                      if (hasContinuations) {
+                        log(`Warning: Playlist has more videos available. Only first ${videos.length} loaded from DOM.`);
+                        log(`Full playlist extraction requires API fallback.`);
+                      }
+                      // Get playlist title from multiple sources
+                      let playlistTitle = '';
+                      const metadata = initialData?.metadata?.playlistMetadataRenderer;
+                      const header = initialData?.header?.playlistHeaderRenderer;
+                      const sidebar = initialData?.sidebar?.playlistSidebarRenderer?.items?.[0]?.playlistSidebarPrimaryInfoRenderer;
+
+                      if (metadata?.title) {
+                        playlistTitle = metadata.title;
+                        log(`Got playlist title from metadata: ${playlistTitle}`);
+                      } else if (header?.title?.simpleText) {
+                        playlistTitle = header.title.simpleText;
+                        log(`Got playlist title from header: ${playlistTitle}`);
+                      } else if (sidebar?.title?.runs?.[0]?.text) {
+                        playlistTitle = sidebar.title.runs[0].text;
+                        log(`Got playlist title from sidebar: ${playlistTitle}`);
+                      } else if (sidebar?.title?.simpleText) {
+                        playlistTitle = sidebar.title.simpleText;
+                        log(`Got playlist title from sidebar simpleText: ${playlistTitle}`);
+                      }
+                      sendResponse({ success: true, videos, title: playlistTitle, logs, hasMoreVideos: hasContinuations });
+                      return;
+                    }
+                  }
+                }
+              }
+            } else {
+              log('ytInitialData not available in page context');
+            }
+          } catch (e) {
+            log(`ytInitialData extraction failed: ${e.message}`);
+          }
+          log('No videos found in DOM or ytInitialData');
+          sendResponse({ success: false, error: 'No videos found', logs });
+          return;
+        }
+
+        // Extract from DOM elements
+        const videos = [];
+        for (const el of videoElements) {
+          try {
+            // Find video link
+            const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
+            if (!link) continue;
+
+            const href = link.getAttribute('href');
+            if (!href) continue;
+
+            // Extract video ID from href
+            const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+            if (!videoIdMatch) continue;
+            const videoId = videoIdMatch[1];
+
+            // Extract title
+            let title = 'Unknown';
+            const titleEl = el.querySelector('#video-title') ||
+                           el.querySelector('a[title]') ||
+                           el.querySelector('.ytd-video-meta-block #video-title') ||
+                           link;
+            if (titleEl) {
+              title = titleEl.getAttribute('title') ||
+                     titleEl.textContent?.trim() ||
+                     'Unknown';
+            }
+
+            // Extract duration
+            let duration = '';
+            const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                              el.querySelector('.badge-shape-wiz__text') ||
+                              el.querySelector('[class*="duration"]');
+            if (durationEl) {
+              duration = durationEl.textContent?.trim() || '';
+            }
+
+            videos.push({ videoId, title, duration });
+          } catch (e) {
+            log(`Error extracting video: ${e.message}`);
+          }
+        }
+
+        log(`Successfully extracted ${videos.length} videos from DOM`);
+
+        // Try to get playlist title from DOM
+        let playlistTitle = '';
+        const titleSelectors = [
+          'ytd-playlist-header-renderer h1 yt-formatted-string',
+          'ytd-playlist-header-renderer h1',
+          'ytd-playlist-header-renderer #title',
+          '.ytd-playlist-header-renderer #title',
+          'ytd-playlist-header-renderer .title',
+          '#playlist-header h1',
+          '[page-subtype="playlist"] h1',
+          'ytd-browse[page-subtype="playlist"] #header h1'
+        ];
+
+        for (const selector of titleSelectors) {
+          const titleEl = document.querySelector(selector);
+          if (titleEl && titleEl.textContent?.trim()) {
+            playlistTitle = titleEl.textContent.trim();
+            log(`Found playlist title using selector "${selector}": ${playlistTitle}`);
+            break;
+          }
+        }
+
+        // Fallback to ytInitialData via page context
+        if (!playlistTitle) {
+          log('No title from DOM, trying ytInitialData...');
+          try {
+            const initialData = await getPageVariable('ytInitialData');
+            if (initialData) {
+              // Try multiple paths for playlist metadata
+              const metadata = initialData?.metadata?.playlistMetadataRenderer;
+              const header = initialData?.header?.playlistHeaderRenderer;
+              const sidebar = initialData?.sidebar?.playlistSidebarRenderer?.items?.[0]?.playlistSidebarPrimaryInfoRenderer;
+
+              if (metadata?.title) {
+                playlistTitle = metadata.title;
+                log(`Got playlist title from ytInitialData.metadata: ${playlistTitle}`);
+              } else if (header?.title?.simpleText) {
+                playlistTitle = header.title.simpleText;
+                log(`Got playlist title from ytInitialData.header: ${playlistTitle}`);
+              } else if (sidebar?.title?.runs?.[0]?.text) {
+                playlistTitle = sidebar.title.runs[0].text;
+                log(`Got playlist title from ytInitialData.sidebar: ${playlistTitle}`);
+              } else {
+                log('ytInitialData structure:', JSON.stringify(Object.keys(initialData || {})));
+              }
+            } else {
+              log('ytInitialData not available');
+            }
+          } catch (e) {
+            log(`ytInitialData fallback failed: ${e.message}`);
+          }
+        }
+
+        sendResponse({ success: true, videos, title: playlistTitle, logs });
+      } catch (e) {
+        log(`Fatal error: ${e.message}`);
+        sendResponse({ success: false, error: e.message, logs });
+      }
+    })();
+    return true; // Keep channel open for async
   }
 });
 
@@ -1040,11 +1329,17 @@ function getPageVariable(variableName) {
       if (event.source === window && 
           event.data.type === 'PAGE_VARIABLE_RESULT' && 
           event.data.requestId === requestId) {
+        if (timeoutId) clearTimeout(timeoutId);
         window.removeEventListener('message', listener);
         resolve(event.data.value);
       }
     };
     window.addEventListener('message', listener);
+    
+    const timeoutId = setTimeout(() => {
+        window.removeEventListener('message', listener);
+        resolve(null);
+    }, 1000);
 
     script.textContent = `
       (function() {
@@ -1067,11 +1362,6 @@ function getPageVariable(variableName) {
     `;
     (document.head || document.documentElement).appendChild(script);
     script.remove();
-    
-    setTimeout(() => {
-        window.removeEventListener('message', listener);
-        resolve(null);
-    }, 1000);
   });
 }
 
@@ -1123,7 +1413,7 @@ async function getRobustPlayerResponse(log, forceRefresh = false) {
     return playerResponse;
 }
 
-function getPlayerResponse() {
+async function getPlayerResponse() {
     try {
         // Try to find the script tag containing ytInitialPlayerResponse
         const scripts = document.querySelectorAll('script');
@@ -1143,7 +1433,7 @@ function getPlayerResponse() {
     } catch (e) {
         console.error('[Content] Failed to scan DOM for player response:', e);
     }
-    return Promise.resolve(null);
+    return null;
 }
 
 async function getCaptionTracks(videoId, log = console.log, forceRefresh = false) {

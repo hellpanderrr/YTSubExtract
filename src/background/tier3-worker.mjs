@@ -99,18 +99,23 @@ export async function fetchTier3Transcript(videoId, options = {}) {
     }
 
     const yt = await getInnertube();
-    
-    // First, try to get info
+
+    // First, try to get info with WEB client (full data including engagement panels).
+    // If WEB client stops returning caption tracks (PoToken enforcement), fall back to
+    // getBasicInfo with IOS client, which currently bypasses PoToken requirements.
     let info;
     try {
         info = await yt.getInfo(videoId);
     } catch (e) {
-        console.warn('Tier 3: getInfo failed, trying basic client', e);
-        // Sometimes basic client works better? 
-        // Or maybe videoId is invalid?
-        throw e;
+        console.warn('Tier 3: getInfo (WEB) failed, trying getBasicInfo with IOS client', e);
+        try {
+            info = await yt.getBasicInfo(videoId, { client: 'IOS' });
+        } catch (e2) {
+            console.warn('Tier 3: getBasicInfo (IOS) also failed', e2);
+            throw e2;
+        }
     }
-    
+
     // 1. Check for caption tracks (Innertube parsed or raw)
     let captionTracks = info.captions?.caption_tracks;
     
@@ -211,8 +216,19 @@ export async function fetchTier3Transcript(videoId, options = {}) {
 export async function getVideoMetadata(videoId) {
   try {
     const yt = await getInnertube();
-    const info = await yt.getInfo(videoId);
-    
+    let info;
+    try {
+      info = await yt.getInfo(videoId);
+    } catch (e) {
+      console.warn('Tier 3 Metadata: getInfo (WEB) failed, trying getBasicInfo with IOS client', e);
+      info = await yt.getBasicInfo(videoId, { client: 'IOS' });
+    }
+
+    // DEBUG: Log the full structure
+    console.log('[Tier 3 Debug] info keys:', Object.keys(info || {}).join(', '));
+    console.log('[Tier 3 Debug] info.captions:', JSON.stringify(info.captions, null, 2));
+    console.log('[Tier 3 Debug] info.basic_info:', JSON.stringify(info.basic_info, null, 2));
+
     let languages = [];
     const captionTracks = info.captions?.caption_tracks;
 

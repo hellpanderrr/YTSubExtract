@@ -1,6 +1,6 @@
 {
   "name": "youtube-subtitle-downloader-mv3",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "YouTube Subtitle Downloader with 3-tier fallback",
   "type": "module",
   "scripts": {
@@ -10,6 +10,11 @@
     "pack": "npm run build && node scripts/pack.cjs",
     "zip": "npm run build && node scripts/zip.cjs",
     "clean": "rimraf dist builds"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "he": "^1.2.0",
+    "striptags": "^3.2.0"
   },
   "devDependencies": {
     "@playzone/youtube-transcript": "^1.0.0",
@@ -22,8 +27,6 @@
     "vite-plugin-node-polyfills": "^0.25.0",
     "vite-plugin-static-copy": "^2.3.2",
     "youtubei.js": "^16.0.1",
-    "zip-a-folder": "^3.1.9",
-    "he": "^1.2.0",
-    "striptags": "^3.2.0"
+    "zip-a-folder": "^3.1.9"
   }
 }

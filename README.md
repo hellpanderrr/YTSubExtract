@@ -21,66 +21,106 @@ A Chrome Extension for extracting subtitles from YouTube videos using a multi-ti
 
 ## Architecture
 
-The extension uses a priority fallback model with multiple extraction methods.
+The extension uses a priority fallback model with multiple extraction methods. **Note:** Due to YouTube's PoToken anti-bot measures (2025), many direct API clients are now blocked. The extension has been optimized to prioritize working methods.
 
-### Tier 0: Network Sniffer
+### Current Tier Status
 
-**Mechanism**: Content script injected into MAIN world at `document_start` intercepts all `fetch` and `XMLHttpRequest` calls.
+#### For Single Videos (Popup Flow)
 
-**Use Case**: Videos with subtitles already loaded.
+| Tier | Method | Status | When It Works |
+|------|--------|--------|---------------|
+| **Tier 0.5** | Player API from active tab | ✅ Works | User has YouTube video open in active tab |
+| **Tier 1.5** | Embed page scraping | ⚠️ Limited | Often blocked by CSP/redirects |
+| **Tier 1** | Direct InnerTube API | ⚠️ **PARTIAL** | IOS works; MWEB/WEB_EMBEDDED require PoToken; ANDROID deprecated |
+| **Tier 2** | Content script injection | ⚠️ Timeout | Requires active tab, often hangs |
+| **Tier 3** | youtubei.js library | ✅ **PRIMARY** | Most reliable method, no active tab needed |
+| **Tier 4** | Page context extraction | ⚠️ Slow | Last resort, requires active tab |
 
-### Tier 0.5: Player API
+#### For Playlist Downloads (Background)
 
-**Mechanism**: Direct access to `document.getElementById('movie_player').getPlayerResponse()`.
+| Tier | Method | Status | Notes |
+|------|--------|--------|-------|
+| **Tier 1** (API clients) | youtube-caption-extractor | ⚠️ Partial | IOS works; others blocked or deprecated |
+| **Tier 1.5** | Embed page | ❌ Broken | No active tab in service worker context |
+| **Tier 3** | youtubei.js | ✅ **PRIMARY** | Only reliable method for playlists |
 
+### Phase 1 Optimizations (Implemented)
 
-**Use Case**: SPA navigation where URL changes without page reload. Includes retry logic (3 attempts, 500ms delay).
+1. **New Client Priority** (IOS → MWEB → WEB → WEB_EMBEDDED → TVHTML5 → ANDROID)
+   - Based on yt-dlp's successful client fallback chain
+   - WEB client added; ANDROID moved to last (deprecated by YouTube in 2026)
+   - Fast-fail on UNPLAYABLE/ERROR/LOGIN_REQUIRED responses
+   - Client-specific payloads: only ANDROID gets legacy params/playbackContext
 
-### Tier 1.5: Embed Page Extraction
+2. **VisitorData Caching** (24h)
+   - Reduces bot-like behavior
+   - Cached in memory, persists during service worker lifetime
 
-**Mechanism**: Fetches the embed page (`/embed/{videoId}`) and extracts `ytInitialPlayerResponse` from HTML.
+3. **Playlist-First Tier 3**
+   - Skips slow/broken Tier 0.5/1/1.5 for playlist downloads
+   - ~2-3x faster per video in playlist mode
 
-**Use Case**: Guest mode (no login required), works without authentication.
+### Phase 2 Fixes (Latest)
 
-### Tier 1: Android/iOS API Client
+4. **Client-Specific Payloads** — Only ANDROID gets legacy `params`/`playbackContext`; others use minimal payload
+5. **User-Agent Consistency** — Fixed DNR rules to match client type (removed forced ANDROID UA override)
+6. **IOS Metadata** — Updated device model (`iPhone17,2`) and OS version (`18.4.1`) to match current UA
 
-**Mechanism**: HTTP request to `https://www.youtube.com/youtubei/v1` masquerading as YouTube mobile app.
+### Tier Details
 
-**Features**: 
-- `contentCheckOk: true` and `racyCheckOk: true` flags for restricted content
-- `tlang` parameter injection for server-side translation
+#### Tier 0.5: Player API
+**Mechanism**: Direct access to `document.getElementById('movie_player').getPlayerResponse()`.  
+**Use Case**: Fastest method when user has YouTube open in active tab.  
+**Status**: ✅ Reliable when active tab available.
 
-### Tier 2: DOM Extraction
+#### Tier 1: Direct API Clients (PARTIAL)
+**Mechanism**: HTTP requests to `youtubei/v1` with client-specific payloads.  
+**Status**: ⚠️ **IOS works**, others require PoToken or deprecated:
+- ✅ **IOS**: Minimal payload, works for most videos (primary Tier 1 client)
+- ❌ **MWEB/WEB**: Require PoToken (enforcement rolled out Apr 2026)
+- ❌ **WEB_EMBEDDED**: Requires embed auth + PoToken
+- ❌ **ANDROID**: Deprecated by YouTube for programmatic access (early 2026)
+- ❌ **TVHTML5**: HTTP 400 — payload incompatible
 
-**Mechanism**: Content script accesses `ytInitialPlayerResponse` object from page context.
+#### Tier 3: InnerTube Emulation (PRIMARY)
+**Mechanism**: Full `youtubei.js` session with proper handshake.  
+**Use Case**: **Primary method** for both single videos and playlists.  
+**Status**: ✅ Works reliably, handles complex signatures automatically.
 
-**Use Case**: API blocked (403/429), leverages existing session cookies.
+#### Tier 1.5: Embed Page Extraction
+**Mechanism**: Fetches `/embed/{videoId}` and extracts `ytInitialPlayerResponse`.  
+**Status**: ⚠️ Often blocked by CSP or returns empty responses.
 
-### Tier 3: InnerTube Emulation
-
-**Mechanism**: Full `youtubei.js` session for desktop client handshake.
-
-**Use Case**: Complex signature deciphering, obfuscated metadata.
-
-### Tier 4: Main World Fetcher
-
-**Mechanism**: Fetches timedtext URLs from MAIN world context to bypass empty response protection.
-
-**Use Case**: Age-restricted videos, YouTube returning 200 OK with empty body.
+#### Tier 4: Main World Fetcher
+**Mechanism**: Fetches timedtext URLs from MAIN world context.  
+**Use Case**: Bypasses empty response protection for age-restricted videos.
 
 ## Extraction Cascades
 
-### Metadata Cascade (Available Languages)
+### Metadata Cascade (Single Video - Popup)
+```text
+Parallel: [Tier 0.5, Tier 1.5] → Tier 1 (API) → Tier 2 → Tier 3 → Tier 4
 ```
-Tier 0.5 → Tier 1.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
-```
-Tier 0 skipped (captures single language URL, metadata needs all languages).
+- Tiers 0.5 and 1.5 execute in parallel first (cheap, fast when available)
+- Tier 1 (direct API) usually fails with UNPLAYABLE — fast-fail to Tier 3
+- **Tier 3 is primary fallback** and handles most cases reliably
 
-### Download Cascade (Subtitle Content)
+### Download Cascade (Single Video - Popup)
+```text
+Tier 0 (sniffer) → Tier 0.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
 ```
-Tier 0 → Tier 0.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
+- Tier 0: Uses captured URL from network sniffer (instant if available)
+- Falls back through tiers until one succeeds
+
+### Playlist Cascade (Background Service Worker)
+```text
+Tier 3 (PRIMARY) → Tier 1 (fallback) → Tier 1.5 (last resort)
 ```
-Tier 0 first (use captured URL directly if available).
+- **Optimized**: Starts with Tier 3 immediately (youtubei.js)
+- Skips broken/slow tiers (0.5, 1, 1.5) that waste 2-3s per video
+- ~2-3x faster than previous implementation
+
+**Timeout Protection**: Each tier has 8-10 second timeout to prevent UI freezing.
 
 ## MAIN World Injection
 
@@ -111,9 +151,36 @@ background.js (Service Worker)
 
 ## Performance
 
+- **Parallel Tier Execution**: Tiers 0.5 and 1.5 run in parallel (2-8s). Tier 1 is fallback if both fail.
 - **Format Switching**: Raw transcript cached in memory (`metadata:${videoId}`). SRT/VTT/TXT conversion is instant.
-- **State Persistence**: `chrome.storage.local` for user preferences.
+- **State Persistence**: `chrome.storage.local` for user preferences including per-playlist language selections.
 - **URL Expiration**: Sniffer-captured URLs checked before use.
+- **Timeout Protection**: All HTTP requests have timeouts (8s for embed pages, 10s for API calls) to prevent UI freezing.
+
+## Features
+
+### Playlist Mode
+
+Batch download subtitles from YouTube playlists:
+- Select/deselect individual videos or all at once
+- Per-playlist language preferences (saved to storage)
+- ZIP packaging with organized filenames
+- Progress tracking with ARIA accessibility support
+- Resume on browser restart via persistent progress storage
+
+### Translation Support
+
+Server-side translation via `tlang` parameter:
+- Automatic translation to 50+ languages
+- Caching optimized to exclude targetLang when not translating
+- Source language auto-detection with 'en' preference
+
+### ARIA Accessibility
+
+Screen reader compatible progress indicators:
+- `role="progressbar"` with `aria-valuemin`, `aria-valuemax`, `aria-valuenow`
+- `aria-live="polite"` for progress announcements
+- Proper focus management during downloads
 
 ## Build
 

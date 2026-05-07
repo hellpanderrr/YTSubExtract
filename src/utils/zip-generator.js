@@ -1,0 +1,108 @@
+import { zipSync, strToU8 } from 'fflate';
+
+/**
+ * Create ZIP archive from files
+ * @param {Array<{name: string, content: string}>} files - Array of files with name and content
+ * @returns {Promise<Blob>} - ZIP file as Blob
+ */
+export async function createZip(files) {
+  // Convert files to the format expected by fflate
+  const zipData = {};
+
+  for (const file of files) {
+    // Sanitize filename
+    const safeName = sanitizeFilename(file.name);
+    // Convert string to Uint8Array
+    zipData[safeName] = strToU8(file.content);
+  }
+
+  // Create ZIP with compression level 6 (good balance)
+  // Using zipSync to avoid Web Worker issues in Service Worker context
+  try {
+    const data = zipSync(zipData, { level: 6 });
+    // Create Blob from compressed data
+    const blob = new Blob([data], { type: 'application/zip' });
+    return blob;
+  } catch (err) {
+    throw new Error(`ZIP creation failed: ${err.message}`);
+  }
+}
+
+/**
+ * Sanitize filename for ZIP
+ * Remove/replace characters that are problematic in filenames
+ */
+function sanitizeFilename(name) {
+  // Extract extension if present
+  const lastDotIndex = name.lastIndexOf('.');
+  const extension = lastDotIndex > 0 ? name.substring(lastDotIndex) : '';
+  const baseName = lastDotIndex > 0 ? name.substring(0, lastDotIndex) : name;
+
+  // Sanitize base name
+  const sanitizedBase = baseName
+    .replace(/[<>:"/\\|?*]/g, '') // Remove illegal Windows chars
+    .replace(/\s+/g, '_');          // Replace spaces with underscores
+
+  // Limit length (account for extension)
+  const maxLength = 100;
+  const allowedBaseLength = extension ? maxLength - extension.length : maxLength;
+  const truncatedBase = sanitizedBase.substring(0, allowedBaseLength);
+
+  return truncatedBase + extension;
+}
+
+/**
+ * Generate filename for individual subtitle file
+ * Format: {index}_{sanitizedTitle}_{videoId}_{language}.{ext}
+ */
+export function generateSubtitleFilename(index, videoId, title, language, format) {
+  const ext = format.toLowerCase();
+  const paddedIndex = String(index).padStart(2, '0');
+  const sanitizedTitle = sanitizeVideoTitle(title);
+  return `${paddedIndex}_${sanitizedTitle}_${videoId}_${language}.${ext}`;
+}
+
+/**
+ * Sanitize video title for use in filename
+ * Keeps alphanumeric and spaces, removes special chars, limits length
+ */
+function sanitizeVideoTitle(title) {
+  if (!title) return 'untitled';
+  return title
+    .replace(/[<>:"/\\|?*]/g, '')     // Remove illegal chars
+    .replace(/[#&%+@!^()\[\]{}]/g, '') // Remove other special chars
+    .replace(/\s+/g, '_')               // Replace spaces with underscores
+    .replace(/_{2,}/g, '_')              // Collapse multiple underscores
+    .replace(/^_|_$/g, '')              // Trim leading/trailing underscores
+    .substring(0, 50);                   // Limit length to 50 chars
+}
+
+/**
+ * Generate ZIP filename
+ * Format: playlist_{sanitizedTitle}_{playlistId}_{language}_{timestamp}.zip
+ */
+export function generateZipFilename(playlistId, language, title = '') {
+  const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const safePlaylistId = String(playlistId || 'playlist').substring(0, 15);
+  const sanitizedTitle = title
+    ? sanitizeVideoTitle(title).substring(0, 30) + '_'
+    : '';
+  return `playlist_${sanitizedTitle}${safePlaylistId}_${language}_${timestamp}.zip`;
+}
+
+/**
+ * Download ZIP file
+ * @param {Blob} blob - ZIP blob
+ * @param {string} filename - Download filename
+ */
+export function downloadZip(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Defer revocation to avoid race condition with download start
+  setTimeout(() => URL.revokeObjectURL(url), 100);
+}
