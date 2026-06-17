@@ -54,91 +54,103 @@ export async function fetchPlaylistVideos(playlistId, maxResults = 50) {
 export async function fetchPlaylistVideosAPI(playlistId, maxResults = 50) {
   maxResults = maxResults || 50; // Guard against undefined/null/0
   const videos = [];
-  let continuationToken = null;
   let pageCount = 0;
   let firstData = null;
-  let lastData = null;
+  let pageError = null; // declared outside loop to be reachable after it
   const maxPages = Math.ceil(maxResults / 100); // YouTube returns ~100 videos per page
 
   debug(`Fetching playlist via API: ${playlistId}, maxResults: ${maxResults}`);
 
-  try {
-    // Generate session data once and reuse for all pages
-    const sessionData = await generateSessionData('WEB');
+  // Try multiple client profiles (WEB first, then IOS, MWEB, WEB_EMBEDDED)
+  // WEB returns alerts (e.g. "does not exist") for some playlists like LL
+  // that other client profiles serve correctly.
+  const CLIENT_PRIORITY = ['WEB', 'IOS', 'MWEB', 'WEB_EMBEDDED', 'TVHTML5'];
 
-    while (videos.length < maxResults && pageCount < maxPages) {
-      const payload = {
-        context: sessionData.context,
-        browseId: `VL${playlistId}`,
-        ...(continuationToken && {
-          continuation: continuationToken
-        })
-      };
+  for (const clientType of CLIENT_PRIORITY) {
+    videos.length = 0;
+    pageCount = 0;
+    firstData = null;
+    let continuationToken = null;
 
-      debug(`Fetching page ${pageCount + 1}, current videos: ${videos.length}`);
+    try {
+      // Generate session data for this client type
+      const sessionData = await generateSessionData(clientType);
 
-      let data;
-      try {
-        data = await fetchInnerTube('/browse', payload, 'WEB');
-      } catch (e) {
-        throw new Error(`Browse API failed: ${e.message}`);
-      }
+      while (videos.length < maxResults && pageCount < maxPages) {
+        const payload = {
+          context: sessionData.context,
+          browseId: `VL${playlistId}`,
+          ...(continuationToken && {
+            continuation: continuationToken
+          })
+        };
 
-      if (!data) {
-        throw new Error('Browse API returned no data');
-      }
-      lastData = data;
-      if (!firstData) firstData = data;
+        // Non-WEB clients need standard safety flags
+        if (clientType !== 'WEB') {
+          payload.contentCheckOk = true;
+          payload.racyCheckOk = true;
+        }
 
-      // Parse videos from response
-      const pageVideos = parsePlaylistVideos(data);
+        debug(`[${clientType}] Fetching page ${pageCount + 1}, current videos: ${videos.length}`);
 
-      if (pageVideos.length === 0 && !continuationToken) {
-        // First page has no videos - might be invalid playlist
-        throw new Error('No videos found in playlist');
-      }
+        let data;
+        try {
+          data = await fetchInnerTube('/browse', payload, clientType);
+        } catch (e) {
+          throw new Error(`Browse API failed: ${e.message}`);
+        }
 
-      debug(`Found ${pageVideos.length} videos on this page`);
+        if (!data) {
+          throw new Error('Browse API returned no data');
+        }
+        if (!firstData) firstData = data;
 
-      // Add to results with global index
-      for (const video of pageVideos) {
-        if (videos.length < maxResults) {
-          videos.push({
-            ...video,
-            index: videos.length + 1
-          });
+        // Parse videos from response
+        const pageVideos = parsePlaylistVideos(data);
+
+        if (pageVideos.length === 0 && !continuationToken) {
+          throw new Error('No videos found in playlist');
+        }
+
+        debug(`[${clientType}] Found ${pageVideos.length} videos on this page`);
+
+        for (const video of pageVideos) {
+          if (videos.length < maxResults) {
+            videos.push({
+              ...video,
+              index: videos.length + 1
+            });
+          }
+        }
+
+        // Check for continuation
+        continuationToken = extractContinuationToken(data);
+
+        if (!continuationToken || videos.length >= maxResults) {
+          break;
+        }
+
+        pageCount++;
+
+        if (continuationToken && pageCount < maxPages) {
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
       }
 
-      debug(`Added ${pageVideos.length} videos, total: ${videos.length}`);
+      if (videos.length > 0) {
+        debug(`[${clientType}] Success: ${videos.length} videos`);
 
-      // Check for continuation
-      continuationToken = extractContinuationToken(data);
-
-      if (!continuationToken || videos.length >= maxResults) {
-        break;
+        const playlistTitle = extractPlaylistTitle(firstData);
+        return { videos, title: playlistTitle };
       }
-
-      pageCount++;
-
-      // Small delay between pages to be respectful
-      if (continuationToken && pageCount < maxPages) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
+    } catch (err) {
+      pageError = err;
+      debug(`[${clientType}] Failed: ${err.message}`);
     }
-
-    debug(`Total videos fetched: ${videos.length}`);
-
-    // Extract playlist title from first page (continuation pages may not have title)
-    const playlistTitle = extractPlaylistTitle(firstData);
-    debug(`Playlist title: ${playlistTitle}`);
-
-    return { videos, title: playlistTitle };
-
-  } catch (err) {
-    debug('Error fetching playlist:', err);
-    throw err;
   }
+
+  // All clients failed
+  throw pageError || new Error(`All client profiles failed for playlist ${playlistId}`);
 }
 
 /**
@@ -184,16 +196,27 @@ function parsePlaylistVideos(data) {
       }
     }
 
-    const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs;
-    if (!tabs) {
-      debug('No tabs found. Checking alternative structures...');
-      // Try alternative structure (singleColumnBrowseResultsRenderer)
-      const singleColumn = data?.contents?.singleColumnBrowseResultsRenderer?.tabs;
-      if (singleColumn) {
-        debug('Found singleColumnBrowseResultsRenderer');
+    // Try twoColumnBrowseResultsRenderer (desktop/WEB)
+    const twoColumn = data?.contents?.twoColumnBrowseResultsRenderer;
+    // Try singleColumnBrowseResultsRenderer (mobile: IOS, MWEB)
+    const singleColumn = data?.contents?.singleColumnBrowseResultsRenderer;
+
+    let contents = null;
+
+    if (twoColumn?.tabs) {
+      debug('Found twoColumnBrowseResultsRenderer');
+      const videoTab = twoColumn.tabs.find(tab =>
+        tab?.tabRenderer?.content?.sectionListRenderer?.contents
+      );
+      if (videoTab) {
+        contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
+        debug(`Found ${contents.length} content sections in twoColumn`);
+      } else {
+        debug('No video tab found in twoColumn, tabs:', twoColumn.tabs.map(t => Object.keys(t || {})));
       }
-      // Check for alertRenderer inside twoColumnBrowseResultsRenderer too
-      const alert = data?.contents?.twoColumnBrowseResultsRenderer?.alerts?.[0]?.alertRenderer;
+
+      // Also check for twoColumn alerts
+      const alert = twoColumn?.alerts?.[0]?.alertRenderer;
       if (alert) {
         debug('Alert found in twoColumn:', JSON.stringify(alert));
         const alertText = alert.text?.simpleText || alert.text?.runs?.map(r => r.text).join('');
@@ -201,47 +224,125 @@ function parsePlaylistVideos(data) {
           throw new Error(`Playlist unavailable: ${alertText}`);
         }
       }
-      // Check for continuation items before returning (continuation responses don't have tabs)
+    } else if (singleColumn?.tabs) {
+      debug('Found singleColumnBrowseResultsRenderer');
+      const videoTab = singleColumn.tabs.find(tab =>
+        tab?.tabRenderer?.content?.sectionListRenderer?.contents
+      );
+      if (videoTab) {
+        contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
+        debug(`Found ${contents.length} content sections in singleColumn`);
+      } else {
+        debug('No video tab found in singleColumn, tabs:', singleColumn.tabs.map(t => Object.keys(t || {})));
+      }
+    }
+
+    // If we found contents, extract videos from them
+    if (contents) {
+      for (const content of contents) {
+        // Try direct playlistVideoListRenderer (current YouTube structure)
+        const playlistVideoList =
+          content?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer ||
+          content?.playlistVideoListRenderer;
+
+        if (playlistVideoList?.contents) {
+          const videoItems = playlistVideoList.contents;
+          debug(`Found playlistVideoListRenderer with ${videoItems.length} items`);
+
+          for (const item of videoItems) {
+            const video = parseVideoRenderer(item?.playlistVideoRenderer);
+            if (video) {
+              videos.push(video);
+            } else {
+              // Fallback: try lockupViewModel inside playlistVideoList
+              const lockup = item?.lockupViewModel;
+              if (lockup) {
+                const lv = parseLockupViewModel(lockup);
+                if (lv) videos.push(lv);
+              }
+            }
+          }
+          continue; // Found videos in this section, move on
+        }
+
+        // Fallback: lockupViewModel at itemSection level (new YouTube structure)
+        // WEB started rendering playlist items as lockupViewModels
+        const itemSectionContents = content?.itemSectionRenderer?.contents || [];
+        for (const itemContent of itemSectionContents) {
+          if (itemContent?.lockupViewModel) {
+            const video = parseLockupViewModel(itemContent.lockupViewModel);
+            if (video) {
+              videos.push(video);
+            }
+          } else if (itemContent?.elementRenderer?.type == "lockupViewModel" || itemContent?.elementRenderer?.newElement?.type?.componentType == "lockupViewModel") {
+            // Mobile (IOS) sometimes wraps in elementRenderer
+            const er = itemContent.elementRenderer;
+            const lockup = er?.newElement?.element?.lockupViewModel;
+            if (!lockup && er?.newElement?.element) {
+              // Try raw element content - YouTube nested format
+              const elData = er?.newElement?.element;
+              const lv = elData?.lockupViewModel;
+              if (!lv) {
+                // Deep nested: serialized innerTubeData
+                const lv2 = elData?.lockupViewModel;
+                if (lv2) {
+                  const video = parseLockupViewModel(lv2);
+                  if (video) videos.push(video);
+                  else debug(`Parsed elementRenderer lockupViewModel but got null`);
+                } else {
+                  debug(`Unknown elementRenderer content: ${Object.keys(elData).join(', ')}`);
+                }
+              } else {
+                const video = parseLockupViewModel(lv);
+                if (video) videos.push(video);
+              }
+            } else if (lockup) {
+              const video = parseLockupViewModel(lockup);
+              if (video) videos.push(video);
+            } else {
+              debug(`elementRenderer has no lockupViewModel, keys: ${Object.keys(er?.newElement?.element || {}).join(', ')}`);
+            }
+          }
+        }
+
+        // Debug: log unrecognized content structure
+        const contentKeys = Object.keys(content || {});
+        const innerContent = content?.itemSectionRenderer?.contents?.[0];
+        if (innerContent && !innerContent.playlistVideoListRenderer) {
+          debug(`Unrecognized itemSection content type: ${Object.keys(innerContent).join(', ')}`);
+        } else if (!content?.itemSectionRenderer) {
+          debug(`Content section type: ${contentKeys.join(', ')}`);
+        }
+      }
+    }
+
+    // Try sidebar (WEB sometimes puts playlist videos in sidebar)
+    const sidebarVideos = twoColumn?.sidebar?.playlistSidebarRenderer?.items;
+    if (sidebarVideos) {
+      debug(`Found sidebar with ${sidebarVideos.length} items`);
+      for (const item of sidebarVideos) {
+        const secondaryRenderer = item?.playlistSidebarSecondaryInfoRenderer;
+        const videoList = secondaryRenderer?.videoOwner?.videoList?.playlistVideoListRenderer?.contents;
+        if (videoList) {
+          for (const vi of videoList) {
+            const video = parseVideoRenderer(vi?.playlistVideoRenderer);
+            if (video) {
+              videos.push(video);
+            }
+          }
+        }
+      }
+      if (videos.length > 0) {
+        debug(`Extracted ${videos.length} videos from sidebar`);
+      }
+    } else {
+      debug('No tabs found in either twoColumn or singleColumn');
+
+      // Check for continuation items (continuation responses don't have tabs)
       const continuationItems = extractContinuationVideos(data);
       if (continuationItems.length > 0) {
         debug(`Found ${continuationItems.length} videos in continuation response`);
         videos.push(...continuationItems);
-      }
-      return videos;
-    }
-
-    debug(`Found ${tabs.length} tabs`);
-
-    // Find the video list tab
-    const videoTab = tabs.find(tab =>
-      tab?.tabRenderer?.content?.sectionListRenderer?.contents
-    );
-
-    if (!videoTab) {
-      debug('No video tab found. Available tabs:', tabs.map(t => Object.keys(t || {})));
-      return videos;
-    }
-
-    debug('Found video tab');
-    const contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
-    debug(`Found ${contents.length} content sections`);
-    
-    for (const content of contents) {
-      // Look for itemSectionRenderer with playlistVideoListRenderer
-      const itemSection = content?.itemSectionRenderer;
-      if (!itemSection) continue;
-
-      const playlistVideoList = itemSection?.contents?.[0]?.playlistVideoListRenderer;
-      if (!playlistVideoList) continue;
-
-      const videoItems = playlistVideoList.contents;
-      if (!videoItems) continue;
-
-      for (const item of videoItems) {
-        const video = parseVideoRenderer(item?.playlistVideoRenderer);
-        if (video) {
-          videos.push(video);
-        }
       }
     }
 
@@ -295,6 +396,61 @@ function parseVideoRenderer(videoRenderer) {
 }
 
 /**
+ * Parse YouTube's new lockupViewModel format
+ * YouTube migrated from playlistVideoRenderer to lockupViewModel in 2026
+ * for browse/playlist responses.
+ *
+ * Structure:
+ * {
+ *   contentId: "videoId",
+ *   metadata: { lockupMetadataViewModel: { title: { content: "..." }, metadata: {...} } },
+ *   thumbnail: { ... }
+ * }
+ */
+function parseLockupViewModel(lockup) {
+  if (!lockup || !lockup.contentId) return null;
+
+  const videoId = lockup.contentId;
+  if (typeof videoId !== 'string' || videoId.length < 11) return null;
+
+  // Extract title from metadata
+  let title = 'Unknown';
+  const metadata = lockup.metadata?.lockupMetadataViewModel;
+  if (metadata?.title?.content) {
+    title = metadata.title.content;
+  } else if (metadata?.title?.simpleText) {
+    title = metadata.title.simpleText;
+  } else if (typeof lockup.metadata?.title === 'string') {
+    title = lockup.metadata.title;
+  }
+
+  // Extract duration — try multiple locations
+  let duration = '';
+  // 1. subtitle field (often "3:15 / 10:30" for playlists)
+  if (metadata?.subtitle?.content) {
+    const parts = metadata.subtitle.content.split(' / ');
+    duration = parts[0] || metadata.subtitle.content;
+  }
+  // 2. secondary metadata
+  if (!duration && metadata?.metadata?.metadataBadgeViewModel?.text) {
+    duration = metadata.metadata.metadataBadgeViewModel.text;
+  }
+  // 3. accessibility label
+  if (!duration && lockup.accessibility?.accessibilityData?.label) {
+    const label = lockup.accessibility.accessibilityData.label;
+    // Try to extract time pattern (e.g. "3 minutes, 15 seconds")
+    // Keep empty if we can't parse it, it's non-critical
+    duration = label;
+  }
+
+  return {
+    videoId,
+    title: title.trim(),
+    duration: duration.trim()
+  };
+}
+
+/**
  * Extract videos from continuation response
  */
 function extractContinuationVideos(data) {
@@ -316,6 +472,12 @@ function extractContinuationVideos(data) {
         const video = parseVideoRenderer(item?.playlistVideoRenderer);
         if (video) {
           videos.push(video);
+        } else {
+          const lockup = item?.lockupViewModel;
+          if (lockup) {
+            const lv = parseLockupViewModel(lockup);
+            if (lv) videos.push(lv);
+          }
         }
       }
     }
@@ -331,29 +493,62 @@ function extractContinuationVideos(data) {
  */
 function extractContinuationToken(data) {
   try {
-    // Try different locations for continuation token
-    
-    // 1. In playlistVideoListRenderer.continuations
-    const tabs = data?.contents?.twoColumnBrowseResultsRenderer?.tabs;
-    if (tabs) {
-      const videoTab = tabs.find(tab => 
-        tab?.tabRenderer?.content?.sectionListRenderer?.contents
-      );
-      
-      if (videoTab) {
-        const contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
-        for (const content of contents) {
-          const itemSection = content?.itemSectionRenderer;
-          if (itemSection) {
-            const playlistVideoList = itemSection?.contents?.[0]?.playlistVideoListRenderer;
-            if (playlistVideoList?.continuations) {
-              const cont = playlistVideoList.continuations[0];
-              if (cont?.nextContinuationData?.continuation) {
-                return cont.nextContinuationData.continuation;
-              }
-            }
+    // Helper: try to extract token from a continuation item
+    const getToken = (item) => {
+      if (!item) return null;
+      // continuationItemRenderer (old format)
+      if (item.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token) {
+        return item.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
+      }
+      // continuationItemViewModel (new format 2026)
+      if (item.continuationItemViewModel?.continuationEndpoint?.continuationCommand?.token) {
+        return item.continuationItemViewModel.continuationEndpoint.continuationCommand.token;
+      }
+      return null;
+    };
+
+    // 1. Scan content sections (works for both twoColumn and singleColumn)
+    const scanContents = (contents) => {
+      if (!contents) return null;
+      for (const content of contents) {
+        // itemSectionRenderer > contents — last item is often a continuation
+        const itemSection = content?.itemSectionRenderer;
+        if (itemSection?.contents) {
+          const lastInner = itemSection.contents[itemSection.contents.length - 1];
+          const token = getToken(lastInner);
+          if (token) return token;
+        }
+        // playlistVideoListRenderer.continuations
+        if (content?.playlistVideoListRenderer?.continuations) {
+          const cont = content.playlistVideoListRenderer.continuations[0];
+          if (cont?.nextContinuationData?.continuation) {
+            return cont.nextContinuationData.continuation;
           }
         }
+        // continuationItemViewModel at content level
+        const token = getToken(content);
+        if (token) return token;
+      }
+      return null;
+    };
+
+    // 1a. twoColumn
+    const twoCol = data?.contents?.twoColumnBrowseResultsRenderer;
+    if (twoCol) {
+      const videoTab = twoCol.tabs?.find(tab => tab?.tabRenderer?.content?.sectionListRenderer?.contents);
+      if (videoTab) {
+        const tok = scanContents(videoTab.tabRenderer.content.sectionListRenderer.contents);
+        if (tok) return tok;
+      }
+    }
+
+    // 1b. singleColumn
+    const singleCol = data?.contents?.singleColumnBrowseResultsRenderer;
+    if (singleCol) {
+      const videoTab = singleCol.tabs?.find(tab => tab?.tabRenderer?.content?.sectionListRenderer?.contents);
+      if (videoTab) {
+        const tok = scanContents(videoTab.tabRenderer.content.sectionListRenderer.contents);
+        if (tok) return tok;
       }
     }
 
@@ -364,9 +559,8 @@ function extractContinuationToken(data) {
         const appendAction = action?.appendContinuationItemsAction;
         if (appendAction?.continuationItems) {
           const lastItem = appendAction.continuationItems[appendAction.continuationItems.length - 1];
-          if (lastItem?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token) {
-            return lastItem.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
-          }
+          const token = getToken(lastItem);
+          if (token) return token;
         }
       }
     }

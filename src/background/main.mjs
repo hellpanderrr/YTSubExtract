@@ -412,26 +412,48 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       zipData['_errors.txt'] = strToU8(errorReport);
     }
 
-    // Create ZIP blob (async to avoid blocking service worker)
-    const zipBlob = await createZipInBackground(zipData);
+    // Create ZIP data (sync, returns Uint8Array)
+    let zipUint8;
+    try {
+      zipUint8 = zipSync(zipData, { level: 6 });
+    } catch (err) {
+      throw new Error(`ZIP creation failed: ${err.message}`);
+    }
 
-    // Convert blob to base64 for storage with error handling
-    const reader = new FileReader();
-    const base64Data = await new Promise((resolve, reject) => {
-      reader.onloadend = () => resolve(reader.result.split(',')[1]);
-      reader.onerror = () => reject(new Error('FileReader failed to read blob'));
-      reader.readAsDataURL(zipBlob);
-    });
+    // Convert Uint8Array → base64 data URL (avoids FileReader/Blob URL in SW)
+    const filename = generateZipFilename(playlistId, lang, playlistTitle);
+    let binary = '';
+    for (let i = 0; i < zipUint8.length; i++) {
+      binary += String.fromCharCode(zipUint8[i]);
+    }
+    const dataUrl = 'data:application/zip;base64,' + btoa(binary);
 
-    await chrome.storage.local.set({
-      [downloadId]: {
-        data: base64Data,
-        filename: generateZipFilename(playlistId, lang, playlistTitle),
-        timestamp: Date.now()
+    let swDownloaded = false;
+    try {
+      await chrome.downloads.download({
+        url: dataUrl,
+        filename: filename,
+        saveAs: true
+      });
+      // Mark that SW already triggered the download — popup just needs to show success
+      swDownloaded = true;
+    } catch (e) {
+      console.error('[Background] chrome.downloads.download failed:', e);
+      // Fallback: store in storage for popup-based download
+      try {
+        await chrome.storage.local.set({
+          [downloadId]: {
+            data: dataUrl.split(',')[1],
+            filename: filename,
+            timestamp: Date.now()
+          }
+        });
+      } catch (storeErr) {
+        console.error('[Background] Storage fallback also failed:', storeErr);
       }
-    });
+    }
 
-    // Update progress to completed (popup will download with correct filename via DOM)
+    // Update progress to completed
     try {
       const stored = await chrome.storage.local.get('currentDownloadProgress');
       const current = stored.currentDownloadProgress || {};
@@ -444,7 +466,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
         total: videos.length,
         failed: results.errors.length,
         downloadId,
-        autoDownloaded: false
+        autoDownloaded: false,
+        swDownloaded
       };
       await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
     } catch (e) {

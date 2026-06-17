@@ -491,7 +491,16 @@ async function checkAndRestoreProgress() {
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'completed' && progress.downloadId) {
-        // Completed — download ZIP (auto-download flow not implemented)
+        if (progress.swDownloaded) {
+          // SW already downloaded the file
+          console.log('[Popup] Restoring completed state (SW downloaded)');
+          setStatus(`Saved! ${progress.completed - (progress.failed || 0)}/${progress.total} subtitles`, 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          resetDownloadState();
+          return;
+        }
         // Atomic guard: acquire lock or skip
         if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress from polling, skipping');
@@ -607,6 +616,17 @@ function startProgressPolling(totalVideos) {
         appendPlaylistLog(`Success: ${progress.completed - (progress.failed || 0)} / ${progress.total}`);
         if (progress.failed > 0) {
           appendPlaylistLog(`Failed: ${progress.failed}`);
+        }
+
+        if (progress.swDownloaded) {
+          // SW already triggered the download via chrome.downloads.download
+          appendPlaylistLog('ZIP saved via browser download');
+          setStatus(`Saved! ${progress.completed - (progress.failed || 0)}/${progress.total} subtitles`, 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          resetDownloadState();
+          return;
         }
 
         // Atomic guard: acquire lock or skip
