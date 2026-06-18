@@ -133,6 +133,51 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
+  // TIER 0.5 Auth: Credentialed Playlist Page Fetch
+  // Used as final fallback for private playlists (e.g. LL) where
+  // all unauthenticated API clients return "does not exist".
+  // Requires an active YouTube tab so the content script can fetch
+  // the playlist page with session cookies.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchPlaylistPageAuth(playlistId) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Auth] No YouTube tab found');
+          return resolve(null);
+        }
+
+        // Prefer active tab, fall back to any YouTube tab
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timeout = setTimeout(() => {
+          console.log('[Tier 0.5 Auth] Timeout');
+          resolve(null);
+        }, 10000);
+
+        chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PLAYLIST_PAGE', playlistId }, (response) => {
+          clearTimeout(timeout);
+
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Auth] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            console.log('[Tier 0.5 Auth] Failed:', response?.error || 'Unknown error');
+            return resolve(null);
+          }
+
+          console.log(`[Tier 0.5 Auth] Success: ${response.videos?.length || 0} videos, title: ${response.title}`);
+          resolve({
+            videos: response.videos || [],
+            title: response.title || ''
+          });
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // TIER 0: Network Sniffer (captured URLs)
   // ─────────────────────────────────────────────────────────────
   async _getCapturedUrl(videoId, lang) {

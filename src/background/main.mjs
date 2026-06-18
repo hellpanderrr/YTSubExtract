@@ -221,7 +221,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           source: 'api'
         });
       } catch (err) {
-        console.error('[Main] Failed to get playlist videos:', err);
+        console.error(`[Main] API failed: ${err.message}`);
+
+        // Final fallback: credentialed playlist page fetch via content script
+        // This handles private playlists (e.g. LL) where all unauthenticated
+        // API clients return "does not exist"
+        try {
+          console.log(`[Main] Trying credentialed fetch for playlist: ${request.playlistId}`);
+          const fetchResult = await translationManager._fetchPlaylistPageAuth(request.playlistId);
+
+          if (fetchResult && fetchResult.videos && fetchResult.videos.length > 0) {
+            console.log(`[Main] Credentialed fetch success: ${fetchResult.videos.length} videos`);
+            sendResponse({
+              success: true,
+              videos: fetchResult.videos.map((v, i) => ({ ...v, index: i + 1 })),
+              title: fetchResult.title || '',
+              source: 'tier0.5-auth'
+            });
+            return;
+          }
+        } catch (authErr) {
+          console.error('[Main] Credentialed fetch also failed:', authErr.message);
+        }
+
         sendResponse({ success: false, error: err.message });
       }
     })();

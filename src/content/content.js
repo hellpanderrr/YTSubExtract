@@ -1317,6 +1317,142 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true; // Keep channel open for async
   }
+
+  // === TIER 0.5 Auth: Credentialed Playlist Page Fetch ===
+  // Used as fallback for private playlists (e.g. LL - Liked Videos) where
+  // unauthenticated InnerTube API returns "does not exist".
+  // Fetches the playlist page with session cookies and parses ytInitialData.
+  if (msg.type === 'FETCH_PLAYLIST_PAGE') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[PlaylistFetch] ${m}`);
+
+      try {
+        const playlistUrl = `https://www.youtube.com/playlist?list=${msg.playlistId}`;
+        log(`Fetching: ${playlistUrl}`);
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const resp = await fetch(playlistUrl, { cache: 'no-store' });
+          const html = await resp.text();
+          log(`Response: ${resp.status}, ${html.length} bytes`);
+
+          // Extract ytInitialData from HTML — same pattern as getRobustPlayerResponse
+          const match = html.match(/ytInitialData\s*=\s*({.+?});/s);
+          if (!match) {
+            log('ytInitialData not found in HTML');
+            if (attempt < 2) {
+              log('Retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error('Failed to extract playlist data from page');
+          }
+
+          const initialData = JSON.parse(match[1]);
+
+          // Check for alerts in the response
+          const alert = initialData?.alerts?.[0]?.alertRenderer;
+          if (alert) {
+            const alertText = alert.text?.simpleText || alert.text?.runs?.map(r => r.text).join('');
+            log(`Alert found: ${alertText}`);
+            if (attempt < 2) {
+              log('Retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error(`Playlist unavailable: ${alertText}`);
+          }
+
+          // Extract videos — reuse the same structure parsing as the API path
+          const videos = [];
+          const twoColumn = initialData?.contents?.twoColumnBrowseResultsRenderer;
+          const tabs = twoColumn?.tabs;
+          let contents = null;
+
+          if (tabs) {
+            const videoTab = tabs.find(t => t?.tabRenderer?.content?.sectionListRenderer?.contents);
+            if (videoTab) {
+              contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
+            }
+          }
+
+          if (contents) {
+            for (const content of contents) {
+              const itemSection = content?.itemSectionRenderer;
+              const playlistVideoList = itemSection?.contents?.[0]?.playlistVideoListRenderer ||
+                                        content?.playlistVideoListRenderer;
+
+              if (playlistVideoList?.contents) {
+                for (const item of playlistVideoList.contents) {
+                  const renderer = item?.playlistVideoRenderer;
+                  if (renderer?.videoId) {
+                    let title = 'Unknown';
+                    if (renderer.title?.runs) {
+                      title = renderer.title.runs.map(r => r.text).join('');
+                    } else if (renderer.title?.simpleText) {
+                      title = renderer.title.simpleText;
+                    }
+                    let duration = '';
+                    if (renderer.lengthText?.simpleText) {
+                      duration = renderer.lengthText.simpleText;
+                    } else if (renderer.lengthText?.runs) {
+                      duration = renderer.lengthText.runs.map(r => r.text).join('');
+                    }
+                    videos.push({ videoId: renderer.videoId, title: title.trim(), duration: duration.trim() });
+                  }
+                }
+                continue;
+              }
+
+              // Fallback: lockupViewModel (new YouTube 2026 format)
+              const itemSectionContents = itemSection?.contents || [];
+              for (const itemContent of itemSectionContents) {
+                const lockup = itemContent?.lockupViewModel;
+                if (lockup && lockup.contentId) {
+                  let title = 'Unknown';
+                  const metadata = lockup.metadata?.lockupMetadataViewModel;
+                  if (metadata?.title?.content) title = metadata.title.content;
+                  let duration = '';
+                  if (metadata?.subtitle?.content) {
+                    const parts = metadata.subtitle.content.split(' / ');
+                    duration = parts[0] || metadata.subtitle.content;
+                  }
+                  videos.push({ videoId: lockup.contentId, title: title.trim(), duration: duration.trim() });
+                }
+              }
+            }
+          }
+
+          // Also extract title from metadata
+          let playlistTitle = '';
+          const metadata = initialData?.metadata?.playlistMetadataRenderer;
+          if (metadata?.title) {
+            playlistTitle = metadata.title;
+          }
+
+          log(`Extracted ${videos.length} videos, title: "${playlistTitle}"`);
+
+          if (videos.length === 0) {
+            if (attempt < 2) {
+              log('No videos found, retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error('No videos found in playlist page');
+          }
+
+          sendResponse({ success: true, videos, title: playlistTitle, logs, source: 'tier0.5-auth' });
+          return;
+        }
+
+        throw new Error('All attempts failed');
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
 });
 
 // Helper to inject script and get variable from page context
