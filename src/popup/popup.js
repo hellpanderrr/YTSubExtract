@@ -219,13 +219,17 @@ async function fetchPlaylistLanguages(videoId) {
 
     if (response && response.success) {
       const { languages } = response.data;
-      populatePlaylistLanguageSelect(languages);
+      if (languages && languages.length > 0) {
+        populatePlaylistLanguageSelect(languages);
+        return;
+      }
     }
   } catch (e) {
     console.log('[Popup] Could not fetch languages for playlist:', e);
-    // Fallback to SUPPORTED_LANGUAGES
-    populatePlaylistLanguageSelect(SUPPORTED_LANGUAGES.map(l => ({ code: l.code, name: l.name })));
   }
+  // Fallback: always populate with full language list so the dropdown isn't empty
+  console.log('[Popup] Metadata failed, using full language list as fallback');
+  populatePlaylistLanguageSelect(SUPPORTED_LANGUAGES.map(l => ({ code: l.code, name: l.name })));
 }
 
 function populatePlaylistLanguageSelect(languages, selectedValue = 'auto') {

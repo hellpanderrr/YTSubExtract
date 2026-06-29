@@ -496,6 +496,9 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       console.error('[Background] Final progress update failed:', e);
     }
 
+    // Restore tab to original URL after batch completes
+    await translationManager.restoreOriginalTab();
+
     return {
       downloadId,
       successCount: results.success.length,
@@ -525,6 +528,9 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     } catch (e) {
       console.error('[Background] Error state update failed:', e);
     }
+
+    // Restore tab to original URL even on error
+    await translationManager.restoreOriginalTab();
 
     throw err;
   }

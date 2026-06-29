@@ -18,20 +18,6 @@
     }
   },
   {
-    "id": 2,
-    "priority": 1,
-    "action": {
-      "type": "modifyHeaders",
-      "requestHeaders": [
-        { "header": "User-Agent", "operation": "set", "value": "com.google.ios.youtube/20.46.2 (iPhone17,2; U; CPU iOS 18_4_1 like Mac OS X)" }
-      ]
-    },
-    "condition": {
-      "urlFilter": "timedtext",
-      "resourceTypes": ["xmlhttprequest", "other"]
-    }
-  },
-  {
     "id": 3,
     "priority": 1,
     "action": {
@@ -44,6 +30,38 @@
     "condition": {
       "urlFilter": "youtube.com/watch",
       "resourceTypes": ["xmlhttprequest", "other"]
+    }
+  },
+  {
+    "id": 4,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "X-Frame-Options", "operation": "remove" },
+        { "header": "Content-Security-Policy", "operation": "remove" },
+        { "header": "Content-Security-Policy-Report-Only", "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||youtube.com/",
+      "resourceTypes": ["sub_frame"]
+    }
+  },
+  {
+    "id": 5,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "X-Frame-Options", "operation": "remove" },
+        { "header": "Content-Security-Policy", "operation": "remove" },
+        { "header": "Content-Security-Policy-Report-Only", "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||youtube-nocookie.com/",
+      "resourceTypes": ["sub_frame"]
     }
   }
 ]

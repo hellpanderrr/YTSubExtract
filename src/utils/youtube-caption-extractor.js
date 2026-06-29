@@ -634,3 +634,229 @@ export const getSubtitles = async ({ videoID, lang = 'en', translate, translateL
        throw err;
    }
 };
+
+// ─────────────────────────────────────────────────────────────
+// ANDROID API Bypass for Batch Transcripts
+// ANDROID client often works without PoToken for /get_transcript.
+// Uses player endpoint with ANDROID context to get params,
+// then calls get_transcript to bypass the 0-byte timedtext issue.
+// ─────────────────────────────────────────────────────────────
+export async function getTranscriptViaAndroid(videoId, lang = 'auto', options = {}) {
+  const { translate, translateLang } = options;
+  debug(`[AndroidBypass] Fetching transcript for ${videoId}`);
+
+  // Step 1: Call /player with ANDROID client to get caption tracks
+  const sessionData = await generateSessionData('ANDROID');
+  const playerPayload = {
+    context: sessionData.context,
+    videoId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+    params: 'CgIQBg==',
+    playbackContext: {
+      contentPlaybackContext: {
+        html5Preference: 'HTML5_PREF_WANTS',
+        signatureTimestamp: 19894,
+        vis: 0,
+        splay: false,
+        autoCaptionsDefaultOn: false,
+        autonavState: 'STATE_NONE',
+        lactMilliseconds: '-1',
+      },
+    },
+  };
+
+  const playerData = await fetchInnerTube('/player', playerPayload, 'ANDROID');
+
+  if (!playerData) {
+    throw new Error('Android player response empty');
+  }
+
+  // Extract caption tracks (check both standard and overlay locations)
+  let captionTracks = playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!captionTracks || captionTracks.length === 0) {
+    const overlay = playerData?.playerOverlays?.playerOverlayRenderer;
+    if (overlay?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks) {
+      captionTracks = overlay.playerOverlayPayload.playerOverlayCaptionRenderer.captionTracks;
+    } else if (overlay?.playerOverlayCaptionRenderer?.captionTracks) {
+      captionTracks = overlay.playerOverlayCaptionRenderer.captionTracks;
+    }
+  }
+
+  if (!captionTracks || captionTracks.length === 0) {
+    throw new Error('No caption tracks in Android player response');
+  }
+
+  // Step 2: Select track by language
+  let track;
+  if (lang && lang !== 'auto') {
+    track = captionTracks.find(t => t.languageCode === lang);
+  }
+  if (!track) {
+    track = captionTracks.find(t => t.languageCode === 'en') || captionTracks[0];
+  }
+
+  const trackLang = track.languageCode;
+  debug(`[AndroidBypass] Selected track: ${trackLang}`);
+
+  // Step 3: Extract getTranscriptEndpoint params from the caption track
+  let params = track?.getTranscriptEndpoint?.params;
+  if (!params) params = track?.params;
+
+  if (params) {
+    // Call /get_transcript with params from player response
+    debug(`[AndroidBypass] Using getTranscriptEndpoint.params`);
+    const transcriptSession = await generateSessionData('ANDROID');
+    const transcriptPayload = {
+      context: transcriptSession.context,
+      params,
+    };
+
+    const transcriptData = await fetchInnerTube('/get_transcript', transcriptPayload, 'ANDROID');
+
+    // Parse segments from the transcript response
+    const segments = parseTranscriptSegments(transcriptData);
+    if (segments && segments.length > 0) {
+      debug(`[AndroidBypass] Got ${segments.length} segments via getTranscriptEndpoint`);
+      return { segments, language: trackLang, source: 'android-bypass-gettranscript' };
+    }
+  }
+
+  // Step 4: Fallback — fetch timedtext URL with ANDROID UA headers
+  debug(`[AndroidBypass] Falling back to timedtext URL with ANDROID UA`);
+  let url = track.baseUrl;
+  if (translate) url += `&tlang=${translateLang}`;
+  url += '&fmt=json3';
+
+  const androidUA = INNERTUBE_CONFIG.CLIENT.ANDROID.USER_AGENT;
+  const timedtextResp = await fetch(url, {
+    headers: {
+      'User-Agent': androidUA,
+      'Accept': 'application/json, text/plain, */*',
+    },
+  });
+
+  if (timedtextResp.ok) {
+    const text = await timedtextResp.text();
+    if (text && text.trim().length > 0) {
+      try {
+        const json = JSON.parse(text);
+        if (json.events && json.events.length > 0) {
+          const segs = json.events
+            .filter(e => e.segs)
+            .map(e => ({
+              start: (e.tStartMs || 0) / 1000,
+              duration: (e.dDurationMs || 0) / 1000,
+              text: e.segs.map(s => s.utf8 || '').join(''),
+            }))
+            .filter(e => e.text.trim().length > 0);
+          if (segs.length > 0) {
+            debug(`[AndroidBypass] Got ${segs.length} segments via timedtext URL`);
+            return { segments: segs, language: trackLang, source: 'android-bypass-timedtext' };
+          }
+        }
+      } catch (e) {
+        debug(`[AndroidBypass] Timedtext parse failed: ${e.message}`);
+      }
+    }
+  }
+
+  throw new Error(`All Android bypass strategies failed for ${videoId}`);
+}
+
+// Helper to parse /get_transcript response into segments
+function parseTranscriptSegments(data) {
+  if (!data) return null;
+
+  // Format 1: actions[0].updateEngagementPanelAction...
+  const segments = data?.actions?.[0]?.updateEngagementPanelAction?.content
+    ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body
+    ?.transcriptSegmentListRenderer?.initialSegments;
+
+  if (segments && Array.isArray(segments) && segments.length > 0) {
+    return segments.map(segment => {
+      const renderer = segment.transcriptSegmentRenderer;
+      if (!renderer) return null;
+      const startMs = parseInt(renderer.startMs || '0');
+      const endMs = parseInt(renderer.endMs || '0');
+      let text = '';
+      if (renderer.snippet?.simpleText) text = renderer.snippet.simpleText;
+      else if (renderer.snippet?.runs) text = renderer.snippet.runs.map(r => r.text).join('');
+      else if (renderer.snippet?.text) text = renderer.snippet.text;
+      return text.trim() ? {
+        start: startMs / 1000,
+        duration: (endMs - startMs) / 1000,
+        text: he.decode(striptags(text)),
+      } : null;
+    }).filter(Boolean);
+  }
+
+  // Format 2: direct transcriptRenderer (some clients)
+  const directData = data?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body
+    ?.transcriptSegmentListRenderer?.initialSegments;
+  if (directData && Array.isArray(directData) && directData.length > 0) {
+    return directData.map(segment => {
+      const renderer = segment.transcriptSegmentRenderer;
+      if (!renderer) return null;
+      const startMs = parseInt(renderer.startMs || '0');
+      const endMs = parseInt(renderer.endMs || '0');
+      let text = '';
+      if (renderer.snippet?.simpleText) text = renderer.snippet.simpleText;
+      else if (renderer.snippet?.runs) text = renderer.snippet.runs.map(r => r.text).join('');
+      else if (renderer.snippet?.text) text = renderer.snippet.text;
+      return text.trim() ? {
+        start: startMs / 1000,
+        duration: (endMs - startMs) / 1000,
+        text: he.decode(striptags(text)),
+      } : null;
+    }).filter(Boolean);
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// /next Endpoint → Engagement Panel → Transcript Extraction
+// Calls /youtubei/v1/next (not /player) to get engagement panels,
+// then extracts transcript via the engagement panel's continuation
+// token or getTranscriptEndpoint.params.
+// ─────────────────────────────────────────────────────────────
+export async function getTranscriptViaNext(videoId, lang = 'auto', options = {}) {
+  const log = createLogger('youtube-caption-extractor');
+
+  log(`[NextBypass] Fetching /next for ${videoId}`);
+  const sessionData = await generateSessionData('IOS');
+  const nextPayload = { ...sessionData, videoId };
+  const nextData = await fetchInnerTube('/next', nextPayload, 'IOS');
+  if (!nextData) throw new Error('/next returned empty');
+
+  const transcriptPanel = nextData?.engagementPanels?.find(
+    p => p?.engagementPanelSectionListRenderer?.panelIdentifier === 'engagement-panel-searchable-transcript'
+  );
+  if (!transcriptPanel) throw new Error('No transcript engagement panel');
+
+  const content = transcriptPanel.engagementPanelSectionListRenderer?.content;
+  let token;
+  const contItem = content?.continuationItemRenderer;
+  if (contItem?.continuationEndpoint?.continuationCommand?.token) {
+    token = contItem.continuationEndpoint.continuationCommand.token;
+  } else if (contItem?.continuationEndpoint?.getTranscriptEndpoint?.params) {
+    token = contItem.continuationEndpoint.getTranscriptEndpoint.params;
+  }
+  if (!token && content?.sectionListRenderer?.contents?.[0]) {
+    const item = content.sectionListRenderer.contents[0].continuationItemRenderer;
+    if (item?.continuationEndpoint?.continuationCommand?.token) token = item.continuationEndpoint.continuationCommand.token;
+  }
+  if (!token) throw new Error('No transcript token');
+
+  const transcriptSession = await generateSessionData('IOS');
+  const transcriptData = await fetchInnerTube('/get_transcript', { ...transcriptSession, params: token }, 'IOS');
+  if (!transcriptData) throw new Error('/get_transcript returned empty');
+
+  const segments = parseTranscriptSegments(transcriptData);
+  if (segments && segments.length > 0) {
+    log(`[NextBypass] Got ${segments.length} segments`);
+    return { segments, language: 'unknown', source: 'tier-next-bypass' };
+  }
+  throw new Error('Parsed 0 segments');
+}

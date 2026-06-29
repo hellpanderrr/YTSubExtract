@@ -2,7 +2,7 @@
 // === UNIVERSAL TRANSLATION MANAGER ===
 // Handles all 3 libraries + YouTube Native API
 
-import { getSubtitles, getLanguages, getVideoInfo } from '../utils/youtube-caption-extractor.js';
+import { getSubtitles, getLanguages, getVideoInfo, getTranscriptViaAndroid, getTranscriptViaNext } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import he from 'he';
@@ -16,6 +16,12 @@ export class TranslationManager {
     // Deduplication maps to prevent concurrent duplicate requests
     this.pendingMetadataRequests = new Map(); // key: videoId -> Promise
     this.pendingTranscriptRequests = new Map(); // key: videoId:lang:translate:targetLang -> Promise
+
+    // Tab navigation lock (serializes tab navigation to prevent conflicts)
+    this._tabNavLock = Promise.resolve();
+
+    // Original tab URL before tab navigation (used to restore after batch)
+    this._originalTabUrl = null;
   }
 
   /**
@@ -178,7 +184,272 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // TIER 0: Network Sniffer (captured URLs)
+  // TIER 0.5 Auth: Credentialed Transcript Fetch
+  // Used as final fallback for batch playlist downloads when
+  // API-only tiers fail with LOGIN_REQUIRED. Requires an active
+  // YouTube tab so the content script can fetch the watch page
+  // with session cookies and extract caption tracks.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchTranscriptAuth(videoId, options = {}) {
+    const { lang = 'auto', translate = false, translateLang = 'en' } = options;
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Auth Transcript] No YouTube tab found');
+          return resolve(null);
+        }
+
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timeout = setTimeout(() => {
+          console.log('[Tier 0.5 Auth Transcript] Timeout');
+          resolve(null);
+        }, 20000);
+
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'FETCH_TRANSCRIPT_AUTH',
+          videoId,
+          lang,
+          translate,
+          translateLang
+        }, (response) => {
+          clearTimeout(timeout);
+
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Auth Transcript] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            console.log('[Tier 0.5 Auth Transcript] Failed:', response?.error || 'Unknown error');
+            if (response?.logs) {
+              response.logs.forEach(l => console.log('[Content]', l));
+            }
+            return resolve(null);
+          }
+
+          if (response?.result && response.result.length > 0) {
+            console.log(`[Tier 0.5 Auth Transcript] Success: ${response.result.length} segments from ${response.source || 'unknown'}`);
+            resolve(response.result);
+          } else {
+            console.log('[Tier 0.5 Auth Transcript] Empty result');
+            resolve(null);
+          }
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // EMBED FRAME TRANSCRIPT SNIFFER
+  // Injects a hidden embed iframe into an active YouTube tab where
+  // the real YouTube player solves BotGuard and makes PoToken-authenticated
+  // timedtext requests. Our sniffer (MAIN world, all_frames:true) captures
+  // response bodies and relays them back via window.postMessage.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchTranscriptViaEmbedFrame(videoId, options = {}) {
+    const { lang = 'auto', timeout = 25000 } = options;
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[EmbedFrame] No YouTube tab found');
+          return resolve(null);
+        }
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timer = setTimeout(() => {
+          console.log('[EmbedFrame] Timeout');
+          resolve(null);
+        }, timeout);
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'INJECT_EMBED_FRAME',
+          videoId,
+          lang: lang !== 'auto' ? lang : null,
+          timeout: timeout - 5000
+        }, (response) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            console.warn('[EmbedFrame] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+          if (!response?.success) {
+            console.log('[EmbedFrame] Failed:', response?.error || 'Unknown error');
+            if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
+            return resolve(null);
+          }
+          if (response?.result && response.result.length > 0) {
+            console.log(`[EmbedFrame] Success: ${response.result.length} segments`);
+            resolve(response.result);
+          } else {
+            console.log('[EmbedFrame] Empty result');
+            resolve(null);
+          }
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // PLAYER COERCION (Pathway 1): Use native YT player
+  // Calls player.loadVideoById() + loadModule("captions") to force
+  // the real YouTube player to solve BotGuard and request timedtext.
+  // Requires an active YouTube tab with a initialized player.
+  // ─────────────────────────────────────────────────────────────
+  async _coercePlayerTranscript(videoId, options = {}) {
+    const { lang = 'auto', timeout = 30000 } = options;
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[CoercePlayer] No YouTube tab found');
+          return resolve(null);
+        }
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timer = setTimeout(() => {
+          console.log('[CoercePlayer] Timeout');
+          resolve(null);
+        }, timeout);
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'COERCE_PLAYER_TRANSCRIPT',
+          videoId,
+          lang: lang !== 'auto' ? lang : null,
+          timeout: timeout - 5000
+        }, (response) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            console.warn('[CoercePlayer] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+          if (!response?.success) {
+            console.log('[CoercePlayer] Failed:', response?.error || 'Unknown error');
+            if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
+            return resolve(null);
+          }
+          if (response?.result && response.result.length > 0) {
+            console.log(`[CoercePlayer] Success: ${response.result.length} segments`);
+            resolve(response.result);
+          } else {
+            console.log('[CoercePlayer] Empty result');
+            resolve(null);
+          }
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // TAB NAVIGATION: Navigate tab to watch page, capture via sniffer
+  // Navigates an active YouTube tab to the video's watch page.
+  // The REAL YouTube player initializes, solves BotGuard, and requests
+  // timedtext with a valid PoToken. The sniffer captures the response.
+  // After extraction, navigates back to the original URL.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchTranscriptViaTabNav(videoId, options = {}) {
+    const { timeout = 30000 } = options;
+    // Serialize via lock to prevent concurrent tab navigations
+    return new Promise((resolve) => {
+      this._tabNavLock = this._tabNavLock.then(() => new Promise((innerResolve) => {
+        const passThrough = (result) => {
+          resolve(result);
+          innerResolve(result);
+        };
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[TabNav] No YouTube tab found');
+          return passThrough(null);
+        }
+
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const originalUrl = tab.url;
+
+        // Preserve playlist context by extracting list param from original URL
+        let watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        try {
+          const origUrlObj = new URL(originalUrl);
+          const listParam = origUrlObj.searchParams.get('list');
+          if (listParam) {
+            watchUrl += `&list=${listParam}`;
+          }
+        } catch (e) {
+          // Invalid URL, just use bare watch URL
+        }
+
+        // Save original URL on first navigation so we can restore it after batch
+        if (!this._originalTabUrl) {
+          this._originalTabUrl = originalUrl;
+        }
+
+        console.log(`[TabNav] Navigating tab ${tab.id} from ${originalUrl} to ${watchUrl}`);
+
+        let resolved = false;
+        let pollTimer = null;
+        let timeoutTimer = null;
+
+        const cleanup = () => {
+          resolved = true;
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+        };
+
+        timeoutTimer = setTimeout(() => {
+          if (resolved) { cleanup(); return; }
+          resolved = true;
+          console.log('[TabNav] Timeout');
+          cleanup();
+          passThrough(null);
+        }, timeout);
+
+        const startPolling = () => {
+          pollTimer = setInterval(() => {
+            chrome.tabs.sendMessage(tab.id, {
+              type: 'POLL_TRANSCRIPT',
+              videoId
+            }, (response) => {
+              if (chrome.runtime.lastError) return;
+              if (response?.success && response?.result?.length > 0) {
+                console.log(`[TabNav] Got ${response.result.length} segments`);
+                resolved = true;
+                cleanup();
+                passThrough(response.result);
+              }
+            });
+          }, 800);
+        };
+
+        const onUpdated = (tabId, changeInfo) => {
+          if (tabId === tab.id && changeInfo.status === 'complete') {
+            setTimeout(() => {
+              if (!resolved) startPolling();
+            }, 3000);
+          }
+        };
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        chrome.tabs.update(tab.id, { url: watchUrl });
+      });   // chrome.tabs.query
+    }));    // inner promise + _tabNavLock.then()
+  });       // outer promise
+}
+
+  // ─────────────────────────────────────────────────────────────
+  // RESTORE ORIGINAL TAB (after batch navigation is done)
+  // ─────────────────────────────────────────────────────────────
+  async restoreOriginalTab() {
+    const originalUrl = this._originalTabUrl;
+    this._originalTabUrl = null;
+    if (!originalUrl) return;
+
+    try {
+      const tabs = await chrome.tabs.query({ url: '*://*.youtube.com/*' });
+      if (tabs.length === 0) return;
+      const tab = tabs.find(t => t.active) || tabs[0];
+      if (tab.url && tab.url.includes('/watch')) {
+        console.log(`[TabNav] Restoring original URL: ${originalUrl}`);
+        await chrome.tabs.update(tab.id, { url: originalUrl });
+      }
+    } catch (e) {
+      console.warn('[TabNav] Failed to restore tab:', e.message);
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────
   async _getCapturedUrl(videoId, lang) {
     return new Promise((resolve) => {
@@ -1533,6 +1804,66 @@ export class TranslationManager {
 
     const errors = [];
 
+    // === TIER 0 (Primary): Android API Bypass ===
+    // ANDROID client often works without PoToken for /get_transcript.
+    // Uses player endpoint with ANDROID context to get params,
+    // then calls get_transcript to bypass PoToken enforcement.
+    try {
+      log('[Tier 0] Attempting Android API bypass...');
+      const androidResult = await getTranscriptViaAndroid(videoId, sourceLang, {
+        translate,
+        translateLang: targetLang
+      });
+
+      if (androidResult && androidResult.segments && androidResult.segments.length > 0) {
+        log(`[Tier 0] Success! ${androidResult.segments.length} segments from ${androidResult.source}`);
+
+        const response = {
+          source: androidResult.source || 'tier0-android',
+          result: androidResult.segments,
+          translated: translate,
+          sourceLang: androidResult.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 0, error: err.message });
+      log(`[Tier 0] Failed: ${err.message}`);
+    }
+
+    // === TIER 0.1: /next Endpoint → Engagement Panel Transcript ===
+    // Calls /youtubei/v1/next instead of /player to get engagement
+    // panels, then extracts transcript via continuation token.
+    // Different endpoint path may have different PoToken enforcement.
+    try {
+      log('[Tier 0.1] Attempting /next engagement panel transcript...');
+      const nextResult = await getTranscriptViaNext(videoId, sourceLang, {
+        translate,
+        translateLang: targetLang
+      });
+
+      if (nextResult && nextResult.segments && nextResult.segments.length > 0) {
+        log(`[Tier 0.1] Success! ${nextResult.segments.length} segments`);
+
+        const response = {
+          source: nextResult.source || 'tier0.1-next',
+          result: nextResult.segments,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '0.1', error: err.message });
+      log(`[Tier 0.1] Failed: ${err.message}`);
+    }
+
     // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
     try {
       log('[Tier 3] Attempting Innertube (primary)...');
@@ -1627,6 +1958,65 @@ export class TranslationManager {
     } catch (err) {
       errors.push({ tier: '1.5', error: err.message });
       log(`[Tier 1.5] Failed: ${err.message}`);
+    }
+
+    // === TIER 2C (Tab Navigation): Navigate to watch page ===
+    // Navigates the active YouTube tab to the video's watch page.
+    // The REAL player solves BotGuard and makes PoToken-authenticated
+    // timedtext request. The sniffer captures the response body.
+    // This is the only tier that reliably works for heavily restricted
+    // videos. The tab briefly visits each video.
+    try {
+      log('[Tier 2C Tab Nav] Navigating tab to watch page...');
+      const tabResult = await this._fetchTranscriptViaTabNav(videoId, {
+        timeout: 30000
+      });
+
+      if (tabResult && tabResult.length > 0) {
+        log(`[Tier 2C Tab Nav] Success! ${tabResult.length} segments`);
+        const response = {
+          source: 'tier2c-tab-nav',
+          result: tabResult,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '2c-tab-nav', error: err.message });
+      log(`[Tier 2C Tab Nav] Failed: ${err.message}`);
+    }
+
+    // === TIER 0.5 AUTH (last resort): Credentialed transcript fetch ===
+    // Only works if user has a YouTube tab open (content script needs cookies).
+    // Used when all API-only tiers fail with LOGIN_REQUIRED.
+    try {
+      log('[Tier 0.5 Auth] Attempting credentialed transcript fetch...');
+      const authResult = await this._fetchTranscriptAuth(videoId, {
+        lang: sourceLang,
+        translate,
+        translateLang: targetLang
+      });
+
+      if (authResult && authResult.length > 0) {
+        log(`[Tier 0.5 Auth] Success! ${authResult.length} segments`);
+        const response = {
+          source: 'tier0.5-auth',
+          result: authResult,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '0.5-auth', error: err.message });
+      log(`[Tier 0.5 Auth] Failed: ${err.message}`);
     }
 
     // All tiers failed

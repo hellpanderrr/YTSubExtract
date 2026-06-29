@@ -11,28 +11,84 @@ const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
 // Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
 const capturedUrls = new Map();
 
+// Storage for full transcript bodies captured by sniffer (MAIN world)
+// videoId -> Map<lang, {text, timestamp}>
+const capturedTranscripts = new Map();
+
+// Bridge: read MAIN-world captured transcripts from document_start sniffer
+// The sniffer sets window.__ytsub_captured_transcripts at document_start,
+// but our ISOLATED world content script can't read it directly.
+// We inject a MAIN world script to relay captured transcripts via postMessage.
+(function bridgeCapturedTranscripts() {
+  const requestId = 'bridge_ct_' + Math.random().toString(36).substring(2, 10);
+  const listener = (event) => {
+    if (event.source !== window) return;
+    if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT_BRIDGE' || event.data?.requestId !== requestId) return;
+    const data = event.data?.data;
+    if (!data) return;
+    for (const videoId in data) {
+      for (const lang in data[videoId]) {
+        for (const entry of data[videoId][lang]) {
+          if (!capturedTranscripts.has(videoId)) {
+            capturedTranscripts.set(videoId, new Map());
+          }
+          capturedTranscripts.get(videoId).set(lang, { text: entry.text, timestamp: entry.timestamp });
+        }
+      }
+    }
+    window.removeEventListener('message', listener);
+  };
+  window.addEventListener('message', listener);
+  const s = document.createElement('script');
+  s.textContent = `(function() {
+    var d = window.__ytsub_captured_transcripts;
+    if (d) window.postMessage({type:'YTSUB_CAPTURED_TRANSCRIPT_BRIDGE',requestId:'${requestId}',data:d},'*');
+  })();`;
+  (document.head || document.documentElement).appendChild(s);
+  setTimeout(() => s.remove(), 100);
+})();
+
 // === REQUEST DEDUPLICATION ===
 // Lock for player tracks requests to prevent concurrent duplicate operations
 const playerTracksLocks = new Map(); // videoId -> Promise
 
-// Listen for messages from sniffer.js (MAIN world)
+// Listen for messages from sniffer.js (MAIN world) and embed iframes
 window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    
+    // IMPORTANT: Do NOT filter by event.source here.
+    // When the sniffer inside the embed iframe relays data via
+    // window.parent.postMessage(), event.source is the iframe window,
+    // not the top window. We trust data checks instead.
+
     if (event.data?.type === 'YTSUB_CAPTURED_URL') {
         const { videoId, lang, url, timestamp } = event.data;
-        
+
         if (!capturedUrls.has(videoId)) {
             capturedUrls.set(videoId, new Map());
         }
-        
+
         capturedUrls.get(videoId).set(lang, { url, timestamp });
-        
+
         // Log the lang parameter from the URL for verification
         if (DEBUG) {
             const urlLangMatch = url.match(URL_LANG_REGEX);
             const urlLang = urlLangMatch ? urlLangMatch[1] : 'no-lang';
             console.log(`[Content] Captured URL: video=${videoId}, storedLang=${lang}, urlLang=${urlLang}, url=${url.substring(0, 100)}...`);
+        }
+    }
+
+    // Store full captured transcript bodies (sniffer captures these
+    // when the real YouTube player makes PoToken-authenticated requests)
+    if (event.data?.type === 'YTSUB_CAPTURED_TRANSCRIPT') {
+        const { videoId, lang, text, timestamp } = event.data;
+        if (!videoId || !text) return;
+
+        if (!capturedTranscripts.has(videoId)) {
+            capturedTranscripts.set(videoId, new Map());
+        }
+        capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp });
+
+        if (DEBUG) {
+            console.log(`[Content] Stored transcript for video=${videoId}, lang=${lang || 'unknown'}, ${text.length} bytes`);
         }
     }
 });
@@ -1446,6 +1502,617 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         throw new Error('All attempts failed');
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === TIER 0.5 Auth: Credentialed Transcript Fetch ===
+  // Fetches watch page with session cookies, extracts caption tracks,
+  // then fetches the timedtext URL directly from the content script
+  // context (same session as the watch page fetch). Returns parsed segments.
+  if (msg.type === 'FETCH_TRANSCRIPT_AUTH') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[Content] ${m}`);
+      const { videoId, lang = 'auto', translate = false, translateLang = 'en' } = msg;
+
+      try {
+        log(`Fetching watch page for ${videoId}...`);
+
+        // Step 1: Fetch the watch page HTML with session cookies
+        const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const resp = await fetch(watchUrl, { cache: 'no-store' });
+        if (!resp.ok) {
+          throw new Error(`Watch page fetch failed: HTTP ${resp.status}`);
+        }
+        const html = await resp.text();
+
+        // Step 2: Extract ytInitialPlayerResponse from HTML
+        const match = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
+        if (!match) {
+          throw new Error('Could not find ytInitialPlayerResponse in watch page');
+        }
+        const playerResponse = JSON.parse(match[1]);
+
+        // Step 3: Get caption tracks
+        const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (!captionTracks || captionTracks.length === 0) {
+          throw new Error('No caption tracks in player response');
+        }
+
+        // Step 4: Select the right track
+        let track;
+        if (lang && lang !== 'auto') {
+          track = captionTracks.find(t => t.languageCode === lang);
+        }
+        if (!track) {
+          track = captionTracks.find(t => t.languageCode === 'en') || captionTracks[0];
+        }
+
+        const trackLang = track.languageCode;
+        log(`Selected track: ${trackLang}`);
+
+        // Try multiple format strategies for the timedtext URL
+        let segments = null;
+        const tryFetch = async (url, label) => {
+          log(`[${label}] ${url.substring(0, 120)}`);
+          const r = await fetch(url, { cache: 'no-store' });
+          if (!r.ok) { log(`[${label}] HTTP ${r.status}`); return null; }
+          const text = await r.text();
+          log(`[${label}] ${text.length} bytes`);
+          if (!text || text.trim().length === 0) return null;
+
+          // Parse JSON3
+          if (url.includes('fmt=json3') || text.startsWith('{')) {
+            try {
+              const json = JSON.parse(text);
+              if (json.events) {
+                const segs = json.events.filter(e => e.segs).map(e => ({
+                  start: (e.tStartMs || 0) / 1000,
+                  duration: (e.dDurationMs || 0) / 1000,
+                  text: e.segs.map(s => s.utf8 || '').join('')
+                })).filter(e => e.text.trim().length > 0);
+                if (segs.length > 0) return segs;
+              }
+            } catch (e) {}
+          }
+
+          // Parse XML
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          const xmlSegs = []; let m;
+          while ((m = xmlRe.exec(text)) !== null) {
+            xmlSegs.push({ start: parseFloat(m[1]), duration: parseFloat(m[2]), text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"') });
+          }
+          if (xmlSegs.length > 0) return xmlSegs;
+
+          // Parse VTT
+          if (text.includes('WEBVTT')) {
+            const lines = text.split('\n'); const vtt = []; let cs = 0, ct = '';
+            for (let i = 0; i < lines.length; i++) {
+              const l = lines[i].trim();
+              if (l.includes('-->')) {
+                if (ct) { vtt.push({ start: cs, duration: 0, text: ct.trim() }); ct = ''; }
+                const p = l.split('-->')[0].trim().split(/\s+/)[0].split(':').map(Number);
+                cs = p.length === 3 ? p[0]*3600 + p[1]*60 + p[2] : p.length === 2 ? p[0]*60 + p[1] : 0;
+              } else if (l && !l.startsWith('WEBVTT') && isNaN(parseFloat(l))) { ct += l + ' '; }
+            }
+            if (ct) vtt.push({ start: cs, duration: 0, text: ct.trim() });
+            if (vtt.length > 0) return vtt;
+          }
+          return null;
+        };
+
+        // Strategy 1: Clean api/timedtext URL with json3
+        let cleanBase = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${trackLang}`;
+        let cleanUrl = cleanBase + '&fmt=json3';
+        if (translate) cleanUrl += `&tlang=${translateLang}`;
+        segments = await tryFetch(cleanUrl, 'Clean-JSON3');
+
+        // Strategy 2: Clean URL without fmt (default XML)
+        if (!segments) {
+          let url = cleanBase;
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-XML');
+        }
+
+        // Strategy 3: Clean URL with VTT
+        if (!segments) {
+          let url = cleanBase + '&fmt=vtt';
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-VTT');
+        }
+
+        // Strategy 4: Clean URL with srv3
+        if (!segments) {
+          let url = cleanBase + '&fmt=srv3';
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-SRV3');
+        }
+
+        // Strategy 5: Signed URL from player response (with JSON3)
+        if (!segments) {
+          let signedUrl = track.baseUrl + '&fmt=json3';
+          if (translate) signedUrl += `&tlang=${translateLang}`;
+          segments = await tryFetch(signedUrl, 'Signed-JSON3');
+        }
+
+        // Strategy 6: Signed URL without format override
+        if (!segments) {
+          let signedUrl = track.baseUrl;
+          if (translate) signedUrl += `&tlang=${translateLang}`;
+          segments = await tryFetch(signedUrl, 'Signed-XML');
+        }
+
+        if (!segments) {
+          throw new Error('Empty timedtext response');
+        }
+
+        if (segments.length === 0) {
+          throw new Error('No text segments found');
+        }
+
+        log(`Success! ${segments.length} segments`);
+        sendResponse({ success: true, result: segments, source: trackLang, logs });
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === GET_CAPTURED_TRANSCRIPT: Return parsed segments from sniffer ===
+  // After tab navigation, the sniffer in MAIN world captures the
+  // PoToken-authenticated timedtext response body. This handler
+  // returns it as parsed segments.
+  if (msg.type === 'GET_CAPTURED_TRANSCRIPT') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[CapturedTranscript] ${m}`);
+      const { videoId, lang = null } = msg;
+
+      try {
+        const videoMap = capturedTranscripts.get(videoId);
+        if (!videoMap || videoMap.size === 0) {
+          throw new Error('No captured transcript for this video');
+        }
+
+        let entry = null;
+        if (lang && videoMap.has(lang)) {
+          entry = videoMap.get(lang);
+        } else {
+          entry = videoMap.values().next().value;
+        }
+
+        if (!entry || !entry.text) {
+          throw new Error('No transcript text found');
+        }
+
+        log(`Found ${entry.text.length} bytes`);
+
+        let segments = null;
+        if (entry.text.startsWith('{')) {
+          try {
+            const json = JSON.parse(entry.text);
+            if (json.events) {
+              segments = json.events
+                .filter(e => e.segs)
+                .map(e => ({
+                  start: (e.tStartMs || 0) / 1000,
+                  duration: (e.dDurationMs || 0) / 1000,
+                  text: e.segs.map(s => s.utf8 || '').join('')
+                }))
+                .filter(e => e.text.trim().length > 0);
+            }
+          } catch (e) {}
+        }
+
+        if (!segments || segments.length === 0) {
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          segments = [];
+          let m;
+          while ((m = xmlRe.exec(entry.text)) !== null) {
+            segments.push({
+              start: parseFloat(m[1]),
+              duration: parseFloat(m[2]),
+              text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+            });
+          }
+        }
+
+        if (segments && segments.length > 0) {
+          log(`Parsed ${segments.length} segments`);
+          sendResponse({ success: true, result: segments, logs });
+        } else {
+          throw new Error('No segments parsed');
+        }
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === POLL TRANSCRIPT (for tab navigation approach) ===
+  // After the background navigates the tab to a watch page, it polls
+  // this handler to check if the sniffer has captured the PoToken-
+  // authenticated timedtext response from the real YouTube player.
+  if (msg.type === 'POLL_TRANSCRIPT') {
+    const { videoId } = msg;
+    const videoMap = capturedTranscripts.get(videoId);
+    if (!videoMap || videoMap.size === 0) {
+      sendResponse({ success: false, error: 'Not yet captured' });
+      return true;
+    }
+
+    // Find the first entry with actual content
+    for (const [, entry] of videoMap) {
+      if (entry.text && entry.text.trim().length > 0) {
+        // Parse into segments
+        let segments = null;
+        if (entry.text.startsWith('{')) {
+          try {
+            const json = JSON.parse(entry.text);
+            if (json.events) {
+              segments = json.events
+                .filter(e => e.segs)
+                .map(e => ({ start: (e.tStartMs || 0) / 1000, duration: (e.dDurationMs || 0) / 1000, text: e.segs.map(s => s.utf8 || '').join('') }))
+                .filter(e => e.text.trim().length > 0);
+            }
+          } catch (e) {}
+        }
+        if (!segments || segments.length === 0) {
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          segments = [];
+          let m;
+          while ((m = xmlRe.exec(entry.text)) !== null) {
+            segments.push({ start: parseFloat(m[1]), duration: parseFloat(m[2]), text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"') });
+          }
+        }
+        if (segments && segments.length > 0) {
+          sendResponse({ success: true, result: segments });
+        } else {
+          sendResponse({ success: false, error: 'No segments parsed' });
+        }
+        return true;
+      }
+    }
+
+    sendResponse({ success: false, error: 'No content found' });
+    return true;
+  }
+
+  // === EMBED FRAME TRANSCRIPT SNIFFER ===
+  // Injects a hidden embed iframe using youtube-nocookie.com with
+  // cc_load_policy=1 to auto-request captions, and referrerpolicy
+  // no-referrer to bypass EMBEDDER_IDENTITY_DENIED.
+  // The real YouTube player JS solves BotGuard naturally and the
+  // sniffer (MAIN world, all_frames) captures the PoToken response.
+  if (msg.type === 'INJECT_EMBED_FRAME') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[EmbedFrame] ${m}`);
+      const { videoId, lang = null, timeout = 25000 } = msg;
+
+      try {
+        // Remove any stale iframe from previous run
+        const oldFrame = document.getElementById('_ytsub_embed_frame');
+        if (oldFrame) oldFrame.remove();
+
+        // Build the embed URL using youtube-nocookie.com for different
+        // referrer/embedding policy, with cc_load_policy=1 to auto-request captions
+        let embedUrl = `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&cc_load_policy=1&hl=${lang || 'en'}&cc_lang_pref=${lang || 'en'}`;
+        log(`Creating embed iframe: ${embedUrl}`);
+
+        const result = await new Promise((resolve, reject) => {
+          const messageHandler = (event) => {
+            if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT') return;
+            if (event.data?.videoId !== videoId) return;
+
+            const { text, lang: captureLang, tlang } = event.data;
+            if (!text || text.trim().length === 0) return;
+
+            log(`Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'})`);
+
+            // Try JSON3 first
+            let segments = null;
+            if (text.startsWith('{')) {
+              try {
+                const json = JSON.parse(text);
+                if (json.events) {
+                  segments = json.events
+                    .filter(e => e.segs)
+                    .map(e => ({
+                      start: (e.tStartMs || 0) / 1000,
+                      duration: (e.dDurationMs || 0) / 1000,
+                      text: e.segs.map(s => s.utf8 || '').join('')
+                    }))
+                    .filter(e => e.text.trim().length > 0);
+                }
+              } catch (e) {}
+            }
+
+            // Try XML
+            if (!segments || segments.length === 0) {
+              const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+              segments = [];
+              let m;
+              while ((m = xmlRe.exec(text)) !== null) {
+                segments.push({
+                  start: parseFloat(m[1]),
+                  duration: parseFloat(m[2]),
+                  text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+                });
+              }
+            }
+
+            if (segments && segments.length > 0) {
+              log(`Parsed ${segments.length} segments`);
+              cleanup();
+              resolve(segments);
+            }
+          };
+
+          const timer = setTimeout(() => {
+            log(`Timeout after ${timeout}ms`);
+            cleanup();
+            resolve(null);
+          }, timeout);
+
+          const cleanup = () => {
+            window.removeEventListener('message', messageHandler);
+            clearTimeout(timer);
+            const frame = document.getElementById('_ytsub_embed_frame');
+            if (frame) {
+              frame.src = 'about:blank';
+              setTimeout(() => frame.remove(), 100);
+            }
+          };
+
+          window.addEventListener('message', messageHandler);
+
+          // Create hidden iframe — youtube-nocookie.com with no-referrer
+          // to prevent EMBEDDER_IDENTITY_DENIED. cc_load_policy=1 forces
+          // captions to load automatically without toggleSubtitles().
+          // DNR rules 4+5 strip X-Frame-Options/CSP from both domains.
+          const iframe = document.createElement('iframe');
+          iframe.id = '_ytsub_embed_frame';
+          iframe.style.cssText = 'position:fixed;top:-100px;left:-100px;width:1px;height:1px;opacity:0.01;border:none;pointer-events:none;';
+          iframe.src = embedUrl;
+          iframe.setAttribute('referrerpolicy', 'no-referrer');
+          iframe.setAttribute('allow', 'autoplay');
+          document.body.appendChild(iframe);
+          log('Iframe injected, waiting for transcript...');
+        });
+
+        if (result && result.length > 0) {
+          sendResponse({ success: true, result, source: 'embed-iframe', logs });
+        } else {
+          sendResponse({ success: false, error: 'No transcript captured from embed', logs });
+        }
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === PLAYER COERCION (Pathway 1) ===
+  // Uses the native YouTube player on the current page to load the target
+  // video, trigger captions, and capture the PoToken-authenticated response.
+  // The sniffer intercepts the timedtext request made by the real player.
+  if (msg.type === 'COERCE_PLAYER_TRANSCRIPT') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[CoercePlayer] ${m}`);
+      const { videoId, lang = null, timeout = 30000 } = msg;
+
+      try {
+        const player = document.getElementById('movie_player');
+        if (!player) {
+          throw new Error('No YouTube player found on this page');
+        }
+
+        log(`Coercing player to load video: ${videoId}`);
+
+        // Inject a MAIN world script to control the player
+        const result = await new Promise((resolve, reject) => {
+          const requestId = `coerce_${videoId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
+          const messageHandler = (event) => {
+            if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT') return;
+            if (event.data?.videoId !== videoId) return;
+
+            const { text, lang: captureLang, tlang } = event.data;
+            if (!text || text.trim().length === 0) return;
+
+            log(`Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'})`);
+
+            let segments = null;
+            if (text.startsWith('{')) {
+              try {
+                const json = JSON.parse(text);
+                if (json.events) {
+                  segments = json.events
+                    .filter(e => e.segs)
+                    .map(e => ({
+                      start: (e.tStartMs || 0) / 1000,
+                      duration: (e.dDurationMs || 0) / 1000,
+                      text: e.segs.map(s => s.utf8 || '').join('')
+                    }))
+                    .filter(e => e.text.trim().length > 0);
+                }
+              } catch (e) {}
+            }
+
+            if (!segments || segments.length === 0) {
+              const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+              segments = [];
+              let m;
+              while ((m = xmlRe.exec(text)) !== null) {
+                segments.push({
+                  start: parseFloat(m[1]),
+                  duration: parseFloat(m[2]),
+                  text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+                });
+              }
+            }
+
+            if (segments && segments.length > 0) {
+              log(`Parsed ${segments.length} segments`);
+              cleanup();
+              resolve(segments);
+            }
+          };
+
+          const statusHandler = (statusEvent) => {
+            if (statusEvent.data?.requestId !== requestId) return;
+            if (statusEvent.data?.type === 'COERCE_PLAYER_COMPLETE') {
+              log('Player script completed execution');
+            }
+          };
+
+          const timer = setTimeout(() => {
+            log(`Timeout after ${timeout}ms`);
+            cleanup();
+            // Give one last chance — check capturedTranscripts
+            const videoMap = capturedTranscripts.get(videoId);
+            if (videoMap && videoMap.size > 0) {
+              const entry = videoMap.values().next().value;
+              if (entry && entry.text) {
+                log(`Found transcript in fallback cache! ${entry.text.length} bytes`);
+                let segments = null;
+                try {
+                  const json = JSON.parse(entry.text);
+                  if (json.events) {
+                    segments = json.events.filter(e => e.segs).map(e => ({
+                      start: (e.tStartMs || 0) / 1000,
+                      duration: (e.dDurationMs || 0) / 1000,
+                      text: e.segs.map(s => s.utf8 || '').join('')
+                    })).filter(e => e.text.trim().length > 0);
+                  }
+                } catch (e) {}
+                if (segments && segments.length > 0) {
+                  cleanup();
+                  resolve(segments);
+                  return;
+                }
+              }
+            }
+            resolve(null);
+          }, timeout);
+
+          const cleanup = () => {
+            window.removeEventListener('message', messageHandler);
+            window.removeEventListener('message', statusHandler);
+            clearTimeout(timer);
+          };
+
+          window.addEventListener('message', messageHandler);
+          window.addEventListener('message', statusHandler);
+
+          // Inject a MAIN world script that:
+          // 1. Loads the video via player.loadVideoById()
+          // 2. Monitors player state
+          // 3. When PLAYING, forces captions module
+          // 4. Mutes audio first
+          const script = document.createElement('script');
+          script.textContent = `
+            (function() {
+              const videoId = '${videoId}';
+              const requestId = '${requestId}';
+
+              // Mute everything
+              document.querySelectorAll('video, audio').forEach(el => { el.muted = true; el.volume = 0; });
+
+              function waitForPlayer(retries) {
+                const player = document.getElementById('movie_player');
+                if (!player) {
+                  if (retries > 0) setTimeout(() => waitForPlayer(retries - 1), 500);
+                  return;
+                }
+
+                if (typeof player.loadVideoById !== 'function') {
+                  if (retries > 0) setTimeout(() => waitForPlayer(retries - 1), 500);
+                  return;
+                }
+
+                // Load the target video
+                try {
+                  player.loadVideoById({videoId: videoId, muted: true});
+                } catch(e) {
+                  try { player.loadVideoById(videoId); } catch(e2) {}
+                }
+
+                // Wait for PLAYING state, then trigger captions
+                let attempts = 0;
+                const captionsTimer = setInterval(() => {
+                  attempts++;
+                  try {
+                    const state = player.getPlayerState();
+                    if (state === 1) { // PLAYING
+                      clearInterval(captionsTimer);
+                      // Load captions module and toggle on
+                      if (typeof player.loadModule === 'function') {
+                        try { player.loadModule('captions'); } catch(e) {}
+                        try { player.loadModule('cc'); } catch(e) {}
+                      }
+                      // Toggle subtitles on
+                      if (typeof player.toggleSubtitles === 'function') {
+                        player.toggleSubtitles(true);
+                      }
+                      // Also try setting the caption track directly
+                      try {
+                        const tracks = player.getOption('captions', 'tracklist');
+                        if (tracks && tracks.length > 0) {
+                          player.setOption('captions', 'track', {languageCode: tracks[0].languageCode});
+                        }
+                      } catch(e) {}
+
+                      window.postMessage({
+                        type: 'COERCE_PLAYER_COMPLETE',
+                        requestId: requestId,
+                        videoId: videoId
+                      }, '*');
+                    }
+                  } catch(e) {
+                    if (attempts > 150) clearInterval(captionsTimer);
+                  }
+                }, 200);
+
+                // Also set a timeout for fallback (try the direct API approach)
+                setTimeout(() => {
+                  // If we haven't gotten to PLAYING yet, try to toggle captions anyway
+                  try {
+                    if (typeof player.toggleSubtitles === 'function') {
+                      player.toggleSubtitles(true);
+                    }
+                    if (typeof player.loadModule === 'function') {
+                      try { player.loadModule('captions'); } catch(e) {}
+                    }
+                  } catch(e) {}
+                }, 5000);
+              }
+
+              waitForPlayer(10);
+            })();
+          `;
+          (document.head || document.documentElement).appendChild(script);
+          script.remove();
+          log('Player coercion script injected');
+        });
+
+        if (result && result.length > 0) {
+          sendResponse({ success: true, result, logs });
+        } else {
+          sendResponse({ success: false, error: 'No transcript captured from player', logs });
+        }
       } catch (err) {
         log(`Error: ${err.message}`);
         sendResponse({ success: false, error: err.message, logs });
