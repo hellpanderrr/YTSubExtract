@@ -20,20 +20,21 @@ if (typeof window === 'undefined') {
   }
 }
 
-let innertube = null;
+// Don't cache the Innertube session — create fresh per call.
+// YouTube's /player response varies (sometimes includes captions, sometimes not)
+// depending on the session's visitorData/poToken state. A fresh session
+// with IOS client gives the best chance of getting caption data.
 
-async function getInnertube() {
-  if (!innertube) {
-    innertube = await Innertube.create({
-      lang: 'en',
-      location: 'US',
-      cache: new UniversalCache(false),
-      generate_session_locally: true,
-      device_category: 'desktop',
-      fetch: (input, init) => globalThis.fetch(input, init)
-    });
-  }
-  return innertube;
+async function createFreshSession(client = 'IOS') {
+  return await Innertube.create({
+    lang: 'en',
+    location: 'US',
+    cache: new UniversalCache(false),
+    generate_session_locally: true,
+    device_category: 'desktop',
+    client_type: client,
+    fetch: (input, init) => globalThis.fetch(input, init),
+  });
 }
 
 function parseXmlTranscript(xml) {
@@ -98,30 +99,91 @@ export async function fetchTier3Transcript(videoId, options = {}) {
         targetLang = options.targetLang || 'ru';
     }
 
-    const yt = await getInnertube();
+    const yt = await createFreshSession('IOS');
 
-    // First, try to get info with WEB client (full data including engagement panels).
-    // If WEB client stops returning caption tracks (PoToken enforcement), fall back to
-    // getBasicInfo with IOS client, which currently bypasses PoToken requirements.
+    // First, try IOS client for info (best for caption discovery).
     let info;
     try {
         info = await yt.getInfo(videoId);
     } catch (e) {
-        console.warn('Tier 3: getInfo (WEB) failed, trying getBasicInfo with IOS client', e);
+        console.warn('Tier 3: getInfo (IOS) failed, trying WEB', e.message);
         try {
-            info = await yt.getBasicInfo(videoId, { client: 'IOS' });
+            const yt2 = await createFreshSession('WEB');
+            info = await yt2.getInfo(videoId);
         } catch (e2) {
-            console.warn('Tier 3: getBasicInfo (IOS) also failed', e2);
+            console.warn('Tier 3: getInfo (WEB) also failed', e2.message);
             throw e2;
         }
     }
 
     // 1. Check for caption tracks (Innertube parsed or raw)
     let captionTracks = info.captions?.caption_tracks;
-    
+
     if (!captionTracks || captionTracks.length === 0) {
          // Fallback to raw player_response if Innertube didn't parse it
          captionTracks = info.player_response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    }
+
+    // 2. If Innertube still has no captions, try direct InnerTube API call
+    // with multiple clients. Sometimes one returns captions when others don't.
+    if (!captionTracks || captionTracks.length === 0) {
+        console.log('[Tier 3] No captions from Innertube, trying direct InnerTube API...');
+        const clientsToTry = [
+            { name: 'IOS', version: '20.46.2', id: '5', ua: 'com.google.ios.youtube/20.46.2 (iPhone17,2; iOS 18.4.1; scale/3.00)', extras: { osName: 'iOS', osVersion: '18.4.1.22E252', deviceMake: 'Apple', deviceModel: 'iPhone17,2' } },
+            { name: 'WEB', version: '2.20260428.00.00', id: '1', extras: {} },
+            { name: 'ANDROID', version: '21.16.256', id: '3', ua: 'com.google.android.youtube/21.16.256 (Linux; U; Android 15; US; Pixel 9 Build/AP4A.250205.002)', extras: { androidSdkVersion: 34 } },
+        ];
+
+        for (const client of clientsToTry) {
+            try {
+                const visitorData = Array.from({length: 11}, () =>
+                    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+                        .charAt(Math.floor(Math.random() * 63))
+                ).join('');
+
+                const playerPayload = {
+                    context: {
+                        client: {
+                            hl: 'en', gl: 'US',
+                            clientName: client.name,
+                            clientVersion: client.version,
+                            visitorData,
+                            ...client.extras,
+                        },
+                    },
+                    videoId,
+                    contentCheckOk: true,
+                    racyCheckOk: true,
+                    params: 'CgIQBg==',
+                };
+
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'X-Youtube-Client-Version': client.version,
+                    'X-Youtube-Client-Name': client.id,
+                    Origin: 'https://www.youtube.com',
+                    Referer: 'https://www.youtube.com/',
+                };
+                if (client.ua) headers['User-Agent'] = client.ua;
+
+                const resp = await fetch(
+                    'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+                    { method: 'POST', headers, body: JSON.stringify(playerPayload) }
+                );
+                if (resp.ok) {
+                    const data = await resp.json();
+                    const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+                        || data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
+                    if (raw?.length > 0) {
+                        captionTracks = raw;
+                        console.log(`[Tier 3] Found ${raw.length} caption tracks via direct ${client.name} API`);
+                        break;
+                    }
+                }
+            } catch (e) {
+                console.warn(`[Tier 3] Direct ${client.name} API failed:`, e.message);
+            }
+        }
     }
     
     if (captionTracks && captionTracks.length > 0) {
@@ -215,47 +277,61 @@ export async function fetchTier3Transcript(videoId, options = {}) {
 
 export async function getVideoMetadata(videoId) {
   try {
-    const yt = await getInnertube();
+    const yt = await createFreshSession('IOS');
     let info;
     try {
       info = await yt.getInfo(videoId);
     } catch (e) {
-      console.warn('Tier 3 Metadata: getInfo (WEB) failed, trying getBasicInfo with IOS client', e);
-      info = await yt.getBasicInfo(videoId, { client: 'IOS' });
+      console.warn('Tier 3 Metadata: getInfo (IOS) failed, trying WEB', e.message);
+      const yt2 = await createFreshSession('WEB');
+      info = await yt2.getInfo(videoId);
     }
 
-    // DEBUG: Log the full structure
     console.log('[Tier 3 Debug] info keys:', Object.keys(info || {}).join(', '));
-    console.log('[Tier 3 Debug] info.captions:', JSON.stringify(info.captions, null, 2));
+    console.log('[Tier 3 Debug] info.captions:', info.captions ? '(present)' : 'undefined');
     console.log('[Tier 3 Debug] info.basic_info:', JSON.stringify(info.basic_info, null, 2));
 
     let languages = [];
-    const captionTracks = info.captions?.caption_tracks;
+    let captionTracks = info.captions?.caption_tracks;
 
     if (captionTracks && captionTracks.length > 0) {
-        languages = captionTracks.map(track => ({
-            code: track.language_code,
-            name: track.name.text,
-            isAuto: track.kind === 'asr',
-            isTranslation: false
-        }));
-    } else {
-        // Fallback: Look for transcript engagement panel
-        console.log('Tier 3: No caption tracks, looking for transcript panel...');
-        if (info.engagement_panels) {
-            const transcriptPanel = info.engagement_panels.find(p => p.content?.model?.payload?.engagementPanelSearchableTranscriptRenderer);
-            
-            try {
-                languages.push({
-                    code: 'default', // Special code
-                    name: 'Default (Transcript)',
-                    isAuto: true,
-                    isTranslation: false
-                });
-            } catch (e) {
-                // ignore
+      languages = captionTracks.map(track => ({
+        code: track.language_code,
+        name: track.name?.text || track.language_code,
+        isAuto: track.kind === 'asr',
+        isTranslation: false
+      }));
+    }
+
+    // Direct API fallback if Innertube had no captions
+    if (!captionTracks || captionTracks.length === 0) {
+      console.log('[Tier 3 Metadata] No captions from Innertube, trying direct API...');
+      const clients = [
+        { name: 'IOS', version: '20.46.2', id: '5', extras: { osName: 'iOS', osVersion: '18.4.1.22E252', deviceMake: 'Apple', deviceModel: 'iPhone17,2' } },
+        { name: 'WEB', version: '2.20260428.00.00', id: '1', extras: {} },
+        { name: 'ANDROID', version: '21.16.256', id: '3', extras: { androidSdkVersion: 34 } },
+      ];
+      for (const c of clients) {
+        try {
+          const vd = Array.from({length: 11}, () =>
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.charAt(Math.floor(Math.random() * 63))
+          ).join('');
+          const resp = await fetch('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Version': c.version, 'X-Youtube-Client-Name': c.id, Origin: 'https://www.youtube.com', Referer: 'https://www.youtube.com/' },
+            body: JSON.stringify({ context: { client: { hl: 'en', gl: 'US', clientName: c.name, clientVersion: c.version, visitorData: vd, ...c.extras } }, videoId, contentCheckOk: true, racyCheckOk: true, params: 'CgIQBg==' }),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+            if (raw?.length > 0) {
+              languages = raw.map(track => ({ code: track.languageCode, name: track.name?.simpleText || track.languageCode, isAuto: track.kind === 'asr', isTranslation: false }));
+              console.log(`[Tier 3 Metadata] Found ${languages.length} languages via direct ${c.name} API`);
+              break;
             }
-        }
+          }
+        } catch (e) { /* skip */ }
+      }
     }
 
     // Sort: manual first, then auto-generated
@@ -265,7 +341,7 @@ export async function getVideoMetadata(videoId) {
     });
 
     return {
-      title: info.basic_info.title,
+      title: info.basic_info?.title || '',
       languages
     };
   } catch (error) {

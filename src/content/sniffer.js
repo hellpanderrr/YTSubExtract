@@ -23,7 +23,7 @@
     // Check if we're in an iframe
     const isInIframe = window !== window.top;
 
-    // Extract videoId, lang from timedtext URL
+    // Extract videoId, lang, pot token from timedtext URL
     function parseTimedTextUrl(url) {
         try {
             const urlObj = new URL(url, 'https://www.youtube.com');
@@ -33,6 +33,8 @@
             const hl = urlObj.searchParams.get('hl');
             const caps = urlObj.searchParams.get('caps');
             const kind = urlObj.searchParams.get('kind');
+            const pot = urlObj.searchParams.get('pot');
+            const visitorData = urlObj.searchParams.get('id') || urlObj.searchParams.get('visitor_data') || null;
 
             let finalLang = lang;
             if (!finalLang) {
@@ -43,7 +45,7 @@
                 }
             }
 
-            return { videoId, lang: finalLang, tlang, url };
+            return { videoId, lang: finalLang, tlang, url, pot, visitorData };
         } catch (e) {
             return null;
         }
@@ -54,17 +56,23 @@
         const parsed = parseTimedTextUrl(url);
         if (!parsed || !parsed.videoId) return;
 
-        const { videoId, lang } = parsed;
+        const { videoId, lang, pot, visitorData } = parsed;
 
         window.postMessage({
             type: 'YTSUB_CAPTURED_URL',
             videoId,
             lang: lang || 'unknown',
             url,
+            pot: pot || null,
+            visitorData: visitorData || null,
             timestamp: Date.now()
         }, '*');
 
-        console.log(`[YTSub Sniffer] Captured URL: video=${videoId}, lang=${lang || 'unknown'}`);
+        if (pot) {
+            console.log(`[YTSub Sniffer] Captured URL with PoToken: video=${videoId}, lang=${lang || 'unknown'}`);
+        } else {
+            console.log(`[YTSub Sniffer] Captured URL: video=${videoId}, lang=${lang || 'unknown'}`);
+        }
     }
 
     // Save captured transcript body and relay to parent
