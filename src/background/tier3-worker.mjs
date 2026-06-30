@@ -125,64 +125,71 @@ export async function fetchTier3Transcript(videoId, options = {}) {
     }
 
     // 2. If Innertube still has no captions, try direct InnerTube API call
-    // with multiple clients. Sometimes one returns captions when others don't.
+    // with multiple clients AND retries. YouTube's /player response is
+    // non-deterministic: sometimes it returns full captions alongside
+    // LOGIN_REQUIRED, sometimes a stripped response without captions.
+    // Retrying with fresh visitorData increases hit rate.
     if (!captionTracks || captionTracks.length === 0) {
-        console.log('[Tier 3] No captions from Innertube, trying direct InnerTube API...');
+        console.log('[Tier 3] No captions from Innertube, trying direct InnerTube API (with retries)...');
         const clientsToTry = [
             { name: 'IOS', version: '20.46.2', id: '5', ua: 'com.google.ios.youtube/20.46.2 (iPhone17,2; iOS 18.4.1; scale/3.00)', extras: { osName: 'iOS', osVersion: '18.4.1.22E252', deviceMake: 'Apple', deviceModel: 'iPhone17,2' } },
             { name: 'WEB', version: '2.20260428.00.00', id: '1', extras: {} },
             { name: 'ANDROID', version: '21.16.256', id: '3', ua: 'com.google.android.youtube/21.16.256 (Linux; U; Android 15; US; Pixel 9 Build/AP4A.250205.002)', extras: { androidSdkVersion: 34 } },
         ];
 
+        // Try each client up to 3 times with different visitorData
         for (const client of clientsToTry) {
-            try {
-                const visitorData = Array.from({length: 11}, () =>
-                    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-                        .charAt(Math.floor(Math.random() * 63))
-                ).join('');
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    const visitorData = Array.from({length: 11}, () =>
+                        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+                            .charAt(Math.floor(Math.random() * 63))
+                    ).join('');
 
-                const playerPayload = {
-                    context: {
-                        client: {
-                            hl: 'en', gl: 'US',
-                            clientName: client.name,
-                            clientVersion: client.version,
-                            visitorData,
-                            ...client.extras,
+                    const playerPayload = {
+                        context: {
+                            client: {
+                                hl: 'en', gl: 'US',
+                                clientName: client.name,
+                                clientVersion: client.version,
+                                visitorData,
+                                ...client.extras,
+                            },
                         },
-                    },
-                    videoId,
-                    contentCheckOk: true,
-                    racyCheckOk: true,
-                    params: 'CgIQBg==',
-                };
+                        videoId,
+                        contentCheckOk: true,
+                        racyCheckOk: true,
+                        params: 'CgIQBg==',
+                    };
 
-                const headers = {
-                    'Content-Type': 'application/json',
-                    'X-Youtube-Client-Version': client.version,
-                    'X-Youtube-Client-Name': client.id,
-                    Origin: 'https://www.youtube.com',
-                    Referer: 'https://www.youtube.com/',
-                };
-                if (client.ua) headers['User-Agent'] = client.ua;
+                    const headers = {
+                        'Content-Type': 'application/json',
+                        'X-Youtube-Client-Version': client.version,
+                        'X-Youtube-Client-Name': client.id,
+                        Origin: 'https://www.youtube.com',
+                        Referer: 'https://www.youtube.com/',
+                    };
+                    if (client.ua) headers['User-Agent'] = client.ua;
 
-                const resp = await fetch(
-                    'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
-                    { method: 'POST', headers, body: JSON.stringify(playerPayload) }
-                );
-                if (resp.ok) {
-                    const data = await resp.json();
-                    const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
-                        || data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
-                    if (raw?.length > 0) {
-                        captionTracks = raw;
-                        console.log(`[Tier 3] Found ${raw.length} caption tracks via direct ${client.name} API`);
-                        break;
+                    const resp = await fetch(
+                        'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
+                        { method: 'POST', headers, body: JSON.stringify(playerPayload) }
+                    );
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+                            || data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
+                        if (raw?.length > 0) {
+                            captionTracks = raw;
+                            console.log(`[Tier 3] Found ${raw.length} caption tracks via direct ${client.name} API (attempt ${attempt + 1})`);
+                            break;
+                        }
                     }
+                } catch (e) {
+                    console.warn(`[Tier 3] Direct ${client.name} API attempt ${attempt + 1} failed:`, e.message);
                 }
-            } catch (e) {
-                console.warn(`[Tier 3] Direct ${client.name} API failed:`, e.message);
             }
+            if (captionTracks?.length > 0) break;
         }
     }
     
@@ -303,34 +310,37 @@ export async function getVideoMetadata(videoId) {
       }));
     }
 
-    // Direct API fallback if Innertube had no captions
+    // Direct API fallback if Innertube had no captions (with retries)
     if (!captionTracks || captionTracks.length === 0) {
-      console.log('[Tier 3 Metadata] No captions from Innertube, trying direct API...');
+      console.log('[Tier 3 Metadata] No captions from Innertube, trying direct API (with retries)...');
       const clients = [
         { name: 'IOS', version: '20.46.2', id: '5', extras: { osName: 'iOS', osVersion: '18.4.1.22E252', deviceMake: 'Apple', deviceModel: 'iPhone17,2' } },
         { name: 'WEB', version: '2.20260428.00.00', id: '1', extras: {} },
         { name: 'ANDROID', version: '21.16.256', id: '3', extras: { androidSdkVersion: 34 } },
       ];
       for (const c of clients) {
-        try {
-          const vd = Array.from({length: 11}, () =>
-            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.charAt(Math.floor(Math.random() * 63))
-          ).join('');
-          const resp = await fetch('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Version': c.version, 'X-Youtube-Client-Name': c.id, Origin: 'https://www.youtube.com', Referer: 'https://www.youtube.com/' },
-            body: JSON.stringify({ context: { client: { hl: 'en', gl: 'US', clientName: c.name, clientVersion: c.version, visitorData: vd, ...c.extras } }, videoId, contentCheckOk: true, racyCheckOk: true, params: 'CgIQBg==' }),
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-            if (raw?.length > 0) {
-              languages = raw.map(track => ({ code: track.languageCode, name: track.name?.simpleText || track.languageCode, isAuto: track.kind === 'asr', isTranslation: false }));
-              console.log(`[Tier 3 Metadata] Found ${languages.length} languages via direct ${c.name} API`);
-              break;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const vd = Array.from({length: 11}, () =>
+              'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.charAt(Math.floor(Math.random() * 63))
+            ).join('');
+            const resp = await fetch('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Version': c.version, 'X-Youtube-Client-Name': c.id, Origin: 'https://www.youtube.com', Referer: 'https://www.youtube.com/' },
+              body: JSON.stringify({ context: { client: { hl: 'en', gl: 'US', clientName: c.name, clientVersion: c.version, visitorData: vd, ...c.extras } }, videoId, contentCheckOk: true, racyCheckOk: true, params: 'CgIQBg==' }),
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+              if (raw?.length > 0) {
+                languages = raw.map(track => ({ code: track.languageCode, name: track.name?.simpleText || track.languageCode, isAuto: track.kind === 'asr', isTranslation: false }));
+                console.log(`[Tier 3 Metadata] Found ${languages.length} languages via direct ${c.name} API (attempt ${attempt + 1})`);
+                break;
+              }
             }
-          }
-        } catch (e) { /* skip */ }
+          } catch (e) { /* skip */ }
+        }
+        if (languages.length > 0) break;
       }
     }
 
