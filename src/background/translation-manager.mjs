@@ -1342,7 +1342,10 @@ export class TranslationManager {
         
         const result = await getSubtitles({
           videoID: videoId,
-          lang: sourceLang !== 'auto' ? sourceLang : 'en',
+          // Pass 'auto' through: getSubtitles already resolves it to the first
+          // available track. Substituting 'en' here made videos whose only
+          // captions are in another language fail with "Language en not found".
+          lang: sourceLang,
           translate: translate,
           translateLang: translate ? targetLang : undefined
         });
@@ -1908,7 +1911,9 @@ export class TranslationManager {
       
       const result = await getSubtitles({
         videoID: videoId,
-        lang: sourceLang !== 'auto' ? sourceLang : 'en',
+        // Pass 'auto' through: getSubtitles resolves it to the first available
+        // track. Substituting 'en' broke videos whose captions are not English.
+        lang: sourceLang,
         translate: translate,
         translateLang: translate ? targetLang : undefined
       });

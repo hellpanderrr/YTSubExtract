@@ -103,6 +103,19 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   see the playlist entry below). Check whether the language dropdown populated
   before suspecting the harness.
 
+- **Playlist batch download silently failed for every video whose captions are
+  not English.** The popup's playlist language dropdown defaults to "Auto (first
+  available)", and the background converted that `'auto'` to `'en'` before
+  calling `getSubtitles` (`translation-manager.mjs`, both the Tier 1 and Tier 1
+  Fallback call sites). `getSubtitles` already resolves `'auto'` to
+  `captionTracks[0]`, so the substitution made it hunt for a track the video does
+  not have and fail with "Language en not found". Every API tier then reported a
+  failure and the ZIP contained only `_errors.txt`. Single-video mode was
+  unaffected because the popup resolves a concrete language first — which is why
+  the *same video* downloaded fine one way and failed the other. Fixed by passing
+  `sourceLang` through unchanged. Symptom to recognize: batch ZIP contains only
+  `_errors.txt` while single-video works on the same video.
+
 - **Playlist URLs whose videos lack accessible captions fail every extraction
   tier** (PoToken/BotGuard). Tier 0 (Android) → 0.1 (/next) → 3 (youtubei.js) →
   1 (InnerTube) → 1.5 (embed) → 2C (tab nav) → 0.5 Auth all reported failures for

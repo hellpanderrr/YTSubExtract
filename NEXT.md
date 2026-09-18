@@ -3,9 +3,13 @@
 _Updated 2026-09-18 — branch playlist-download_
 
 ## State
-The e2e suite is green end-to-end: **8 passed, 1 skipped, exit 0** (verified
-twice). The skipped spec is `private-playlist`, which needs a one-time login.
-The blocker that consumed this session was **not** a code bug — see Open threads.
+The e2e suite is green end-to-end: **7-8 passed, 1 skipped, exit 0**, including
+batch ZIP download of real subtitles. A real product bug was found and fixed:
+playlist batch download failed for every video whose captions are not English,
+because the background converted the dropdown's "auto" to "en" before calling
+`getSubtitles` (which already resolves "auto" itself). Single-video mode was
+unaffected, so the same video worked one way and failed the other. Fixed in
+`translation-manager.mjs` (both Tier 1 call sites); see docs/LESSONS.md.
 
 ## Open threads
 - **Log in to enable `private-playlist`.** Run `npm run e2e:login`, sign in, then
@@ -18,10 +22,8 @@ The blocker that consumed this session was **not** a code bug — see Open threa
 - **Single-video flaked once in ~4 runs** (a retry rescued it). Not investigated;
   `retries: 1` covers it. If it becomes frequent, check whether it is the native
   startup crash (`DEBUG=pw:browser`) or "SRT button never enabled" (BotGuard).
-- **Batch ZIP verifies the mechanism, not subtitles.** The test playlist's videos
-  lack accessible captions, so the ZIP contains only `_errors.txt`. To assert
-  real subtitle output, point `E2E_BATCH_URL` at a playlist with captions and set
-  `E2E_BATCH_EXPECT_SUCCESS=1`.
+- **Batch ZIP now produces real subtitles**, so `E2E_BATCH_EXPECT_SUCCESS=1` can
+  be set to require every selected video to succeed (verified with 3 videos).
 
 ## Running / unfinished
 - Nothing running in background. No stray Chromium processes hold the profile.
