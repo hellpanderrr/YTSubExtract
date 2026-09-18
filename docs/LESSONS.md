@@ -115,10 +115,18 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   the *same video* downloaded fine one way and failed the other. Fixed by passing
   `sourceLang` through unchanged. Symptom to recognize: batch ZIP contains only
   `_errors.txt` while single-video works on the same video.
+  ✅ enforced by `e2e/batch-download.spec.mjs` with `E2E_BATCH_EXPECT_SUCCESS=1`,
+  which requires a real subtitle file per selected video (not just an
+  accounted-for entry in `_errors.txt`).
 
 - **Playlist URLs whose videos lack accessible captions fail every extraction
   tier** (PoToken/BotGuard). Tier 0 (Android) → 0.1 (/next) → 3 (youtubei.js) →
   1 (InnerTube) → 1.5 (embed) → 2C (tab nav) → 0.5 Auth all reported failures for
-  such videos; the pipeline is working, the content is simply unavailable. Batch
-  tests should assert the mechanism (every selected video is accounted for, as a
-  subtitle file or in `_errors.txt`), not that every download succeeds.
+  such videos; the pipeline is working, the content is simply unavailable.
+  **Caution (2026-09-18):** a "every video is accounted for" assertion is too
+  weak — it passes just as happily when *all* videos fail, which is exactly how
+  the `'auto'`→`'en'` bug above hid for a whole session (a green suite reported
+  batch as working while every download failed). The default batch spec still
+  asserts accounting so it survives caption-less playlists, but run it at least
+  once with `E2E_BATCH_EXPECT_SUCCESS=1` on a captioned playlist before trusting
+  batch at all.
