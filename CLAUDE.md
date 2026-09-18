@@ -12,14 +12,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### E2E tests (Playwright, headless)
 
-- `npm run e2e:login` — ONE-TIME: opens a window to sign into YouTube in the
-  dedicated `.e2e-profile/`. Required for login-gated specs; they skip without it.
+- `npm run e2e:login` — ONE-TIME: opens a window to sign into YouTube, writing a
+  golden profile at `.e2e-profile-golden/` (each run copies it). Required for
+  login-gated specs; they skip without it.
 - `npm run e2e` — build, then run the whole suite
 - `npm run e2e:smoke` — harness self-test only (no YouTube content needed)
 - `npm run e2e:headed` — run with a visible browser
 
+The test browser reaches YouTube through the system proxy — if that proxy is
+down, youtube.com fails with `net::ERR_CONNECTION_CLOSED` (which looks like a
+harness crash) while other sites load fine. Check the proxy before a run.
+
 Specs live in `e2e/`; see `e2e/README.md` for env vars and per-spec coverage.
-Known-unresolved issues with this harness are logged in `docs/LESSONS.md`.
+Harness gotchas and dead ends are logged in `docs/LESSONS.md`.
 
 ## Project Structure
 

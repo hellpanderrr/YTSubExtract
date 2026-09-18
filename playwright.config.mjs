@@ -21,7 +21,12 @@ export default defineConfig({
   timeout: 600_000,
   expect: { timeout: 15_000 },
 
-  retries: process.env.CI ? 1 : 0,
+  // Headless Chromium with an extension intermittently dies at startup on
+  // Windows with a native crash (0xC0000005 / 0x80000003) under memory
+  // pressure. These are browser-process faults, not test failures — a retry
+  // tears down the worker and relaunches the browser, which clears them. One
+  // retry is enough; a genuine product failure still fails the second attempt.
+  retries: 1,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : [['list']],
 
   use: {

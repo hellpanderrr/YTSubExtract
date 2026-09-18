@@ -16,6 +16,7 @@ import {
   waitForZipDownload,
   clearDownloads,
   resetDownloadProgress,
+  eraseDownloadHistory,
 } from './helpers.mjs';
 import { unzipSync } from 'fflate';
 import fs from 'fs';
@@ -31,6 +32,7 @@ test.describe('batch ZIP download', () => {
     // A previous interrupted batch leaves `running` progress in storage, which
     // makes the popup restore it and keep Download ZIP disabled.
     await resetDownloadProgress(context);
+    await eraseDownloadHistory(context);
   });
 
   test(`downloads a ZIP with subtitle files for ${LIMIT} selected videos`, async ({

@@ -1,9 +1,11 @@
 /**
  * One-time YouTube login for the e2e suite.
  *
- * Opens a HEADED browser using the same persistent profile the headless tests
- * use (.e2e-profile/). Sign into YouTube in that window; cookies persist in the
- * profile directory, so every later `npm run e2e` run starts signed in.
+ * Opens a HEADED browser using the golden profile
+ * (.e2e-profile-golden/). Sign into YouTube in that window; cookies persist in
+ * the profile directory, and every `npm run e2e` run starts from a fresh COPY of
+ * it. That copy step is deliberate: reusing one profile in place made a warm
+ * profile fail where a fresh copy passed (see docs/LESSONS.md).
  *
  * Why not reuse the real Chrome profile: Chrome refuses to launch with a profile
  * that is already open, and the raw profile is large. A dedicated test profile is
@@ -19,7 +21,7 @@ import readline from 'readline';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const PROFILE_DIR = path.resolve(ROOT, '.e2e-profile');
+const PROFILE_DIR = path.resolve(ROOT, '.e2e-profile-golden');
 const EXTENSION_DIR = path.resolve(ROOT, 'dist');
 
 const AUTH_COOKIES = ['__Secure-1PSID', 'SAPISID', 'SID', '__Secure-3PSID'];

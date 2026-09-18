@@ -1,8 +1,8 @@
 # E2E test suite
 
 Headless Playwright tests that load the built extension into a real Chromium and
-drive its popup against live YouTube. Uses a dedicated browser profile
-(`.e2e-profile/`), never your everyday Chrome profile.
+drive its popup against live YouTube. Uses dedicated browser profiles, never
+your everyday Chrome profile.
 
 ## One-time setup
 
@@ -10,13 +10,26 @@ drive its popup against live YouTube. Uses a dedicated browser profile
 npm run e2e:login     # opens a window; sign into YouTube, then press Enter
 ```
 
+This writes a **golden profile** to `.e2e-profile-golden/`. Each test run copies
+it to a throwaway `.e2e-profile/` so every run starts from the same clean,
+signed-in state (a reused profile was observed to fail where a fresh copy
+passed). Headless re-login is impossible, so the golden copy is the only way to
+keep the session.
+
 Google blocks sign-in from automated browsers, and YouTube's auth cookies
 (`__Secure-1PSID`, `SAPISID`, `SID`) are HttpOnly, so neither scripted login nor
-`document.cookie` can capture them. Signing in manually once into the dedicated
-profile is the only reliable route. The cookies persist, so every later headless
-run starts signed in.
+`document.cookie` can capture them. Signing in manually once is the only
+reliable route.
 
-Tests that need login **skip** (not fail) when the profile isn't signed in.
+Tests that need login **skip** (not fail) when no golden profile exists.
+
+## Prerequisite: the system proxy must be up
+
+The test browser reaches YouTube through your system proxy. If that proxy is
+down or disabled, `www.youtube.com` fails with `net::ERR_CONNECTION_CLOSED`
+while other sites load — which looks like a harness crash but is the network.
+`curl` may still work (it can go direct while Chromium honours the configured
+proxy), so do not trust curl here. Check the proxy is running before a suite run.
 
 ## Running
 

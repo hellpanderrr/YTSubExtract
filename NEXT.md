@@ -3,43 +3,43 @@
 _Updated 2026-09-18 — branch playlist-download_
 
 ## State
-Built a headless Playwright e2e suite for the extension (`e2e/`,
-`playwright.config.mjs`). Harness, playlist-listing and smoke specs pass green
-(verified exit 0). Single-video and batch download specs are written but the
-download-capture path is **not yet reliable** — see Open threads.
+The e2e suite is green end-to-end: **8 passed, 1 skipped, exit 0** (verified
+twice). The skipped spec is `private-playlist`, which needs a one-time login.
+The blocker that consumed this session was **not** a code bug — see Open threads.
 
 ## Open threads
-- **Fix download capture for single-video specs.** Currently fails with
-  `Download interrupted: CRASH ()`. Start from `e2e/helpers.mjs`
-  (`waitForFileDownloaded` / `classifyDownload`) and the fixture in
-  `e2e/fixtures.mjs`. Verify with:
-  `E2E_VIDEO_URL="https://www.youtube.com/watch?v=KkOY9Arrg1Y" npx playwright test e2e/single-video.spec.mjs`
-- **Re-verify batch ZIP spec** once download capture works:
-  `E2E_BATCH_URL="https://www.youtube.com/playlist?list=PLQXk9_XDN67Ig46GNQt11mzHCfZ6JSjar" E2E_BATCH_LIMIT=2 npx playwright test e2e/batch-download.spec.mjs`
-- **Verify the private-playlist spec against a real login.** It currently skips
-  because `.e2e-profile/` is not signed in. Run `npm run e2e:login`, sign in,
-  then confirm `private-playlist.spec.mjs` passes rather than skips.
-- **Update `e2e/README.md`** if the download approach changes (it documents the
-  current design and the two download paths).
+- **Log in to enable `private-playlist`.** Run `npm run e2e:login`, sign in, then
+  confirm `private-playlist.spec.mjs` passes rather than skips. This writes
+  `.e2e-profile-golden/`; every run copies it.
+- **The system proxy must be running** before any suite run. If it is down,
+  youtube.com fails with `net::ERR_CONNECTION_CLOSED` while other sites load —
+  it looks like a crash but is the network. `curl` keeps working, so don't trust
+  it as a check.
+- **Single-video flaked once in ~4 runs** (a retry rescued it). Not investigated;
+  `retries: 1` covers it. If it becomes frequent, check whether it is the native
+  startup crash (`DEBUG=pw:browser`) or "SRT button never enabled" (BotGuard).
+- **Batch ZIP verifies the mechanism, not subtitles.** The test playlist's videos
+  lack accessible captions, so the ZIP contains only `_errors.txt`. To assert
+  real subtitle output, point `E2E_BATCH_URL` at a playlist with captions and set
+  `E2E_BATCH_EXPECT_SUCCESS=1`.
 
 ## Running / unfinished
-- Nothing running in background. `test-results/` and `.e2e-downloads/` hold
-  stale output from failed runs; both are gitignored.
-- `npm run e2e:login` has never been completed — the profile has 6 anonymous
-  cookies and no auth cookies, so every login-gated spec skips.
+- Nothing running in background. No stray Chromium processes hold the profile.
+- `.e2e-profile-golden/` does **not** exist yet — login has never been completed,
+  so `private-playlist` always skips.
 
 ## Don't redo
-- **Do not add CDP `Browser.setDownloadBehavior` to the fixture.** It produces
-  `Download interrupted: CRASH ()`; tried and reverted. Logged in
-  `docs/LESSONS.md`.
-- **Do not launch the persistent context per test.** It causes intermittent
-  Chromium `STATUS_BREAKPOINT` crashes; the fixture is deliberately
-  worker-scoped.
-- **Do not assert that every playlist video downloads successfully.** Some
-  videos have no reachable captions (PoToken/BotGuard) and fail all tiers by
-  design. The batch spec asserts every selected video is *accounted for*
-  (subtitle file or `_errors.txt`).
+- **Do not chase "youtube.com fails but the browser is fine" as a harness bug.**
+  That was a disabled system proxy. Diagnose in one step: `goto` youtube.com AND
+  example.com in a test body. example.com OK + youtube.com failing = network.
+- **Do not launch the persistent context per test.** `context.close()` does not
+  synchronously release the profile's `SingletonLock` on Windows; the browser is
+  deliberately worker-scoped.
+- **Do not add `--disable-software-rasterizer`.** With `--disable-gpu` it removes
+  every raster path and caused more crashes, not fewer.
+- **The original `Download interrupted: CRASH` was a harness bug, now fixed.**
+  `chrome.downloads.search` returns the whole profile's history including stale
+  interrupted entries; `waitForFileDownloaded` now baselines on the max id at
+  entry and only fails on downloads this run started.
 - **`scripts/test-batch.js` and `scripts/login.js` are superseded** by `e2e/`.
-  They are stale (wrong popup URL; HttpOnly cookies make the paste flow a no-op).
-- Do not run the full suite against the whole codebase's uncommitted files —
-  only `e2e/` and `playwright.config.mjs` are this session's work.
+- Full history of dead ends is in `docs/LESSONS.md`.

@@ -4,9 +4,9 @@
 import fs from 'fs';
 import path from 'path';
 import { expect } from '@playwright/test';
-import { DOWNLOAD_DIR, PROFILE_DIR } from './fixtures.mjs';
+import { DOWNLOAD_DIR, PROFILE_DIR, GOLDEN_PROFILE_DIR } from './fixtures.mjs';
 
-export { DOWNLOAD_DIR, PROFILE_DIR };
+export { DOWNLOAD_DIR, PROFILE_DIR, GOLDEN_PROFILE_DIR };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -31,7 +31,7 @@ export async function requireLogin(context, test) {
   test.skip(
     true,
     'Not signed into YouTube in the e2e profile — run `npm run e2e:login` once ' +
-    `(profile: ${PROFILE_DIR}).`
+    `(golden profile: ${GOLDEN_PROFILE_DIR}).`
   );
 }
 
@@ -203,39 +203,78 @@ export async function waitForDownload(context, predicate, timeout = 300_000) {
  * Chromium crashes the transfer ("Download interrupted: CRASH") when the
  * extension popup page is torn down mid-download under an explicit CDP path.
  */
+/** Read the profile's current downloads via the extension's own API. */
+async function searchDownloads(context) {
+  const sw = await getServiceWorker(context);
+  if (!sw) return [];
+  try {
+    return await sw.evaluate(async () => {
+      const list = await chrome.downloads.search({ limit: 50, orderBy: ['-startTime'] });
+      return list.map((d) => ({
+        id: d.id,
+        state: d.state,
+        filename: d.filename,
+        exists: d.exists,
+        error: d.error,
+      }));
+    });
+  } catch {
+    // Service worker went idle mid-poll; retry on the next tick.
+    return [];
+  }
+}
+
 export async function waitForFileDownloaded(context, predicate, timeout = 300_000) {
   const deadline = Date.now() + timeout;
   const seen = [];
 
-  while (Date.now() < deadline) {
-    const sw = await getServiceWorker(context);
-    if (sw) {
-      let items = [];
-      try {
-        items = await sw.evaluate(async () => {
-          const list = await chrome.downloads.search({ limit: 20, orderBy: ['-startTime'] });
-          return list.map((d) => ({
-            state: d.state,
-            filename: d.filename,
-            exists: d.exists,
-            error: d.error,
-          }));
-        });
-      } catch {
-        // Service worker went idle mid-poll; retry on the next tick.
-      }
+  // chrome.downloads.search returns the WHOLE persistent profile's history,
+  // including stale `interrupted`/CRASH entries from earlier runs (they carry an
+  // empty filename). Throwing on those would reject this run's own success.
+  //
+  // Callers invoke this BEFORE triggering the download, so the set of ids
+  // present here predates ours. Capture the max and freeze it: any new id is
+  // ours. Capturing on a later poll would be wrong — our own in-flight download
+  // would already be in the list and get absorbed into the baseline.
+  //
+  // If the service worker is momentarily unavailable the entry search can come
+  // back empty. Retry until we have a usable baseline rather than proceeding
+  // with `null`, which would re-enable the stale-history false failure below.
+  let baselineId = null;
+  const baselineDeadline = Date.now() + 30_000;
+  while (baselineId === null && Date.now() < baselineDeadline) {
+    const initial = await searchDownloads(context);
+    if (initial.length > 0) {
+      baselineId = Math.max(...initial.map((d) => d.id));
+      break;
+    }
+    await sleep(500);
+  }
 
-      for (const item of items) {
+  while (Date.now() < deadline) {
+    const items = await searchDownloads(context);
+
+    for (const item of items) {
+      // A completed file is always eligible: a prior run's success must not
+      // mask ours, and the baseline must not gate a file that already landed.
+      if (item.state === 'complete') {
         if (item.filename && !seen.includes(item.filename)) seen.push(item.filename);
-        if (item.state === 'interrupted') {
-          throw new Error(`Download interrupted: ${item.error} (${item.filename})`);
-        }
-        if (item.state === 'complete' && item.exists && fs.existsSync(item.filename)) {
+        if (item.exists && item.filename && fs.existsSync(item.filename)) {
           const kind = classifyDownload(item.filename);
           if (kind && predicate(kind)) return item.filename;
         }
+        continue;
+      }
+      // Ids at or below the baseline predate this call — stale history.
+      if (baselineId !== null && item.id <= baselineId) continue;
+      if (item.filename && !seen.includes(item.filename)) seen.push(item.filename);
+      if (item.state === 'interrupted') {
+        // A download this run started failed — surface it immediately rather
+        // than burning the full timeout.
+        throw new Error(`Download interrupted: ${item.error} (${item.filename || 'no path'})`);
       }
     }
+
     await sleep(500);
   }
 
@@ -243,6 +282,21 @@ export async function waitForFileDownloaded(context, predicate, timeout = 300_00
     `No matching download within ${timeout}ms.\n` +
     `Files seen: ${seen.join(', ') || '(none)'}`
   );
+}
+
+/**
+ * Erase the profile's download history.
+ *
+ * Runs must not inherit stale `interrupted`/`CRASH` entries from prior failed
+ * runs — they are indistinguishable from this run's failures by state alone.
+ * Safe here because the profile is dedicated to e2e.
+ */
+export async function eraseDownloadHistory(context) {
+  const sw = await getServiceWorker(context);
+  if (!sw) return;
+  await sw.evaluate(async () => {
+    await chrome.downloads.erase({});
+  }).catch(() => {});
 }
 
 /**

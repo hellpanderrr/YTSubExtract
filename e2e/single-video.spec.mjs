@@ -10,6 +10,7 @@ import {
   waitForSingleVideoReady,
   waitForDownload,
   clearDownloads,
+  eraseDownloadHistory,
 } from './helpers.mjs';
 import fs from 'fs';
 
@@ -18,7 +19,10 @@ const VIDEO_URL = process.env.E2E_VIDEO_URL;
 test.describe('single video download', () => {
   test.skip(!VIDEO_URL, 'Set E2E_VIDEO_URL to a video with captions to run this test.');
 
-  test.beforeEach(() => clearDownloads());
+  test.beforeEach(async ({ context }) => {
+    clearDownloads();
+    await eraseDownloadHistory(context);
+  });
 
   test('fetches languages and downloads an SRT', async ({ context, extensionId }) => {
     const yt = await context.newPage();

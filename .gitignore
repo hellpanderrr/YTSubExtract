@@ -6,8 +6,9 @@ builds/
 .DS_Store
 *.log
 
-# e2e test artifacts — the profile holds live YouTube session cookies
+# e2e test artifacts — the profiles hold live YouTube session cookies
 .e2e-profile/
+.e2e-profile-golden/
 .e2e-downloads/
 .session-cookies.json
 logs/
