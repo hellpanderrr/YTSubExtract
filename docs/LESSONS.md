@@ -130,3 +130,21 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   asserts accounting so it survives caption-less playlists, but run it at least
   once with `E2E_BATCH_EXPECT_SUCCESS=1` on a captioned playlist before trusting
   batch at all.
+
+- **Tier 0.5's DOM playlist selectors were stale and matched nothing.** YouTube
+  now renders playlist rows as `yt-lockup-view-model` (title in
+  `yt-lockup-metadata-view-model h3`, duration in
+  `yt-thumbnail-bottom-overlay-view-model`); the old `ytd-playlist-video-renderer`
+  elements are no longer emitted. A live playlist page returned **0** hits for
+  every selector in the list, so the tier silently reported "No videos found in
+  DOM" and the flow always fell through to the API path — which is why the
+  breakage was invisible on public playlists (the API fallback covered for it)
+  and only bit private ones like LL, where the API path is the one that fails.
+  Symptom to recognize: a private playlist never loads, yet the same page's
+  `ytInitialData` clearly contains videos. Fix: add the lockup selector (scoped
+  to `ytd-browse[page-subtype="playlist"]` first) and parse `h3` /
+  bottom-overlay for title and duration. Verify a DOM tier by sending its
+  content-script message directly from the service worker
+  (`chrome.tabs.sendMessage(tab.id, {type:'GET_PLAYLIST_VIDEOS_FROM_DOM', ...})`)
+  — the popup's "Loaded N videos" can be satisfied by the API fallback and does
+  not prove the DOM path ran at all.

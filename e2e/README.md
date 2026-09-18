@@ -59,6 +59,7 @@ when its variable is unset.
 | `E2E_BATCH_URL` | batch-download | Falls back to `E2E_PLAYLIST_URL` |
 | `E2E_BATCH_LIMIT` | batch-download | How many videos to download (default 3) |
 | `E2E_BATCH_EXPECT_SUCCESS` | batch-download | Set to `1` to require every video to succeed |
+| `E2E_LL_EXPECT_SUCCESS` | private-playlist | Set to `0` to accept an accounted-for LL failure (default: require a real subtitle) |
 | `E2E_HEADED` | all | Set to `1` for a visible browser |
 
 Example:
@@ -75,7 +76,7 @@ npm run e2e
 |---|---|
 | `smoke.spec.mjs` | Harness self-test: extension loads, SW registers, popup reaches ready |
 | `playlist-listing.spec.mjs` | Public playlist loads; select-all toggles rows |
-| `private-playlist.spec.mjs` | Liked Videos (`LL`) via the credentialed-fetch fallback |
+| `private-playlist.spec.mjs` | Liked Videos (`LL`): listing via the credentialed-fetch fallback, and a batch ZIP producing a real subtitle |
 | `single-video.spec.mjs` | Language dropdown populates; SRT and VTT download with valid content |
 | `batch-download.spec.mjs` | Batch ZIP lands with one file per video (or an error report) |
 

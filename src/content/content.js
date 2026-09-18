@@ -1169,11 +1169,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         log(`Extracting videos for playlist: ${listId}`);
 
-        // Try multiple selectors for playlist video items
+        // Try multiple selectors for playlist video items.
+        // `yt-lockup-view-model` is the current (2026) structure YouTube renders
+        // playlist rows with; the older `ytd-playlist-video-renderer` elements
+        // are no longer emitted, so without it this tier matched nothing.
         const selectors = [
           'ytd-playlist-video-renderer',
           'ytd-playlist-panel-video-renderer',
           '.ytd-playlist-video-list-renderer > .ytd-playlist-video-renderer',
+          // Scope the lockup selector to the playlist browse container first, so
+          // unrelated lockups (recommendations, shelves) are not swept in.
+          'ytd-browse[page-subtype="playlist"] yt-lockup-view-model',
+          'yt-lockup-view-model',
           '[data-playlist-item]'
         ];
 
@@ -1286,6 +1293,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // Extract title
             let title = 'Unknown';
             const titleEl = el.querySelector('#video-title') ||
+                           el.querySelector('yt-lockup-metadata-view-model h3') ||
                            el.querySelector('a[title]') ||
                            el.querySelector('.ytd-video-meta-block #video-title') ||
                            link;
@@ -1298,6 +1306,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // Extract duration
             let duration = '';
             const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                              el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
                               el.querySelector('.badge-shape-wiz__text') ||
                               el.querySelector('[class*="duration"]');
             if (durationEl) {
