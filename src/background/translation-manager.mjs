@@ -20,6 +20,11 @@ export class TranslationManager {
     // Tab navigation lock (serializes tab navigation to prevent conflicts)
     this._tabNavLock = Promise.resolve();
 
+    // Player-coercion lock: loadVideoById drives the ONE shared movie_player,
+    // so concurrent batch workers would clobber each other's video. Coercion
+    // calls serialize here; API tiers above stay parallel.
+    this._coerceLock = Promise.resolve();
+
     // Original tab URL before tab navigation (used to restore after batch)
     this._originalTabUrl = null;
   }
@@ -295,42 +300,49 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   async _coercePlayerTranscript(videoId, options = {}) {
     const { lang = 'auto', timeout = 30000 } = options;
+    // Serialize: every caller drives the same movie_player via loadVideoById.
     return new Promise((resolve) => {
-      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) {
-          console.log('[CoercePlayer] No YouTube tab found');
-          return resolve(null);
-        }
-        const tab = tabs.find(t => t.active) || tabs[0];
-        const timer = setTimeout(() => {
-          console.log('[CoercePlayer] Timeout');
-          resolve(null);
-        }, timeout);
-        chrome.tabs.sendMessage(tab.id, {
-          type: 'COERCE_PLAYER_TRANSCRIPT',
-          videoId,
-          lang: lang !== 'auto' ? lang : null,
-          timeout: timeout - 5000
-        }, (response) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) {
-            console.warn('[CoercePlayer] Runtime error:', chrome.runtime.lastError.message);
-            return resolve(null);
+      this._coerceLock = this._coerceLock.then(() => new Promise((innerResolve) => {
+        const passThrough = (result) => {
+          resolve(result);
+          innerResolve(result);
+        };
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+          if (tabs.length === 0) {
+            console.log('[CoercePlayer] No YouTube tab found');
+            return passThrough(null);
           }
-          if (!response?.success) {
-            console.log('[CoercePlayer] Failed:', response?.error || 'Unknown error');
-            if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
-            return resolve(null);
-          }
-          if (response?.result && response.result.length > 0) {
-            console.log(`[CoercePlayer] Success: ${response.result.length} segments`);
-            resolve(response.result);
-          } else {
-            console.log('[CoercePlayer] Empty result');
-            resolve(null);
-          }
+          const tab = tabs.find(t => t.active) || tabs[0];
+          const timer = setTimeout(() => {
+            console.log('[CoercePlayer] Timeout');
+            passThrough(null);
+          }, timeout);
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'COERCE_PLAYER_TRANSCRIPT',
+            videoId,
+            lang: lang !== 'auto' ? lang : null,
+            timeout: timeout - 5000
+          }, (response) => {
+            clearTimeout(timer);
+            if (chrome.runtime.lastError) {
+              console.warn('[CoercePlayer] Runtime error:', chrome.runtime.lastError.message);
+              return passThrough(null);
+            }
+            if (!response?.success) {
+              console.log('[CoercePlayer] Failed:', response?.error || 'Unknown error');
+              if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
+              return passThrough(null);
+            }
+            if (response?.result && response.result.length > 0) {
+              console.log(`[CoercePlayer] Success: ${response.result.length} segments`);
+              passThrough(response.result);
+            } else {
+              console.log('[CoercePlayer] Empty result');
+              passThrough(null);
+            }
+          });
         });
-      });
+      }));
     });
   }
 
@@ -1996,6 +2008,39 @@ export class TranslationManager {
     } catch (err) {
       errors.push({ tier: '1.6-embed-frame', error: err.message });
       log(`[Tier 1.6 Embed Frame] Failed: ${err.message}`);
+    }
+
+    // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
+    // Calls player.loadVideoById() on the existing movie_player in the active
+    // YouTube tab — same-page video switch, no navigation, no page load. The
+    // REAL player solves BotGuard and makes PoToken-authenticated timedtext
+    // requests, captured by the MAIN-world sniffer. Calls serialize on
+    // _coerceLock since all workers drive the one shared player; API tiers
+    // above stay parallel. Only runs when a YouTube tab exists.
+    try {
+      log('[Tier 1.7 Player Coercion] Coercing shared player...');
+      const coerced = await this._coercePlayerTranscript(videoId, {
+        lang: sourceLang,
+        timeout: 45000
+      });
+
+      if (coerced && coerced.length > 0) {
+        log(`[Tier 1.7 Player Coercion] Success! ${coerced.length} segments`);
+        const response = {
+          source: 'tier1.7-player-coercion',
+          result: coerced,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+      log('[Tier 1.7 Player Coercion] No transcript captured, falling through...');
+    } catch (err) {
+      errors.push({ tier: '1.7-player-coercion', error: err.message });
+      log(`[Tier 1.7 Player Coercion] Failed: ${err.message}`);
     }
 
     // === TIER 2C (Tab Navigation): Navigate to watch page ===

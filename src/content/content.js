@@ -1927,6 +1927,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!player) {
           throw new Error('No YouTube player found on this page');
         }
+        // Fail fast: playlist/browse pages may render a player shell without
+        // the API (no loadVideoById) — waiting the full timeout is pure waste.
+        if (typeof player.loadVideoById !== 'function') {
+          throw new Error('Player has no loadVideoById (not a watch page)');
+        }
 
         log(`Coercing player to load video: ${videoId}`);
 
