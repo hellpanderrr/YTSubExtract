@@ -137,7 +137,7 @@ function extensionIdFromProfile() {
  * `-wal`, or `Crashpad/` from a profile Chromium has touched produces a subtly
  * corrupt copy, and a copied lock file makes the next launch refuse to start.
  */
-function prepareProfile() {
+async function prepareProfile() {
   fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
   if (!fs.existsSync(GOLDEN_PROFILE_DIR)) {
     fs.mkdirSync(PROFILE_DIR, { recursive: true });
@@ -161,6 +161,109 @@ function prepareProfile() {
       return true;
     },
   });
+
+  // Seeded login cookies are DPAPI-encrypted; if the test browser cannot
+  // decrypt them it silently drops every encrypted row on first read (the
+  // working Cookies shrinks ~393KB → ~20KB), and the failure surfaces much
+  // later as "playlist does not exist". So when the golden profile carries a
+  // login, verify up front that the cookies survive a real Chromium launch.
+  // A golden without auth cookies is the supported signed-out state
+  // (login-gated specs skip) and needs no check.
+  await verifyCookiesSurvived();
+}
+
+/**
+ * Whether the golden Cookies DB holds a live (table-leaf, not freelist-stale)
+ * YouTube auth row. Minimal SQLite reader: walks table-leaf pages, parses
+ * record headers, and checks the host_key/name fields. ~40 lines, no deps.
+ */
+function goldenHasLiveAuthCookie() {
+  const AUTH = new Set(['SID', 'SAPISID', 'LOGIN_INFO', '__Secure-1PSID', '__Secure-3PSID']);
+  let sql;
+  try {
+    sql = fs.readFileSync(path.join(GOLDEN_PROFILE_DIR, 'Default', 'Network', 'Cookies'));
+  } catch {
+    return false;
+  }
+  if (sql.length < 100 || sql.subarray(0, 16).toString() !== 'SQLite format 3\0') return false;
+  const pageSize = new DataView(sql.buffer, sql.byteOffset + 16, 2).getUint16(0) || 4096;
+  const nPages = new DataView(sql.buffer, sql.byteOffset + 28, 4).getUint32(0);
+  const varint = (buf, p) => {
+    let v = 0, b;
+    do { b = buf[p++]; v = (v << 7) | (b & 0x7f); } while (b & 0x80);
+    return [v, p];
+  };
+  for (let pg = 1; pg <= Math.min(nPages, sql.length / pageSize); pg++) {
+    const off = (pg - 1) * pageSize;
+    if (sql[off] !== 0x0d) continue; // table leaf only
+    const dv = new DataView(sql.buffer, sql.byteOffset + off, pageSize);
+    const n = dv.getUint16(3);
+    for (let i = 0; i < n; i++) {
+      const ptr = dv.getUint16(8 + i * 2);
+      if (ptr + 2 > pageSize) continue;
+      // Cell: varint payload-len, varint rowid, then the record. The record
+      // starts with its header (serial types), then field values in schema
+      // order: creation_utc, host_key, top_frame_site_key, name, ... — so
+      // host_key and name sit at the head of the value area, in order.
+      let p = off + ptr;
+      let plen;
+      [plen, p] = varint(sql, p);
+      [, p] = varint(sql, p); // rowid
+      const end = p + plen;
+      if (end > sql.length) continue;
+      [, p] = varint(sql, p); // header length
+      const head = sql.subarray(p, Math.min(end, p + 160)).toString('binary');
+      const hi = head.indexOf('.youtube.com');
+      if (hi === -1) continue;
+      const tail = head.slice(hi + 13, hi + 60);
+      for (const name of AUTH) {
+        if (tail.startsWith(name)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Launch a throwaway Chromium against the working profile copy and check that
+ * the seeded login cookies are still readable. Exits the process with a clear
+ * message if Chromium dropped them (see prepareProfile).
+ */
+async function verifyCookiesSurvived() {
+  // Only meaningful when the golden profile carries a login. A golden without
+  // auth cookies is the supported signed-out state (login-gated specs skip).
+  // NOTE: the Cookies file is SQLite, not text — read it as a buffer and
+  // search the raw bytes. (An earlier version read it as utf8 and always saw
+  // "no login", silently disabling this guard.) Stale bytes can linger in
+  // freelist pages after Chromium deletes rows, so require the marker to
+  // appear as a LIVE table-leaf row, not just anywhere in the file.
+  if (!goldenHasLiveAuthCookie()) return;
+
+  const probeDir = `${PROFILE_DIR}-cookieprobe`;
+  fs.rmSync(probeDir, { recursive: true, force: true });
+  fs.cpSync(PROFILE_DIR, probeDir, { recursive: true });
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(probeDir, {
+      channel: 'chromium',
+      headless: true,
+      args: ['--no-first-run', '--no-default-browser-check'],
+    });
+    const cookies = await context.cookies('https://www.youtube.com');
+    const names = new Set(cookies.map((c) => c.name));
+    const missing = ['SID', 'SAPISID', '__Secure-1PSID'].filter((n) => !names.has(n));
+    if (missing.length > 0) {
+      console.error(
+        `[e2e] LOGIN LOST: Chromium dropped the golden profile's encrypted cookies ` +
+        `(${missing.join(', ')} missing). The suite would run signed out. See docs/LESSONS.md.`
+      );
+      process.exit(2);
+    }
+    console.log('[e2e] login cookies survived the Chromium launch check.');
+  } finally {
+    if (context) await context.close().catch(() => {});
+    fs.rmSync(probeDir, { recursive: true, force: true });
+  }
 }
 
 const worker = base.extend({
@@ -185,7 +288,7 @@ const worker = base.extend({
       );
     }
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-    prepareProfile();
+    await prepareProfile();
 
     const context = await launchBrowser();
     await use(context);

@@ -1,42 +1,46 @@
 # Next
 
-_Updated 2026-09-18 — branch playlist-download_
+_Updated 2026-09-19 — branch playlist-download_
 
 ## State
-Tier 0.5's DOM playlist selectors were stale (YouTube now renders rows as
-`yt-lockup-view-model`, not `ytd-playlist-video-renderer`), so the tier matched
-0 elements and always fell through to the API path. Fixed + committed `3f12cf7`.
-Suite green: **8 passed, 2 skipped, exit 0**, with a real SRT under
-`E2E_BATCH_EXPECT_SUCCESS=1`. The 2 skips are the LL tests (no login yet).
+Tier 0.5's DOM selectors fixed for `yt-lockup-view-model` (committed `3f12cf7`).
+Suite green on public content: **8 passed, 2 skipped, exit 0**, with a real SRT
+under `E2E_BATCH_EXPECT_SUCCESS=1`. The 2 skips are the LL tests.
 
 ## Open threads
-- **Verify Liked Videos (LL) — waiting on login.** The user is running
-  `npm run e2e:login` now. Once it reports signed in, run:
-  `npx playwright test e2e/private-playlist.spec.mjs --reporter=line`
-  Both tests must pass: listing (credentialed-fetch fallback) AND batch ZIP
-  (requires a real subtitle by default; `E2E_LL_EXPECT_SUCCESS=0` relaxes it).
-- The DOM fix is already proven without login: a direct Tier 0.5 message
-  returned 2/2 videos with titles+durations on a live playlist. LL adds the
-  signed-in credentialed path on top.
+- **LL verification is BLOCKED on login transfer, not on the extension.**
+  Cookie-copy is a dead end (see Don't redo). Options, in order:
+  1. Fix `e2e:login` to launch with the real keychain (drop Playwright's
+     `--use-mock-keychain`/`--password-store=basic` via `ignoreDefaultArgs`)
+     and sign in there — needs a headed run, Google may still flag automation.
+  2. Run the suite against Chrome Dev (`channel: 'chrome-dev'`) pointed at a
+     COPY of your signed-in `Profile 1` — same binary family that owns the
+     session, so decryption should work. Needs a fixture flag; not implemented.
+  3. Manual check: open the popup on `list=LL` in your logged-in Dev window
+     (load unpacked `dist/`) and confirm the listing loads + a 1-video ZIP has
+     a real subtitle.
 - **Single-video flaked ~1 in 4 runs** (retry rescued it). Not investigated.
 
 ## Running / unfinished
-- Nothing in background.
-- `.e2e-profile-golden/` does **not** exist until `e2e:login` succeeds; without
-  it every run is signed out and the LL tests skip.
+- Nothing in background. Working `.e2e-profile/` removed; golden keeps the
+  seeded (currently unusable-by-Chromium) cookies + Dev `Login Data`/`Web Data`.
+- `e2e/fixtures.mjs` (uncommitted) now fail-fasts with LOGIN LOST + exit 2 when
+  the golden carries a login Chromium cannot decrypt.
 
 ## Don't redo
-- **Tier 0.5 DOM selectors:** the fix is `yt-lockup-view-model` (title in
+- **Do NOT copy cookies between Chrome profiles to transfer a login.**
+  Seeded cookies are DPAPI-`v10` blobs; Playwright's Chromium
+  (`--use-mock-keychain`) cannot decrypt them and silently DELETES every
+  encrypted row on first read (393KB → 20KB). Proven by seed → launch →
+  `context.cookies()`: SID/SAPISID/LOGIN_INFO all MISSING. The session also
+  doesn't transfer: accounts.google.com lands on the chooser.
+- **Tier 0.5 DOM selectors:** fixed to `yt-lockup-view-model` (title in
   `yt-lockup-metadata-view-model h3`, duration in
-  `yt-thumbnail-bottom-overlay-view-model`). To test a DOM tier, send its
-  content-script message directly from the SW — the popup's "Loaded N videos"
-  can come from the API fallback and does NOT prove the DOM path ran.
-- **The system proxy must be up.** If down, youtube.com fails with
-  `net::ERR_CONNECTION_CLOSED` while other sites load — looks like a crash but
-  is the network. `curl` keeps working; don't trust it as a check.
-- **Do not "fix" a batch ZIP containing only `_errors.txt` by blaming BotGuard.**
-  A real bug (auto→en substitution) hid behind that for a session.
-- **Do not add `--disable-software-rasterizer`** — with `--disable-gpu` it caused
-  more crashes, not fewer.
+  `yt-thumbnail-bottom-overlay-view-model`). Test a DOM tier by messaging the
+  content script directly — "Loaded N videos" can come from the API fallback.
+- **The system proxy must be up** (`ProxyEnable=0` breaks youtube.com with
+  `ERR_CONNECTION_CLOSED` while curl works; do not trust curl).
+- **A batch ZIP with only `_errors.txt` is a bug, not BotGuard** (auto→en fix).
+- **No `--disable-software-rasterizer`** with `--disable-gpu`.
 - `scripts/test-batch.js` and `scripts/login.js` are superseded by `e2e/`.
 - Full history in `docs/LESSONS.md`.

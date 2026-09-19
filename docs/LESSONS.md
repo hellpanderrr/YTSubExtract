@@ -148,3 +148,26 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   (`chrome.tabs.sendMessage(tab.id, {type:'GET_PLAYLIST_VIDEOS_FROM_DOM', ...})`)
   — the popup's "Loaded N videos" can be satisfied by the API fallback and does
   not prove the DOM path ran at all.
+
+- **Seeded login cookies do not survive a Playwright Chromium launch.**
+  Chrome encrypts cookie values (DPAPI `v10` blobs) against a key in
+  `Local State`, and Playwright launches Chromium with `--use-mock-keychain`
+  (plus `--password-store=basic`). A Chromium launched that way cannot decrypt
+  the seeded rows, so on first read it **silently deletes every encrypted
+  cookie** (working `Cookies` shrank 393KB → 20KB; SID/SAPISID/LOGIN_INFO gone,
+  only plausible-deniability rows like PREF/VISITOR_INFO survived) — and the
+  failure surfaces much later as "The playlist does not exist" on LL. The
+  session also does not transfer at all: accounts.google.com lands on the
+  account chooser, so the cookies are dead weight outside their home profile.
+  Consequences: (1) there is no cookie-copy login path — `e2e:login` must
+  produce the session *inside* the profile Playwright will use, or the login
+  must happen in a browser that shares the real keychain; (2) the fixture now
+  fail-fasts: `prepareProfile` probes a throwaway copy and `process.exit(2)`
+  with LOGIN LOST instead of running the suite signed out. Diagnostic that
+  settles it in minutes: seed → launch → `context.cookies()` — if SID is
+  MISSING, stop debugging the extension. Also note the schema trap that slowed
+  this down: modern `cookies` has 20 columns with `encrypted_value` BETWEEN
+  `value` and `path` (DDL: `... name, value, encrypted_value, path ...`), so a
+  naive field walk mislabels the v10 blob as `path` and reports expiry wrong.
+  And the Cookies file is SQLite, not text: search raw bytes or parse pages —
+  a utf8 read silently mangles it.
