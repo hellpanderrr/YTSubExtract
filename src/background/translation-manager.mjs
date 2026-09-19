@@ -1965,6 +1965,39 @@ export class TranslationManager {
       log(`[Tier 1.5] Failed: ${err.message}`);
     }
 
+    // === TIER 1.6 (Embed Frame): hidden youtube-nocookie.com iframe ===
+    // Injects a hidden embed iframe into the active YouTube tab, where the REAL
+    // embed player solves BotGuard and makes PoToken-authenticated timedtext
+    // requests. The MAIN-world sniffer (all_frames) captures the response body.
+    // Per-video cost (~10-20s of one hidden iframe), no tab navigation, no
+    // full-page load — the batch equivalent of what single-video mode gets
+    // from the watch-page player. Only runs when a YouTube tab exists.
+    try {
+      log('[Tier 1.6 Embed Frame] Attempting hidden embed iframe...');
+      const frameResult = await this._fetchTranscriptViaEmbedFrame(videoId, {
+        lang: sourceLang,
+        timeout: 25000
+      });
+
+      if (frameResult && frameResult.length > 0) {
+        log(`[Tier 1.6 Embed Frame] Success! ${frameResult.length} segments`);
+        const response = {
+          source: 'tier1.6-embed-frame',
+          result: frameResult,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+      log('[Tier 1.6 Embed Frame] No transcript captured, falling through...');
+    } catch (err) {
+      errors.push({ tier: '1.6-embed-frame', error: err.message });
+      log(`[Tier 1.6 Embed Frame] Failed: ${err.message}`);
+    }
+
     // === TIER 2C (Tab Navigation): Navigate to watch page ===
     // Navigates the active YouTube tab to the video's watch page.
     // The REAL player solves BotGuard and makes PoToken-authenticated
