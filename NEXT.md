@@ -3,44 +3,30 @@
 _Updated 2026-09-19 — branch playlist-download_
 
 ## State
-Tier 0.5's DOM selectors fixed for `yt-lockup-view-model` (committed `3f12cf7`).
-Suite green on public content: **8 passed, 2 skipped, exit 0**, with a real SRT
-under `E2E_BATCH_EXPECT_SUCCESS=1`. The 2 skips are the LL tests.
+LL verified end-to-end: **listing + batch ZIP green (2 passed, 42.7s)** with a
+real SRT (`..._dQw4w9WgXcQ_auto.srt`). Login now uses real DPAPI (mock-keychain
+flags dropped); full suite **9 passed, 1 failed** — the failure is the public
+batch spec on an ASR-only video (BotGuard 0-byte bodies), not the harness.
 
 ## Open threads
-- **LL verification is BLOCKED on login transfer, not on the extension.**
-  Cookie-copy is a dead end (see Don't redo). Options, in order:
-  1. Fix `e2e:login` to launch with the real keychain (drop Playwright's
-     `--use-mock-keychain`/`--password-store=basic` via `ignoreDefaultArgs`)
-     and sign in there — needs a headed run, Google may still flag automation.
-  2. Run the suite against Chrome Dev (`channel: 'chrome-dev'`) pointed at a
-     COPY of your signed-in `Profile 1` — same binary family that owns the
-     session, so decryption should work. Needs a fixture flag; not implemented.
-  3. Manual check: open the popup on `list=LL` in your logged-in Dev window
-     (load unpacked `dist/`) and confirm the listing loads + a 1-video ZIP has
-     a real subtitle.
-- **Single-video flaked ~1 in 4 runs** (retry rescued it). Not investigated.
+- **Public batch spec flakes on ASR-only content** (`0VH1Lim8gL8` got 2/3 with
+  `E2E_BATCH_EXPECT_SUCCESS=1`): same BotGuard class as LL row 0. Either point
+  it at a std-caption playlist or apply the LL row-walker pattern.
+- **Single-video ~1-in-4 flake** (retry rescued it). Not investigated.
 
 ## Running / unfinished
-- Nothing in background. Working `.e2e-profile/` removed; golden keeps the
-  seeded (currently unusable-by-Chromium) cookies + Dev `Login Data`/`Web Data`.
-- `e2e/fixtures.mjs` (uncommitted) now fail-fasts with LOGIN LOST + exit 2 when
-  the golden carries a login Chromium cannot decrypt.
+- Nothing in background. Golden profile holds the working login (gitignored).
 
 ## Don't redo
-- **Do NOT copy cookies between Chrome profiles to transfer a login.**
-  Seeded cookies are DPAPI-`v10` blobs; Playwright's Chromium
-  (`--use-mock-keychain`) cannot decrypt them and silently DELETES every
-  encrypted row on first read (393KB → 20KB). Proven by seed → launch →
-  `context.cookies()`: SID/SAPISID/LOGIN_INFO all MISSING. The session also
-  doesn't transfer: accounts.google.com lands on the chooser.
-- **Tier 0.5 DOM selectors:** fixed to `yt-lockup-view-model` (title in
-  `yt-lockup-metadata-view-model h3`, duration in
-  `yt-thumbnail-bottom-overlay-view-model`). Test a DOM tier by messaging the
-  content script directly — "Loaded N videos" can come from the API fallback.
-- **The system proxy must be up** (`ProxyEnable=0` breaks youtube.com with
-  `ERR_CONNECTION_CLOSED` while curl works; do not trust curl).
-- **A batch ZIP with only `_errors.txt` is a bug, not BotGuard** (auto→en fix).
+- **Do NOT copy cookies between Chrome profiles.** App-bound encryption
+  (Chrome 127+) binds keys to the source user-data dir — copies never
+  decrypt. Log in via `npm run e2e:login` (real-keychain flags); wipe
+  `.e2e-profile-golden/` first if re-seeding after flag changes.
+- **Google flags Playwright's login window** unless `--enable-automation` is
+  stripped and `--disable-blink-features=AutomationControlled` is set.
+- **Row 0 of LL is not a fixture** — walk `.video-duration` ≥ 60s rows.
+- **A batch ZIP with only `_errors.txt` is a bug, not BotGuard** (auto→en fix);
+  but ASR-only videos genuinely fail every tier (HTTP 200, 0 bytes).
+- **The system proxy must be up** (`ProxyEnable=0` breaks youtube.com).
 - **No `--disable-software-rasterizer`** with `--disable-gpu`.
-- `scripts/test-batch.js` and `scripts/login.js` are superseded by `e2e/`.
 - Full history in `docs/LESSONS.md`.

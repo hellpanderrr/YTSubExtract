@@ -174,3 +174,27 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   ✅ enforced by `e2e/fixtures.mjs` (`verifyCookiesSurvived`): when the golden
   profile holds a live auth row, a throwaway Chromium launch must still read
   SID/SAPISID/__Secure-1PSID or the worker exits 2 with LOGIN LOST.
+
+- **RESOLVED 2026-09-19: drop the mock-keychain flags, log in inside the
+  Playwright profile.** Both `e2e/login.mjs` and `e2e/fixtures.mjs` now pass
+  `ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain',
+  '--password-store=basic']`, so Chromium uses real DPAPI and cookies written
+  by `e2e:login` decrypt on every later run (same key, same profile). Login
+  also needs `--enable-automation` stripped +
+  `--disable-blink-features=AutomationControlled`, or Google rejects the
+  headed sign-in as "insecure browser". Cookie-copy from a real Chrome profile
+  stays dead regardless: since Chrome 127 app-bound encryption binds the key
+  to the source user-data dir, a copy into a different dir can never unwrap
+  it (confirmed via web research + probes: `Secure Preferences` HMAC reset,
+  phantom extension IDs, stale nested `Default/`, all red herrings — the SID
+  cookie never survived). The golden profile must be re-seeded after this
+  change (old mock-keychain cookies are undecryptable); wipe
+  `.e2e-profile-golden/` and re-run `npm run e2e:login`.
+  ✅ enforced by `e2e/login.mjs` + `e2e/fixtures.mjs` (`ignoreDefaultArgs`).
+- **"First Liked video" is not a test fixture.** LL mixes Shorts with
+  long-form and row 0 is whatever was liked most recently; several long-form
+  rows carry ASR-only tracks that BotGuard answers with HTTP 200 + 0-byte
+  bodies, failing every tier. The batch spec now walks rows with
+  `.video-duration` ≥ 60s and takes the first yielding a real subtitle.
+  Parse durations from the rows' `.video-duration` spans — the row text's
+  leading index (`01 | Title | 23:26`) false-matches a naive time regex.
