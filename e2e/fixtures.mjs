@@ -57,6 +57,21 @@ const LAUNCH_OPTIONS = {
   headless: !(process.argv.includes('--headed') || process.env.E2E_HEADED === '1'),
   viewport: { width: 1280, height: 800 },
   acceptDownloads: true,
+  // Playwright injects `--disable-extensions` into every persistent-context
+  // launch; user args cannot override a default (Chromium keeps the FIRST
+  // occurrence), so it must be removed here or no extension ever loads. Seen
+  // on chrome://version's Command Line: `--disable-extensions` sat before our
+  // `--load-extension`, and zero service workers appeared.
+  //
+  // Playwright also injects `--use-mock-keychain` + `--password-store=basic`,
+  // which make Chromium encrypt cookies with a throwaway mock key instead of
+  // real DPAPI. A golden profile seeded by logging in with those flags keeps
+  // working (same mock key every launch), but cookies copied in from a real
+  // Chrome can never decrypt that way — and since Chrome 127 app-bound
+  // encryption ties the key to the original user-data dir, cross-profile
+  // cookie transfer is dead regardless (see docs/LESSONS.md). The supported
+  // path is: log in ONCE via `npm run e2e:login` (same flags), then reuse.
+  ignoreDefaultArgs: ['--disable-extensions', '--use-mock-keychain', '--password-store=basic'],
   args: [
     `--disable-extensions-except=${EXTENSION_DIR}`,
     `--load-extension=${EXTENSION_DIR}`,
@@ -131,6 +146,29 @@ function extensionIdFromProfile() {
 }
 
 /**
+ * Copy a Chrome profile directory, skipping lock and transient files: copying
+ * a `SingletonLock`, SQLite `-journal`/`-wal`, caches, or `Crashpad/` produces
+ * a subtly corrupt copy, and a copied lock makes the next launch refuse to
+ * start.
+ *
+ */
+function copyProfileFiltered(src, dest) {
+  fs.cpSync(src, dest, {
+    recursive: true,
+    filter: (p) => {
+      const name = path.basename(p);
+      if (name.startsWith('Singleton')) return false;
+      if (name === 'LOCK' || name.startsWith('LOCK.')) return false;
+      if (name.endsWith('-journal') || name.endsWith('-wal') || name.endsWith('-shm')) return false;
+      if (name === 'Crashpad' || name === 'Cache' || name === 'Code Cache'
+        || name === 'GPUCache' || name === 'Service Worker') return false;
+      if (name.endsWith('.log')) return false;
+      return true;
+    },
+  });
+}
+
+/**
  * Replace the working profile with a fresh copy of the golden one.
  *
  * Skips lock and transient files: copying a `SingletonLock`, SQLite `-journal`/
@@ -147,20 +185,7 @@ async function prepareProfile() {
     );
     return;
   }
-  fs.cpSync(GOLDEN_PROFILE_DIR, PROFILE_DIR, {
-    recursive: true,
-    filter: (src) => {
-      const name = path.basename(src);
-      if (name === 'SingletonLock' || name === 'SingletonSocket' || name === 'SingletonCookie') {
-        return false;
-      }
-      if (name === 'LOCK' || name.startsWith('LOCK.')) return false;
-      if (name.endsWith('-journal') || name.endsWith('-wal') || name.endsWith('-shm')) return false;
-      if (name === 'Crashpad') return false;
-      if (name.endsWith('.log')) return false;
-      return true;
-    },
-  });
+  copyProfileFiltered(GOLDEN_PROFILE_DIR, PROFILE_DIR);
 
   // Seeded login cookies are DPAPI-encrypted; if the test browser cannot
   // decrypt them it silently drops every encrypted row on first read (the

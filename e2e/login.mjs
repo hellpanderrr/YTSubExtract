@@ -50,14 +50,32 @@ async function main() {
     channel: 'chromium',
     headless: false,
     viewport: { width: 1280, height: 800 },
+    // Same keychain flags as the test runs (see fixtures.mjs): cookies must
+    // be encrypted with the same key the suite will decrypt with, or the
+    // login is silently dropped on first launch.
+    // `--enable-automation` off + `AutomationControlled` blink feature off:
+    // without these Google flags the headed login window as "insecure browser".
+    // (Chromium keeps the FIRST occurrence of a flag, so defaults must be
+    // removed via ignoreDefaultArgs, not overridden in args.)
+    ignoreDefaultArgs: [
+      '--disable-extensions',
+      '--use-mock-keychain',
+      '--password-store=basic',
+      '--enable-automation',
+    ],
     args: EXTENSION_DIR && fs.existsSync(EXTENSION_DIR)
       ? [
           `--disable-extensions-except=${EXTENSION_DIR}`,
           `--load-extension=${EXTENSION_DIR}`,
           '--no-first-run',
           '--no-default-browser-check',
+          '--disable-blink-features=AutomationControlled',
         ]
-      : ['--no-first-run', '--no-default-browser-check'],
+      : [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-blink-features=AutomationControlled',
+        ],
   });
 
   const page = context.pages()[0] || (await context.newPage());
