@@ -171,3 +171,6 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   naive field walk mislabels the v10 blob as `path` and reports expiry wrong.
   And the Cookies file is SQLite, not text: search raw bytes or parse pages —
   a utf8 read silently mangles it.
+  ✅ enforced by `e2e/fixtures.mjs` (`verifyCookiesSurvived`): when the golden
+  profile holds a live auth row, a throwaway Chromium launch must still read
+  SID/SAPISID/__Secure-1PSID or the worker exits 2 with LOGIN LOST.
