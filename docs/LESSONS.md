@@ -271,3 +271,18 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   fired a caption request for ASR-gated videos; embed page carries no
   `captionTracks` for Hegel at all. Removed from the batch chain (handler kept
   for single/manual use).
+- **Hegel is server-gated per session, not client-broken.** 2026-09-20 HEADED
+  probe (logged in, no headless): `movie_player.getPlayerResponse()` for
+  `u-CLv5-hbqk` carries zero captionTracks, player playing fine, zero timedtext
+  requests before or after loadModule+setOption+toggleSubtitles. The historic
+  2/4 wins came from the correct account holder's attested payload, not from
+  any client sequence reproducible here — cold-API tricks (SAPISIDHASH
+  InnerTube, menu-button drive) chase a tracklist the page never yields.
+  ✅ enforced by `8c9e44f` (restored sniffer arm machinery) + this entry.
+- **An undeclared variable read inside the sniffer IIFE kills the whole hook.**
+  `drivePlayerCoercion`'s `respTracks` closed over `playerRef` (assigned but
+  never declared); under the IIFE's `'use strict'` even `playerRef?.x` throws
+  ReferenceError at definition-call time, aborting the sniffer before the
+  fetch/XHR hooks install. Batch showed "arms but zero timedtext" — the drive
+  never ran at all. Fixed `8c9e44f` (close over local `player`). Rule: every
+  sniffer identifier must be declared or closed over; no implicit globals.

@@ -9,9 +9,13 @@ via sniffer bridge + `chrome.scripting` MAIN fallback (`6f790ed`); dropped dead
 Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
 
 ## Open threads
-- **Hegel still gated**: player arms (`respTracks=0`) but issues zero timedtext
-  requests; cold tiers 400, embed has no tracks. Next: headed run (headless may
-  be the whole problem), then SAPISIDHASH-authenticated InnerTube from background.
+- **Hegel server-gated, not a client bug**: HEADED probe `u-CLv5-hbqk` (2026-09-20,
+  since-deleted temp spec): `getPlayerResponse` carries ZERO captionTracks logged-in
+  headed, playerState=1, zero timedtext requests pre/post arm. The 2/4 wins are the
+  correct account holder's attested payload, not reproducible here. Don't chase
+  client tricks (menu-button drive, SAPISIDHASH InnerTube): page already yields no
+  tracklist to drive against. Next real lever: bgutil-style PoToken minting (see
+  trials doc) — or accept 2C tab-nav as the ceiling.
 - **Single-video path uses ~10 dead ISOLATED player handlers** (`FORCE_CC_TRIGGER`,
   `GET_PLAYER_TRACKS`, `GET_PAGE_CONTEXT_*`, `FETCH_TIER2_*` — class sweep done,
   fixes not): route via scripting or retire.
@@ -25,6 +29,9 @@ Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
 - **Never inject `<script>` from ISOLATED world, never cross-world postMessage**
   — use document_start MAIN script or `chrome.scripting` (`scripting` perm added).
 - **Don't `event.source`-filter the sniffer listener**; type+requestId is the boundary.
+- **`playerRef`-style undeclared globals inside the sniffer IIFE are fatal**:
+  optional-chained read still throws ReferenceError under `'use strict'`,
+  killing the fetch/XHR hook install. Close over locals, declare everything.
 - **Track truth = `getPlayerResponse`, not `getOption`** (empty in headless).
 - **Seed URL pinned to batch video + `autoplay=0`**; bare `/watch?` check let YT wander.
 - **Cold API can't serve ASR-gated tracks**; cookies don't replace PoToken.
