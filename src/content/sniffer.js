@@ -256,7 +256,7 @@
         const done = (detail) => window.postMessage({ type: 'COERCE_PLAYER_COMPLETE', requestId, videoId, detail }, '*');
         const respTracks = () => {
             try {
-                const r = playerRef?.getPlayerResponse?.();
+                const r = player?.getPlayerResponse?.();
                 return r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
             } catch (e) { return []; }
         };
@@ -266,7 +266,6 @@
             fail('no usable player');
             return;
         }
-        playerRef = player;
         let needLoad = true;
         try {
             const cur = player.getPlayerResponse?.();
