@@ -15,14 +15,18 @@ const capturedUrls = new Map();
 // videoId -> Map<lang, {text, timestamp}>
 const capturedTranscripts = new Map();
 
-// Bridge: read MAIN-world captured transcripts from document_start sniffer
-// The sniffer sets window.__ytsub_captured_transcripts at document_start,
-// but our ISOLATED world content script can't read it directly.
-// We inject a MAIN world script to relay captured transcripts via postMessage.
+// Bridge: read MAIN-world captured transcripts from the document_start
+// sniffer. The sniffer (MAIN world, all_frames) stores bodies in
+// window.__ytsub_captured_transcripts AND postMessages every capture live;
+// the live YTSUB_CAPTURED_TRANSCRIPT listener below (source-unfiltered, so
+// iframe relays arrive) is the primary feed. This bridge is a best-effort
+// backfill for captures that fired before this script loaded: it asks the
+// sniffer for a re-broadcast instead of injecting a script element (script
+// injection from ISOLATED world does not execute on youtube.com — proven
+// 2026-09-20 — so the old inject-and-read pattern silently did nothing).
 (function bridgeCapturedTranscripts() {
   const requestId = 'bridge_ct_' + Math.random().toString(36).substring(2, 10);
   const listener = (event) => {
-    if (event.source !== window) return;
     if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT_BRIDGE' || event.data?.requestId !== requestId) return;
     const data = event.data?.data;
     if (!data) return;
@@ -39,13 +43,8 @@ const capturedTranscripts = new Map();
     window.removeEventListener('message', listener);
   };
   window.addEventListener('message', listener);
-  const s = document.createElement('script');
-  s.textContent = `(function() {
-    var d = window.__ytsub_captured_transcripts;
-    if (d) window.postMessage({type:'YTSUB_CAPTURED_TRANSCRIPT_BRIDGE',requestId:'${requestId}',data:d},'*');
-  })();`;
-  (document.head || document.documentElement).appendChild(s);
-  setTimeout(() => s.remove(), 100);
+  window.postMessage({ type: 'YTSUB_REQUEST_BACKFILL', requestId }, '*');
+  setTimeout(() => window.removeEventListener('message', listener), 5000);
 })();
 
 // === REQUEST DEDUPLICATION ===
@@ -465,19 +464,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Reports whether this tab hosts a usable movie_player for loadVideoById
   // coercion. Used by _ensureWatchPlayer to decide if a navigation is needed.
   if (msg.type === 'CHECK_PLAYER_READY') {
-    const player = document.getElementById('movie_player');
-    const ready = !!player && typeof player.loadVideoById === 'function';
-    // hasCaptions: does the player's CURRENT response already carry an
-    // attested tracklist? Seed waits for this (non-fatal) so coercion never
-    // fires into a player whose BotGuard handshake hasn't completed.
-    let hasCaptions = false;
-    try {
-      const resp = (player && typeof player.getPlayerResponse === 'function')
-        ? player.getPlayerResponse() : null;
-      const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      hasCaptions = Array.isArray(tracks) && tracks.length > 0;
-    } catch (e) {}
-    sendResponse({ ready, hasCaptions });
+    // NOTE: this content script runs in the ISOLATED world, where the
+    // movie_player node is visible but its JS API (loadVideoById,
+    // getPlayerResponse, ...) is NOT — page JS attaches those in MAIN world.
+    // Probing them here always reports "no API" on a healthy watch page
+    // (proven 2026-09-20). Two routes to MAIN world, in order:
+    //  1. the MAIN-world sniffer (document_start) via postMessage;
+    //  2. chrome.scripting.executeScript({world:'MAIN'}) via the background
+    //     (needs "scripting" + activeTab; granted on the YouTube tab).
+    // Route 1 is tried first (no extra permission surface); route 2 is the
+    // fallback. Both report the same state shape.
+    (async () => {
+      const requestId = 'ready_' + Math.random().toString(36).substring(2, 10);
+      const viaSniffer = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          window.removeEventListener('message', listener);
+          resolve(null);
+        }, 2500);
+        const listener = (event) => {
+          if (event.data?.type !== 'YTSUB_PLAYER_READY' || event.data?.requestId !== requestId) return;
+          clearTimeout(timer);
+          window.removeEventListener('message', listener);
+          resolve(event.data.state);
+        };
+        window.addEventListener('message', listener);
+        window.postMessage({ type: 'YTSUB_PROBE_PLAYER', requestId }, '*');
+      });
+      if (viaSniffer) {
+        sendResponse(viaSniffer);
+        return;
+      }
+      // Fallback: ask the background to run the probe directly in MAIN world.
+      chrome.runtime.sendMessage({ type: 'PROBE_PLAYER_MAIN', requestId }, (resp) => {
+        if (chrome.runtime.lastError || !resp?.state) {
+          sendResponse({ ready: false, probeErr: 'sniffer + scripting probes failed' });
+          return;
+        }
+        sendResponse(resp.state);
+      });
+    })();
     return true;
   }
 
@@ -1942,21 +1967,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const log = (m) => logs.push(`[CoercePlayer] ${m}`);
       const { videoId, lang = null, desiredLang = null, timeout = 22000 } = msg;
 
-      // Surface the requested language to the injected MAIN-world script via a
-      // data attribute (single source of truth for track selection).
+      // The player lives in MAIN world, untouchable from here — including the
+      // fail-fast element check: a player shell in ISOLATED DOM tells us
+      // nothing about the API. All driving goes through the MAIN-world
+      // sniffer via YTSUB_DRIVE_PLAYER; the isolated-side element check that
+      // used to reject healthy watch pages ("no loadVideoById") is gone.
       const wantLang = desiredLang || lang || null;
 
       try {
-        const player = document.getElementById('movie_player');
-        if (!player) {
-          throw new Error('No YouTube player found on this page');
-        }
-        // Fail fast: playlist/browse pages may render a player shell without
-        // the API (no loadVideoById) — waiting the full timeout is pure waste.
-        if (typeof player.loadVideoById !== 'function') {
-          throw new Error('Player has no loadVideoById (not a watch page)');
-        }
-
         log(`Coercing player to load video: ${videoId} (wantLang=${wantLang || 'auto'})`);
 
         const parseSegments = (text) => {
@@ -2041,7 +2059,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           };
 
           const statusHandler = (statusEvent) => {
-            if (statusEvent.data?.requestId !== requestId) return;
+            // Sniffer posts requestId=requestId; the scripting fallback posts
+            // requestId='scripting' (it never saw ours). Accept both.
+            const rid = statusEvent.data?.requestId;
+            if (rid !== requestId && rid !== 'scripting') return;
+            if (statusEvent.data?.type === 'COERCE_TRACKLIST') {
+              const tracks = statusEvent.data?.tracks || [];
+              log(`Player reports ${tracks.length} tracks: ` +
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', '));
+              return;
+            }
             if (statusEvent.data?.type === 'COERCE_PLAYER_COMPLETE') {
               log(`Player script: ${statusEvent.data?.detail || 'completed execution'}`);
             } else if (statusEvent.data?.type === 'COERCE_PLAYER_FAILED') {
@@ -2085,113 +2112,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return;
           }
 
-          // Inject a MAIN world script that:
-          // 1. Loads the video via player.loadVideoById()
-          // 2. Waits for PLAYING and for the captions tracklist to be non-empty
-          // 3. Explicitly selects the requested track (or the first) BEFORE
-          //    toggling subtitles — the old blind toggle fired into an empty
-          //    tracklist half the time.
-          const script = document.createElement('script');
-          script.textContent = `
-            (function() {
-              const videoId = ${JSON.stringify(videoId)};
-              const requestId = ${JSON.stringify(requestId)};
-              const wantLang = ${JSON.stringify(wantLang)};
-              const fail = (detail) => window.postMessage({type:'COERCE_PLAYER_FAILED',requestId,videoId,detail},'*');
-              const done = (detail) => window.postMessage({type:'COERCE_PLAYER_COMPLETE',requestId,videoId,detail},'*');
-
-              // Mute everything
-              document.querySelectorAll('video, audio').forEach(el => { el.muted = true; el.volume = 0; });
-
-              const player = document.getElementById('movie_player');
-              if (!player || typeof player.loadVideoById !== 'function') {
-                fail('no usable player');
+          // Drive the player in MAIN world (script injection from ISOLATED
+          // world does not execute on youtube.com — proven 2026-09-20).
+          // Route 1: the MAIN-world sniffer (document_start) via postMessage.
+          // Route 2 (fallback): chrome.scripting.executeScript({world:'MAIN'})
+          // via the background. Status arrives via COERCE_PLAYER_FAILED/COMPLETE.
+          window.postMessage({
+            type: 'YTSUB_DRIVE_PLAYER',
+            videoId,
+            requestId,
+            wantLang,
+          }, '*');
+          log('Player drive request sent to MAIN-world sniffer');
+          // If the sniffer never reports within 6s, fall back to scripting.
+          setTimeout(() => {
+            if (finished) return;
+            chrome.runtime.sendMessage({
+              type: 'DRIVE_PLAYER_MAIN',
+              videoId,
+              requestId,
+              wantLang,
+            }, (resp) => {
+              if (finished) return;
+              if (chrome.runtime.lastError || !resp?.success) {
+                log(`Scripting drive fallback failed: ${chrome.runtime.lastError?.message || resp?.error || 'no response'}`);
                 return;
               }
-
-              // If we're already on the requested video AND it already has a
-              // tracklist, skip the reload — the player may already be
-              // mid-request for the timedtext we want.
-              let needLoad = true;
-              try {
-                const cur = player.getPlayerResponse?.();
-                if (cur?.videoDetails?.videoId === videoId) {
-                  const curTracks = player.getOption?.('captions', 'tracklist') || [];
-                  if (curTracks.length > 0) needLoad = false;
-                }
-              } catch(e) {}
-
-              const armCaptions = () => {
-                let trackTries = 0;
-                const trackTimer = setInterval(() => {
-                  trackTries++;
-                  let tracks = [];
-                  try { tracks = player.getOption('captions', 'tracklist') || []; } catch(e) {}
-                  if (tracks.length > 0) {
-                    clearInterval(trackTimer);
-                    window.postMessage({type:'COERCE_TRACKLIST',requestId,videoId,
-                      tracks: tracks.map(t => ({languageCode: t.languageCode, kind: t.kind || null}))},'*');
-                    let pick = null;
-                    if (wantLang) pick = tracks.find(t => t.languageCode === wantLang) || null;
-                    if (!pick) pick = tracks.find(t => t.kind === 'asr') || tracks[0];
-                    try {
-                      if (typeof player.loadModule === 'function') {
-                        try { player.loadModule('captions'); } catch(e) {}
-                        try { player.loadModule('cc'); } catch(e) {}
-                      }
-                      if (pick && typeof player.setOption === 'function') {
-                        try { player.setOption('captions', 'track', {languageCode: pick.languageCode}); } catch(e) {}
-                      }
-                      if (typeof player.toggleSubtitles === 'function') {
-                        player.toggleSubtitles(true);
-                      }
-                      done('captions armed on ' + (pick ? pick.languageCode : 'default'));
-                    } catch(e) { fail('caption arm threw: ' + e.message); }
-                  } else if (trackTries > 50) {
-                    clearInterval(trackTimer);
-                    // One blind attempt, then report — background keeps polling
-                    // the capture cache until its own timeout.
-                    try {
-                      if (typeof player.loadModule === 'function') {
-                        try { player.loadModule('captions'); } catch(e) {}
-                      }
-                      if (typeof player.toggleSubtitles === 'function') {
-                        player.toggleSubtitles(true);
-                      }
-                    } catch(e) {}
-                    done('tracklist never appeared, blind toggle sent');
-                  }
-                }, 200);
-              };
-
-              if (!needLoad) { armCaptions(); return; }
-
-              try {
-                player.loadVideoById({videoId: videoId, muted: true});
-              } catch(e) {
-                try { player.loadVideoById(videoId); } catch(e2) { fail('loadVideoById threw'); return; }
-              }
-
-              let attempts = 0;
-              const captionsTimer = setInterval(() => {
-                attempts++;
-                try {
-                  if (player.getPlayerState() === 1) { // PLAYING
-                    clearInterval(captionsTimer);
-                    armCaptions();
-                  } else if (attempts > 150) {
-                    clearInterval(captionsTimer);
-                    armCaptions(); // last resort: arm anyway
-                  }
-                } catch(e) {
-                  if (attempts > 150) { clearInterval(captionsTimer); fail('state poll threw'); }
-                }
-              }, 200);
-            })();
-          `;
-          (document.head || document.documentElement).appendChild(script);
-          script.remove();
-          log('Player coercion script injected');
+              log('Scripting drive fallback dispatched');
+            });
+          }, 6000);
         });
 
         if (result && result.length > 0) {

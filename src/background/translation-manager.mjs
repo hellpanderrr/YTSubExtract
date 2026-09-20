@@ -470,9 +470,18 @@ export class TranslationManager {
 
     if (!this._originalTabUrl) this._originalTabUrl = tab.url;
 
-    if (!/youtube\.com\/watch\?/.test(tab.url || '')) {
-      let url = `https://www.youtube.com/watch?v=${videoId}`;
+    // Pin this batch's video in the URL (autoplay=0 keeps YT from wandering
+    // to "up next" mid-batch — observed 2026-09-20: seed returned "ready"
+    // for jGg_1h0qzaM while coercing u-CLv5-hbqk). Re-navigate when the tab
+    // is not on our video, even if it is already a /watch page.
+    const wantUrl = (vid) => {
+      let url = `https://www.youtube.com/watch?v=${vid}&autoplay=0`;
       if (playlistId) url += `&list=${playlistId}`;
+      return url;
+    };
+    const tabVid = (() => { try { return new URL(tab.url || '').searchParams.get('v'); } catch (e) { return null; } })();
+    if (tabVid !== videoId) {
+      const url = wantUrl(videoId);
       console.log(`[WatchSeed] Navigating tab ${tab.id} once to ${url}`);
       await chrome.tabs.update(tab.id, { url });
       await new Promise((resolve) => {
@@ -492,34 +501,45 @@ export class TranslationManager {
       await new Promise((r) => setTimeout(r, 3000));
     }
 
-    const deadline = Date.now() + Math.max(timeout - 33000, 15000);
-    while (Date.now() < deadline) {
-      const state = await new Promise((resolve) => {
-        chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
-          if (chrome.runtime.lastError) return resolve(null);
-          resolve(resp || null);
-        });
+    const probe = () => new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
+        if (chrome.runtime.lastError) {
+          return resolve({ __err: chrome.runtime.lastError.message });
+        }
+        resolve(resp || null);
       });
-      // Usable the moment the API exists; a tracklist already present means
-      // the BotGuard handshake finished, otherwise keep waiting for it.
-      if (state?.ready === true && state?.hasCaptions !== true) {
-        console.log('[WatchSeed] Player API ready, waiting for attested tracklist...');
-      }
-      if (state?.ready === true && state?.hasCaptions === true) {
-        console.log('[WatchSeed] Player ready with attested tracklist');
+    });
+    const deadline = Date.now() + Math.max(timeout - 33000, 15000);
+    let lastErr = null;
+    while (Date.now() < deadline) {
+      const state = await probe();
+      if (state?.__err) {
+        // No listener on this tab (navigating / wrong target) — log verbatim
+        // so "messaging the wrong tab" is distinguishable from withheld tracks.
+        if (state.__err !== lastErr) {
+          console.log(`[WatchSeed] tab ${tab.id} probe error: ${state.__err}`);
+          lastErr = state.__err;
+        }
+      } else if (state?.ready === true && state?.hasCaptions === true) {
+        console.log(`[WatchSeed] Player ready with attested tracklist (${state.trackCount}: ${state.tracks.join(', ')})`);
         return true;
+      } else if (state?.ready === true) {
+        console.log(`[WatchSeed] tab ${tab.id} API ready, no tracklist yet (state=${state.playerState}, page=${state.url})`);
+      } else if (state) {
+        console.log(`[WatchSeed] tab ${tab.id} hasPlayer=${state.hasPlayer} (page=${state.url})`);
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
     // Best effort: the API may still serve even if the tracklist probe missed.
-    const last = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
-        if (chrome.runtime.lastError) return resolve(false);
-        resolve(resp?.ready === true);
-      });
-    });
-    console.log(last ? '[WatchSeed] Player API ready (tracklist unconfirmed)' : '[WatchSeed] Player never became ready');
-    return last;
+    const last = await probe();
+    if (last?.__err) {
+      console.log(`[WatchSeed] Player never became ready (tab ${tab.id} probe error: ${last.__err})`);
+      return false;
+    }
+    console.log(last?.ready === true
+      ? `[WatchSeed] Player API ready, tracklist unconfirmed (state=${last.playerState}, tracks=${last.trackCount}, page=${last.url})`
+      : `[WatchSeed] Player never became ready (tab ${tab.id}, hasPlayer=${last?.hasPlayer}, page=${last?.url})`);
+    return last?.ready === true;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -2058,38 +2078,12 @@ export class TranslationManager {
       log(`[Tier 1.5] Failed: ${err.message}`);
     }
 
-    // === TIER 1.6 (Embed Frame): hidden youtube-nocookie.com iframe ===
-    // Injects a hidden embed iframe into the active YouTube tab, where the REAL
-    // embed player solves BotGuard and makes PoToken-authenticated timedtext
-    // requests. The MAIN-world sniffer (all_frames) captures the response body.
-    // Per-video cost (~10-20s of one hidden iframe), no tab navigation, no
-    // full-page load — the batch equivalent of what single-video mode gets
-    // from the watch-page player. Only runs when a YouTube tab exists.
-    try {
-      log('[Tier 1.6 Embed Frame] Attempting hidden embed iframe...');
-      const frameResult = await this._fetchTranscriptViaEmbedFrame(videoId, {
-        lang: sourceLang,
-        timeout: 10000
-      });
-
-      if (frameResult && frameResult.length > 0) {
-        log(`[Tier 1.6 Embed Frame] Success! ${frameResult.length} segments`);
-        const response = {
-          source: 'tier1.6-embed-frame',
-          result: frameResult,
-          translated: translate,
-          sourceLang,
-          targetLang,
-          logs
-        };
-        this._setCache(cacheKey, response);
-        return response;
-      }
-      log('[Tier 1.6 Embed Frame] No transcript captured, falling through...');
-    } catch (err) {
-      errors.push({ tier: '1.6-embed-frame', error: err.message });
-      log(`[Tier 1.6 Embed Frame] Failed: ${err.message}`);
-    }
+    // === TIER 1.6 (Embed Frame): DISABLED in batch ===
+    // Probes showed the nocookie iframe never fires a caption request for
+    // ASR-gated videos — it burned 10-25s per video for zero captures and
+    // shared the coercion lock (serialized dead wait). _fetchTranscriptViaEmbedFrame
+    // and the INJECT_EMBED_FRAME handler stay for manual/single use; batch
+    // goes straight from cold tiers to 1.7 player coercion. (2026-09-20)
 
     // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
     // Switches videos in-page via player.loadVideoById() — no navigation, no

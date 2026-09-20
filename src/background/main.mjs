@@ -51,8 +51,157 @@ if (typeof globalThis.restoreProgressPromise === 'undefined') {
   globalThis.restoreProgressPromise = null;
 }
 
+// MAIN-world player probe/drive state shared with the content script.
+// chrome.scripting.executeScript({world:'MAIN'}) is the only channel that
+// provably reaches page JS (ISOLATED-world script injection does not execute
+// on youtube.com; ISOLATED→MAIN postMessage does not cross worlds — proven
+// 2026-09-20). sender.tab.id scopes the injection to the requesting tab.
+const MAIN_PROBE_FUNC = () => {
+  const state = { ready: false, hasCaptions: false, hasPlayer: false,
+    trackCount: 0, tracks: [], trackErr: null, playerState: null, url: location.href };
+  try {
+    const p = document.getElementById('movie_player');
+    state.hasPlayer = !!p;
+    if (p && typeof p.loadVideoById === 'function') {
+      state.ready = true;
+      try { state.playerState = (typeof p.getPlayerState === 'function') ? p.getPlayerState() : null; }
+      catch (e) { state.playerState = 'threw'; }
+      try {
+        const r = (typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+        const list = r?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (Array.isArray(list)) {
+          state.trackCount = list.length;
+          state.tracks = list.map((t) => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`);
+          state.hasCaptions = list.length > 0;
+        }
+      } catch (e) { state.trackErr = e.message; }
+    }
+  } catch (e) { state.trackErr = e.message; }
+  return state;
+};
+
+const MAIN_DRIVE_FUNC = (videoId, wantLang) => {
+  const fail = (detail) => window.postMessage({ type: 'COERCE_PLAYER_FAILED', requestId: 'scripting', videoId, detail }, '*');
+  const done = (detail) => window.postMessage({ type: 'COERCE_PLAYER_COMPLETE', requestId: 'scripting', videoId, detail }, '*');
+  try { document.querySelectorAll('video, audio').forEach((el) => { el.muted = true; el.volume = 0; }); } catch (e) {}
+  const player = document.getElementById('movie_player');
+  if (!player || typeof player.loadVideoById !== 'function') {
+    // Status goes through the MAIN-world sniffer's fetch/XHR hook logs; the
+    // ISOLATED listener can't see this postMessage, so throw to surface it.
+    throw new Error('no usable player in MAIN world');
+  }
+  const respTracks = () => {
+    try {
+      const r = player.getPlayerResponse?.();
+      return r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    } catch (e) { return []; }
+  };
+  let needLoad = true;
+  try {
+    const cur = player.getPlayerResponse?.();
+    if (cur?.videoDetails?.videoId === videoId && respTracks().length > 0) needLoad = false;
+  } catch (e) {}
+  const armCaptions = () => {
+    let trackTries = 0;
+    const trackTimer = setInterval(() => {
+      trackTries++;
+      const tracks = respTracks();
+      if (tracks.length > 0 || trackTries > 25) {
+        clearInterval(trackTimer);
+        let pick = null;
+        if (wantLang) pick = tracks.find((t) => t.languageCode === wantLang) || null;
+        if (!pick) pick = tracks.find((t) => t.kind === 'asr') || tracks[0];
+        try {
+          if (typeof player.loadModule === 'function') {
+            try { player.loadModule('captions'); } catch (e) {}
+            try { player.loadModule('cc'); } catch (e) {}
+          }
+          if (pick && typeof player.setOption === 'function') {
+            try { player.setOption('captions', 'track', { languageCode: pick.languageCode }); } catch (e) {}
+            try { player.setOption('captions', 'track', { languageCode: pick.languageCode, kind: pick.kind || undefined }); } catch (e) {}
+          }
+          let cycle = 0;
+          const toggleTimer = setInterval(() => {
+            cycle++;
+            try {
+              if (typeof player.toggleSubtitles === 'function') {
+                player.toggleSubtitles(false);
+                setTimeout(() => { try { player.toggleSubtitles(true); } catch (e) {} }, 300);
+              }
+            } catch (e) {}
+            if (cycle >= 3) {
+              clearInterval(toggleTimer);
+              done('captions armed on ' + (pick ? pick.languageCode : 'default') +
+                ` (respTracks=${tracks.length})`);
+            }
+          }, 800);
+        } catch (e) { fail('caption arm threw: ' + e.message); }
+      }
+    }, 200);
+  };
+  if (!needLoad) { armCaptions(); return 'already on video'; }
+  try {
+    player.loadVideoById({ videoId, muted: true });
+  } catch (e) {
+    try { player.loadVideoById(videoId); } catch (e2) { throw new Error('loadVideoById threw'); }
+  }
+  let attempts = 0;
+  const captionsTimer = setInterval(() => {
+    attempts++;
+    try {
+      if (player.getPlayerState() === 1) {
+        clearInterval(captionsTimer);
+        armCaptions();
+      } else if (attempts > 150) {
+        clearInterval(captionsTimer);
+        armCaptions();
+      }
+    } catch (e) {
+      if (attempts > 150) { clearInterval(captionsTimer); fail('state poll threw'); }
+    }
+  }, 200);
+  return 'drive dispatched';
+};
+
 // Message Handler
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // MAIN-world probe/drive via chrome.scripting (fallback when the sniffer
+  // postMessage bridge is unreachable). sender.tab scopes to the tab.
+  if (request.type === 'PROBE_PLAYER_MAIN') {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (!tabId) throw new Error('no sender tab');
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: MAIN_PROBE_FUNC,
+        });
+        sendResponse({ success: true, state: res?.result || { ready: false, probeErr: 'empty result' } });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+  if (request.type === 'DRIVE_PLAYER_MAIN') {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (!tabId) throw new Error('no sender tab');
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: MAIN_DRIVE_FUNC,
+          args: [request.videoId, request.wantLang || null],
+        });
+        sendResponse({ success: true });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
     // 1. Get Video Metadata (Languages)
     if (request.type === 'GET_VIDEO_METADATA') {
         // Atomic update of currentDownloadProgress to avoid overwriting on SW start

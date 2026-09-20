@@ -27,7 +27,8 @@
     "activeTab",
     "storage",
     "declarativeNetRequest",
-    "downloads"
+    "downloads",
+    "scripting"
   ],
   "host_permissions": [
     "*://*.youtube.com/*",
