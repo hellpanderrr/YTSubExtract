@@ -466,9 +466,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // coercion. Used by _ensureWatchPlayer to decide if a navigation is needed.
   if (msg.type === 'CHECK_PLAYER_READY') {
     const player = document.getElementById('movie_player');
-    sendResponse({
-      ready: !!player && typeof player.loadVideoById === 'function',
-    });
+    const ready = !!player && typeof player.loadVideoById === 'function';
+    // hasCaptions: does the player's CURRENT response already carry an
+    // attested tracklist? Seed waits for this (non-fatal) so coercion never
+    // fires into a player whose BotGuard handshake hasn't completed.
+    let hasCaptions = false;
+    try {
+      const resp = (player && typeof player.getPlayerResponse === 'function')
+        ? player.getPlayerResponse() : null;
+      const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      hasCaptions = Array.isArray(tracks) && tracks.length > 0;
+    } catch (e) {}
+    sendResponse({ ready, hasCaptions });
     return true;
   }
 
@@ -1931,7 +1940,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const logs = [];
       const log = (m) => logs.push(`[CoercePlayer] ${m}`);
-      const { videoId, lang = null, timeout = 30000 } = msg;
+      const { videoId, lang = null, desiredLang = null, timeout = 22000 } = msg;
+
+      // Surface the requested language to the injected MAIN-world script via a
+      // data attribute (single source of truth for track selection).
+      const wantLang = desiredLang || lang || null;
 
       try {
         const player = document.getElementById('movie_player');
@@ -1944,188 +1957,236 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           throw new Error('Player has no loadVideoById (not a watch page)');
         }
 
-        log(`Coercing player to load video: ${videoId}`);
+        log(`Coercing player to load video: ${videoId} (wantLang=${wantLang || 'auto'})`);
+
+        const parseSegments = (text) => {
+          let segments = null;
+          if (text.startsWith('{')) {
+            try {
+              const json = JSON.parse(text);
+              if (json.events) {
+                segments = json.events
+                  .filter(e => e.segs)
+                  .map(e => ({
+                    start: (e.tStartMs || 0) / 1000,
+                    duration: (e.dDurationMs || 0) / 1000,
+                    text: e.segs.map(s => s.utf8 || '').join('')
+                  }))
+                  .filter(e => e.text.trim().length > 0);
+              }
+            } catch (e) {}
+          }
+          if (!segments || segments.length === 0) {
+            const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+            segments = [];
+            let m;
+            while ((m = xmlRe.exec(text)) !== null) {
+              segments.push({
+                start: parseFloat(m[1]),
+                duration: parseFloat(m[2]),
+                text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+              });
+            }
+          }
+          return (segments && segments.length > 0) ? segments : null;
+        };
+
+        const drainCache = () => {
+          const videoMap = capturedTranscripts.get(videoId);
+          if (!videoMap || videoMap.size === 0) return null;
+          const order = [];
+          if (wantLang && videoMap.has(wantLang)) order.push(videoMap.get(wantLang));
+          for (const entry of videoMap.values()) order.push(entry);
+          for (const entry of order) {
+            if (entry?.text) {
+              const segments = parseSegments(entry.text);
+              if (segments) return { segments, bytes: entry.text.length };
+            }
+          }
+          return null;
+        };
 
         // Inject a MAIN world script to control the player
         const result = await new Promise((resolve, reject) => {
           const requestId = `coerce_${videoId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+          let finished = false;
+
+          const finish = (segments, note) => {
+            if (finished) return;
+            finished = true;
+            cleanup();
+            if (note) log(note);
+            resolve(segments);
+          };
 
           const messageHandler = (event) => {
+            if (finished) return;
+            if (event.data?.type === 'COERCE_TRACKLIST') {
+              if (event.data?.requestId !== requestId) return;
+              const tracks = event.data?.tracks || [];
+              log(`Player reports ${tracks.length} tracks for ${event.data?.videoId || '?'}: ` +
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', '));
+              return;
+            }
             if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT') return;
             if (event.data?.videoId !== videoId) return;
 
             const { text, lang: captureLang, tlang } = event.data;
             if (!text || text.trim().length === 0) return;
 
-            log(`Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'})`);
-
-            let segments = null;
-            if (text.startsWith('{')) {
-              try {
-                const json = JSON.parse(text);
-                if (json.events) {
-                  segments = json.events
-                    .filter(e => e.segs)
-                    .map(e => ({
-                      start: (e.tStartMs || 0) / 1000,
-                      duration: (e.dDurationMs || 0) / 1000,
-                      text: e.segs.map(s => s.utf8 || '').join('')
-                    }))
-                    .filter(e => e.text.trim().length > 0);
-                }
-              } catch (e) {}
-            }
-
-            if (!segments || segments.length === 0) {
-              const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
-              segments = [];
-              let m;
-              while ((m = xmlRe.exec(text)) !== null) {
-                segments.push({
-                  start: parseFloat(m[1]),
-                  duration: parseFloat(m[2]),
-                  text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-                });
-              }
-            }
-
-            if (segments && segments.length > 0) {
-              log(`Parsed ${segments.length} segments`);
-              cleanup();
-              resolve(segments);
+            const segments = parseSegments(text);
+            if (segments) {
+              finish(segments, `Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'}), parsed ${segments.length} segments`);
             }
           };
 
           const statusHandler = (statusEvent) => {
             if (statusEvent.data?.requestId !== requestId) return;
             if (statusEvent.data?.type === 'COERCE_PLAYER_COMPLETE') {
-              log('Player script completed execution');
+              log(`Player script: ${statusEvent.data?.detail || 'completed execution'}`);
+            } else if (statusEvent.data?.type === 'COERCE_PLAYER_FAILED') {
+              finish(null, `Player script failed: ${statusEvent.data?.detail || 'unknown'}`);
             }
           };
 
           const timer = setTimeout(() => {
-            log(`Timeout after ${timeout}ms`);
-            cleanup();
-            // Give one last chance — check capturedTranscripts
-            const videoMap = capturedTranscripts.get(videoId);
-            if (videoMap && videoMap.size > 0) {
-              const entry = videoMap.values().next().value;
-              if (entry && entry.text) {
-                log(`Found transcript in fallback cache! ${entry.text.length} bytes`);
-                let segments = null;
-                try {
-                  const json = JSON.parse(entry.text);
-                  if (json.events) {
-                    segments = json.events.filter(e => e.segs).map(e => ({
-                      start: (e.tStartMs || 0) / 1000,
-                      duration: (e.dDurationMs || 0) / 1000,
-                      text: e.segs.map(s => s.utf8 || '').join('')
-                    })).filter(e => e.text.trim().length > 0);
-                  }
-                } catch (e) {}
-                if (segments && segments.length > 0) {
-                  cleanup();
-                  resolve(segments);
-                  return;
-                }
-              }
+            const hit = drainCache();
+            if (hit) {
+              finish(hit.segments, `Late capture from cache: ${hit.bytes} bytes, parsed ${hit.segments.length} segments`);
+            } else {
+              finish(null, `Timeout after ${timeout}ms`);
             }
-            resolve(null);
           }, timeout);
+
+          const poller = setInterval(() => {
+            if (finished) return;
+            const hit = drainCache();
+            if (hit) {
+              finish(hit.segments, `Polled capture: ${hit.bytes} bytes, parsed ${hit.segments.length} segments`);
+            }
+          }, 1500);
 
           const cleanup = () => {
             window.removeEventListener('message', messageHandler);
             window.removeEventListener('message', statusHandler);
             clearTimeout(timer);
+            clearInterval(poller);
           };
 
           window.addEventListener('message', messageHandler);
           window.addEventListener('message', statusHandler);
 
+          // Drain anything the player fetched between seed and this call BEFORE
+          // injecting — closes the capture-miss race where timedtext fires
+          // before our listener attaches.
+          const preHit = drainCache();
+          if (preHit) {
+            finish(preHit.segments, `Pre-existing capture: ${preHit.bytes} bytes, parsed ${preHit.segments.length} segments`);
+            return;
+          }
+
           // Inject a MAIN world script that:
           // 1. Loads the video via player.loadVideoById()
-          // 2. Monitors player state
-          // 3. When PLAYING, forces captions module
-          // 4. Mutes audio first
+          // 2. Waits for PLAYING and for the captions tracklist to be non-empty
+          // 3. Explicitly selects the requested track (or the first) BEFORE
+          //    toggling subtitles — the old blind toggle fired into an empty
+          //    tracklist half the time.
           const script = document.createElement('script');
           script.textContent = `
             (function() {
-              const videoId = '${videoId}';
-              const requestId = '${requestId}';
+              const videoId = ${JSON.stringify(videoId)};
+              const requestId = ${JSON.stringify(requestId)};
+              const wantLang = ${JSON.stringify(wantLang)};
+              const fail = (detail) => window.postMessage({type:'COERCE_PLAYER_FAILED',requestId,videoId,detail},'*');
+              const done = (detail) => window.postMessage({type:'COERCE_PLAYER_COMPLETE',requestId,videoId,detail},'*');
 
               // Mute everything
               document.querySelectorAll('video, audio').forEach(el => { el.muted = true; el.volume = 0; });
 
-              function waitForPlayer(retries) {
-                const player = document.getElementById('movie_player');
-                if (!player) {
-                  if (retries > 0) setTimeout(() => waitForPlayer(retries - 1), 500);
-                  return;
-                }
+              const player = document.getElementById('movie_player');
+              if (!player || typeof player.loadVideoById !== 'function') {
+                fail('no usable player');
+                return;
+              }
 
-                if (typeof player.loadVideoById !== 'function') {
-                  if (retries > 0) setTimeout(() => waitForPlayer(retries - 1), 500);
-                  return;
+              // If we're already on the requested video AND it already has a
+              // tracklist, skip the reload — the player may already be
+              // mid-request for the timedtext we want.
+              let needLoad = true;
+              try {
+                const cur = player.getPlayerResponse?.();
+                if (cur?.videoDetails?.videoId === videoId) {
+                  const curTracks = player.getOption?.('captions', 'tracklist') || [];
+                  if (curTracks.length > 0) needLoad = false;
                 }
+              } catch(e) {}
 
-                // Load the target video
-                try {
-                  player.loadVideoById({videoId: videoId, muted: true});
-                } catch(e) {
-                  try { player.loadVideoById(videoId); } catch(e2) {}
-                }
-
-                // Wait for PLAYING state, then trigger captions
-                let attempts = 0;
-                const captionsTimer = setInterval(() => {
-                  attempts++;
-                  try {
-                    const state = player.getPlayerState();
-                    if (state === 1) { // PLAYING
-                      clearInterval(captionsTimer);
-                      // Load captions module and toggle on
+              const armCaptions = () => {
+                let trackTries = 0;
+                const trackTimer = setInterval(() => {
+                  trackTries++;
+                  let tracks = [];
+                  try { tracks = player.getOption('captions', 'tracklist') || []; } catch(e) {}
+                  if (tracks.length > 0) {
+                    clearInterval(trackTimer);
+                    window.postMessage({type:'COERCE_TRACKLIST',requestId,videoId,
+                      tracks: tracks.map(t => ({languageCode: t.languageCode, kind: t.kind || null}))},'*');
+                    let pick = null;
+                    if (wantLang) pick = tracks.find(t => t.languageCode === wantLang) || null;
+                    if (!pick) pick = tracks.find(t => t.kind === 'asr') || tracks[0];
+                    try {
                       if (typeof player.loadModule === 'function') {
                         try { player.loadModule('captions'); } catch(e) {}
                         try { player.loadModule('cc'); } catch(e) {}
                       }
-                      // Toggle subtitles on
+                      if (pick && typeof player.setOption === 'function') {
+                        try { player.setOption('captions', 'track', {languageCode: pick.languageCode}); } catch(e) {}
+                      }
                       if (typeof player.toggleSubtitles === 'function') {
                         player.toggleSubtitles(true);
                       }
-                      // Also try setting the caption track directly
-                      try {
-                        const tracks = player.getOption('captions', 'tracklist');
-                        if (tracks && tracks.length > 0) {
-                          player.setOption('captions', 'track', {languageCode: tracks[0].languageCode});
-                        }
-                      } catch(e) {}
-
-                      window.postMessage({
-                        type: 'COERCE_PLAYER_COMPLETE',
-                        requestId: requestId,
-                        videoId: videoId
-                      }, '*');
-                    }
-                  } catch(e) {
-                    if (attempts > 150) clearInterval(captionsTimer);
+                      done('captions armed on ' + (pick ? pick.languageCode : 'default'));
+                    } catch(e) { fail('caption arm threw: ' + e.message); }
+                  } else if (trackTries > 50) {
+                    clearInterval(trackTimer);
+                    // One blind attempt, then report — background keeps polling
+                    // the capture cache until its own timeout.
+                    try {
+                      if (typeof player.loadModule === 'function') {
+                        try { player.loadModule('captions'); } catch(e) {}
+                      }
+                      if (typeof player.toggleSubtitles === 'function') {
+                        player.toggleSubtitles(true);
+                      }
+                    } catch(e) {}
+                    done('tracklist never appeared, blind toggle sent');
                   }
                 }, 200);
+              };
 
-                // Also set a timeout for fallback (try the direct API approach)
-                setTimeout(() => {
-                  // If we haven't gotten to PLAYING yet, try to toggle captions anyway
-                  try {
-                    if (typeof player.toggleSubtitles === 'function') {
-                      player.toggleSubtitles(true);
-                    }
-                    if (typeof player.loadModule === 'function') {
-                      try { player.loadModule('captions'); } catch(e) {}
-                    }
-                  } catch(e) {}
-                }, 5000);
+              if (!needLoad) { armCaptions(); return; }
+
+              try {
+                player.loadVideoById({videoId: videoId, muted: true});
+              } catch(e) {
+                try { player.loadVideoById(videoId); } catch(e2) { fail('loadVideoById threw'); return; }
               }
 
-              waitForPlayer(10);
+              let attempts = 0;
+              const captionsTimer = setInterval(() => {
+                attempts++;
+                try {
+                  if (player.getPlayerState() === 1) { // PLAYING
+                    clearInterval(captionsTimer);
+                    armCaptions();
+                  } else if (attempts > 150) {
+                    clearInterval(captionsTimer);
+                    armCaptions(); // last resort: arm anyway
+                  }
+                } catch(e) {
+                  if (attempts > 150) { clearInterval(captionsTimer); fail('state poll threw'); }
+                }
+              }, 200);
             })();
           `;
           (document.head || document.documentElement).appendChild(script);

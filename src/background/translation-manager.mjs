@@ -252,43 +252,52 @@ export class TranslationManager {
   // response bodies and relays them back via window.postMessage.
   // ─────────────────────────────────────────────────────────────
   async _fetchTranscriptViaEmbedFrame(videoId, options = {}) {
-    const { lang = 'auto', timeout = 25000 } = options;
+    const { lang = 'auto', timeout = 10000 } = options;
     return new Promise((resolve) => {
-      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) {
-          console.log('[EmbedFrame] No YouTube tab found');
-          return resolve(null);
-        }
-        const tab = tabs.find(t => t.active) || tabs[0];
-        const timer = setTimeout(() => {
-          console.log('[EmbedFrame] Timeout');
-          resolve(null);
-        }, timeout);
-        chrome.tabs.sendMessage(tab.id, {
-          type: 'INJECT_EMBED_FRAME',
-          videoId,
-          lang: lang !== 'auto' ? lang : null,
-          timeout: timeout - 5000
-        }, (response) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) {
-            console.warn('[EmbedFrame] Runtime error:', chrome.runtime.lastError.message);
-            return resolve(null);
+      // Embed-frame shares the page with Tier 1.7's coercion, so concurrent
+      // batch workers would inject/remove the same fixed iframe id. Serialize
+      // on the coercion lock — it is the same shared surface.
+      this._coerceLock = this._coerceLock.then(() => new Promise((innerResolve) => {
+        const passThrough = (result) => {
+          resolve(result);
+          innerResolve(result);
+        };
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+          if (tabs.length === 0) {
+            console.log('[EmbedFrame] No YouTube tab found');
+            return passThrough(null);
           }
-          if (!response?.success) {
-            console.log('[EmbedFrame] Failed:', response?.error || 'Unknown error');
-            if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
-            return resolve(null);
-          }
-          if (response?.result && response.result.length > 0) {
-            console.log(`[EmbedFrame] Success: ${response.result.length} segments`);
-            resolve(response.result);
-          } else {
-            console.log('[EmbedFrame] Empty result');
-            resolve(null);
-          }
+          const tab = tabs.find(t => t.active) || tabs[0];
+          const timer = setTimeout(() => {
+            console.log('[EmbedFrame] Timeout');
+            passThrough(null);
+          }, timeout);
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'INJECT_EMBED_FRAME',
+            videoId,
+            lang: lang !== 'auto' ? lang : null,
+            timeout: timeout - 2000
+          }, (response) => {
+            clearTimeout(timer);
+            if (chrome.runtime.lastError) {
+              console.warn('[EmbedFrame] Runtime error:', chrome.runtime.lastError.message);
+              return passThrough(null);
+            }
+            if (!response?.success) {
+              console.log('[EmbedFrame] Failed:', response?.error || 'Unknown error');
+              if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
+              return passThrough(null);
+            }
+            if (response?.result && response.result.length > 0) {
+              console.log(`[EmbedFrame] Success: ${response.result.length} segments`);
+              passThrough(response.result);
+            } else {
+              console.log('[EmbedFrame] Empty result');
+              passThrough(null);
+            }
+          });
         });
-      });
+      }));
     });
   }
 
@@ -299,7 +308,7 @@ export class TranslationManager {
   // Requires an active YouTube tab with a initialized player.
   // ─────────────────────────────────────────────────────────────
   async _coercePlayerTranscript(videoId, options = {}) {
-    const { lang = 'auto', timeout = 30000 } = options;
+    const { lang = 'auto', timeout = 25000 } = options;
     // Serialize: every caller drives the same movie_player via loadVideoById.
     return new Promise((resolve) => {
       this._coerceLock = this._coerceLock.then(() => new Promise((innerResolve) => {
@@ -321,7 +330,8 @@ export class TranslationManager {
             type: 'COERCE_PLAYER_TRANSCRIPT',
             videoId,
             lang: lang !== 'auto' ? lang : null,
-            timeout: timeout - 5000
+            desiredLang: lang !== 'auto' ? lang : null,
+            timeout: timeout - 2000
           }, (response) => {
             clearTimeout(timer);
             if (chrome.runtime.lastError) {
@@ -482,22 +492,34 @@ export class TranslationManager {
       await new Promise((r) => setTimeout(r, 3000));
     }
 
-    const deadline = Date.now() + Math.max(timeout - 33000, 5000);
+    const deadline = Date.now() + Math.max(timeout - 33000, 15000);
     while (Date.now() < deadline) {
-      const ready = await new Promise((resolve) => {
+      const state = await new Promise((resolve) => {
         chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
-          if (chrome.runtime.lastError) return resolve(false);
-          resolve(resp?.ready === true);
+          if (chrome.runtime.lastError) return resolve(null);
+          resolve(resp || null);
         });
       });
-      if (ready) {
-        console.log('[WatchSeed] Player ready');
+      // Usable the moment the API exists; a tracklist already present means
+      // the BotGuard handshake finished, otherwise keep waiting for it.
+      if (state?.ready === true && state?.hasCaptions !== true) {
+        console.log('[WatchSeed] Player API ready, waiting for attested tracklist...');
+      }
+      if (state?.ready === true && state?.hasCaptions === true) {
+        console.log('[WatchSeed] Player ready with attested tracklist');
         return true;
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    console.log('[WatchSeed] Player never became ready');
-    return false;
+    // Best effort: the API may still serve even if the tracklist probe missed.
+    const last = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
+        if (chrome.runtime.lastError) return resolve(false);
+        resolve(resp?.ready === true);
+      });
+    });
+    console.log(last ? '[WatchSeed] Player API ready (tracklist unconfirmed)' : '[WatchSeed] Player never became ready');
+    return last;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -2047,7 +2069,7 @@ export class TranslationManager {
       log('[Tier 1.6 Embed Frame] Attempting hidden embed iframe...');
       const frameResult = await this._fetchTranscriptViaEmbedFrame(videoId, {
         lang: sourceLang,
-        timeout: 25000
+        timeout: 10000
       });
 
       if (frameResult && frameResult.length > 0) {
@@ -2081,7 +2103,7 @@ export class TranslationManager {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
       const coerced = await this._coercePlayerTranscript(videoId, {
         lang: sourceLang,
-        timeout: 45000
+        timeout: 25000
       });
 
       if (coerced && coerced.length > 0) {
