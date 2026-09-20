@@ -289,11 +289,22 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   fetch/XHR hooks install. Batch showed "arms but zero timedtext" — the drive
   never ran at all. Fixed `8c9e44f` (close over local `player`). Rule: every
   sniffer identifier must be declared or closed over; no implicit globals.
-- **Stealing page attestation cannot unlock Hegel (content binding is real).**
-  2026-09-20 probes (temp specs, deleted): (1) donor video `KkOY9Arrg1Y`
-  yielded a real `pot=` (124 chars) + `ru` track; replaying Hegel `/player`
-  with the donor pot → still `LOGIN_REQUIRED`, tracks=0; donor timedtext URL
-  with `v=` swapped to Hegel → HTTP 404, not a body. (2) Hegel's own watch
-  page fired ZERO `/youtubei/v1/player|next` POSTs in 20s — no Hegel-bound
-  token exists on the page to steal. Steal is dead; only fresh per-video
-  minting (BgUtils `WebPoMinter.mint(videoId)`) remains on the table.
+- **CORRECTION 2026-09-21: the steal experiments were INVALID, not just
+  mis-ID'd** (outside review caught this). (1) The `/player` replay ran
+  unauthenticated from Node — no cookies, no session — so `LOGIN_REQUIRED`
+  was guaranteed with or without the donor `pot`. (2) Swapping `v=` in a
+  signed timedtext URL breaks the HMAC over `v`, so the 404 was guaranteed
+  regardless of token binding. Neither experiment could have succeeded, so
+  neither proves content binding. Status: **steal is UNTESTED, not dead.**
+  (2)'s zero-POST observation stands as a page fact but says nothing about
+  token reuse. Do not cite "content binding confirmed" — re-run properly
+  (authenticated replay of the exact unmodified URL) before claiming it.
+- **Replay discriminator (2026-09-21): the rejected token is genuinely bad,
+  not environment-blocked.** Exact unmodified timedtext URL from the test
+  browser (120-char `pot`, `ip=0.0.0.0` so not IP-bound by signature) fetched
+  via curl on the machine's own egress (REDACTED, `--noproxy '*'`) and
+  with `cbr=HeadlessChrome`→`Chrome` → HTTP 200 + 0 bytes both times. The
+  token travels cleanly; the server empties the body for the token itself.
+  H1 (bad token) lives; H2 (distrusted egress) is out for this URL. Minting
+  earns its cost — next: BgUtils Node spike (fresh `WebPoMinter.mint(videoId)`
+  → `getBasicInfo`, check captionTracks; watch issue #48 WEB-client caveat).

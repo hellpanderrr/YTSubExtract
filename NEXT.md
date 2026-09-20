@@ -14,8 +14,11 @@ Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
   timedtext WITH 120-char `pot`, receives HTTP 200 + 0-byte body. User's Chrome:
   556 segments. So the page DOES attest — the server just rejects this session's
   token. Prior `u-CLv5-hbqk` probes are VOID (8s meme, no subs — zero tracks is
-  correct). Next: BgUtils Node spike — mint fresh per-video token, check whether
-  a self-minted token passes where the page's own token fails.
+  correct). Replay discriminator 2026-09-21: exact rejected URL via curl on
+  machine egress (REDACTED) → 200 + 0 bytes, with and without the
+  `cbr=HeadlessChrome` marker. Token genuinely bad (H1 lives, H2 out). Steal
+  experiments INVALID per review — untested, not dead. Next: BgUtils Node spike
+  (mint → getBasicInfo → captionTracks?; watch issue #48 WEB-client caveat).
 - **Single-video path uses ~10 dead ISOLATED player handlers** (`FORCE_CC_TRIGGER`,
   `GET_PLAYER_TRACKS`, `GET_PAGE_CONTEXT_*`, `FETCH_TIER2_*` — class sweep done,
   fixes not): route via scripting or retire.
