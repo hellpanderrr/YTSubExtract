@@ -271,14 +271,17 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   fired a caption request for ASR-gated videos; embed page carries no
   `captionTracks` for Hegel at all. Removed from the batch chain (handler kept
   for single/manual use).
-- **Hegel is server-gated per session, not client-broken.** 2026-09-20 HEADED
-  probe (logged in, no headless): `movie_player.getPlayerResponse()` for
-  `u-CLv5-hbqk` carries zero captionTracks, player playing fine, zero timedtext
-  requests before or after loadModule+setOption+toggleSubtitles. The historic
-  2/4 wins came from the correct account holder's attested payload, not from
-  any client sequence reproducible here — cold-API tricks (SAPISIDHASH
-  InnerTube, menu-button drive) chase a tracklist the page never yields.
-  ✅ enforced by `8c9e44f` (restored sniffer arm machinery) + this entry.
+- **CORRECTION 2026-09-21: the "server-gated Hegel" probes targeted the wrong
+  video.** All 2026-09-20 probes used `u-CLv5-hbqk` — an 8-second meme with no
+  subs, where zero tracks / zero timedtext is CORRECT behavior, not gating.
+  The real Hegel is `PJ2ThKDsbmc`: in the signed-in test browser (headless AND
+  headed) the player lists `en/asr`, fires timedtext WITH a 120-char `pot`,
+  and gets HTTP 200 + **0-byte body** — a PoToken the server refuses to honor.
+  The user's main Chrome gets 556 segments from the same video. So the trust
+  gap is real, but its shape is narrower than claimed: attestation IS minted,
+  the token is just judged insufficient. "Steal is dead" below still stands
+  (donor pot correctly rejected for Hegel), but it was proven on the wrong ID
+  pair — the conclusion holds, the evidence needs the re-run, not the claim.
 - **An undeclared variable read inside the sniffer IIFE kills the whole hook.**
   `drivePlayerCoercion`'s `respTracks` closed over `playerRef` (assigned but
   never declared); under the IIFE's `'use strict'` even `playerRef?.x` throws
