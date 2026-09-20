@@ -198,3 +198,41 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   `.video-duration` ≥ 60s and takes the first yielding a real subtitle.
   Parse durations from the rows' `.video-duration` spans — the row text's
   leading index (`01 | Title | 23:26`) false-matches a naive time regex.
+
+## 2026-09-20 — batch ASR via player coercion (seed-once)
+
+- **ASR-gated videos are unextractable via any cold API call — the fix is
+  borrowing the player's attestation, not another client.** Every InnerTube
+  client (IOS/WEB/MWEB/ANDROID/TVHTML5) returns `LOGIN_REQUIRED` for such
+  videos regardless of visitorData, so the server never even lists caption
+  tracks. Single-video mode works because the watch page's own player solved
+  BotGuard and its session-blessed track URLs just get fetched. Batch needed
+  the same property: navigate the tab ONCE to a `/watch` page
+  (`seedWatchPage`, keeping `&list=`), then switch videos in-page via
+  `player.loadVideoById()` (Tier 1.7) so the real player makes
+  PoToken-authenticated timedtext requests the sniffer captures.
+  ✅ enforced by `src/background/main.mjs` (seed call) +
+  `src/background/translation-manager.mjs` (`seedWatchPage`, Tier 1.7) +
+  `src/content/content.js` (`CHECK_PLAYER_READY`, `COERCE_PLAYER_TRANSCRIPT`).
+- **Dead code that was never wired in is worse than missing code.** Both the
+  embed-iframe pathway (`INJECT_EMBED_FRAME`, Tier 1.6) and player coercion
+  (`COERCE_PLAYER_TRANSCRIPT`, Tier 1.7) existed fully written in content.js
+  since June and were called by nothing — the batch chain silently skipped
+  from Tier 1.5 to 2C. Sweep for zero-caller handlers before building new
+  tiers: `grep -rn <message-type> src/` and check for a sender.
+- **A playlist page has no `movie_player` — coercion needs a watch page.**
+  Probing showed `getElementById('movie_player')` is null on `list=LL`, so
+  Tier 1.7 failed fast there by design; the content script throws immediately
+  when `loadVideoById` is missing instead of burning the 40s timeout.
+- **The extension has only `activeTab`, not `tabs` — but `chrome.tabs.update`
+  on the active tab works.** `seedWatchPage`/`_fetchTranscriptViaTabNav` both
+  navigate the active/first YouTube tab without the `tabs` permission and
+  without user-visible breakage in e2e; the earlier "does not work like you
+  said" suspicion was wrong (a promise-form `await` quirk, not a permission
+  failure — verified by direct SW-evaluate nav probe).
+- **Benchmark the success path, not the failure path.** A 100-video LL run
+  measured ~30s/video and 1/100 success — but that was 99 videos each burning
+  the full tier chain (1.6's 25s + 1.7's 45s + 2C's 30s timeouts). The 3-video
+  probe (1 std + 2 ASR) is the meaningful benchmark: 2/3 in ~80s with a real
+  556-cue Hegel SRT. Per-batch tier timeouts dominate failing videos; skip
+  tiers per batch (not per video) if that ever matters.

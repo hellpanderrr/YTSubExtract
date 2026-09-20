@@ -1,32 +1,27 @@
 # Next
 
-_Updated 2026-09-19 — branch playlist-download_
+_Updated 2026-09-20 — branch playlist-download_
 
 ## State
-LL verified end-to-end: **listing + batch ZIP green (2 passed, 42.7s)** with a
-real SRT (`..._dQw4w9WgXcQ_auto.srt`). Login now uses real DPAPI (mock-keychain
-flags dropped); full suite **9 passed, 1 failed** — the failure is the public
-batch spec on an ASR-only video (BotGuard 0-byte bodies), not the harness.
+Batch now extracts ASR-gated videos: seed-once watch nav + Tier 1.7 player
+coercion (`30ac102`; 1.6/1.7 wiring in `5d4376b`/`8ace6db`). Verified: 3-video
+LL probe 2/3 with a real 556-cue Hegel SRT; LL spec **2 passed (46.7s)**.
 
 ## Open threads
-- **Public batch spec flakes on ASR-only content** (`0VH1Lim8gL8` got 2/3 with
-  `E2E_BATCH_EXPECT_SUCCESS=1`): same BotGuard class as LL row 0. Either point
-  it at a std-caption playlist or apply the LL row-walker pattern.
-- **Single-video ~1-in-4 flake** (retry rescued it). Not investigated.
+- **Player-path flake**: Hegel succeeded 2/4 runs (attestation/readiness timing).
+  Start: lengthen `seedWatchPage` readiness wait in `translation-manager.mjs`.
+- **Public batch on ASR-only content** + **single-video ~1-in-4 flake**: still open.
+- **Weekly CI smoke test** (public specs + auto-issue): designed, not written —
+  needs `.github/workflows/weekly-e2e.yml` + `.puppeteer-profile/` gitignore line.
 
 ## Running / unfinished
 - Nothing in background. Golden profile holds the working login (gitignored).
 
 ## Don't redo
-- **Do NOT copy cookies between Chrome profiles.** App-bound encryption
-  (Chrome 127+) binds keys to the source user-data dir — copies never
-  decrypt. Log in via `npm run e2e:login` (real-keychain flags); wipe
-  `.e2e-profile-golden/` first if re-seeding after flag changes.
-- **Google flags Playwright's login window** unless `--enable-automation` is
-  stripped and `--disable-blink-features=AutomationControlled` is set.
-- **Row 0 of LL is not a fixture** — walk `.video-duration` ≥ 60s rows.
-- **A batch ZIP with only `_errors.txt` is a bug, not BotGuard** (auto→en fix);
-  but ASR-only videos genuinely fail every tier (HTTP 200, 0 bytes).
-- **The system proxy must be up** (`ProxyEnable=0` breaks youtube.com).
-- **No `--disable-software-rasterizer`** with `--disable-gpu`.
+- **Cold API calls can never serve ASR-gated tracks** (all clients → LOGIN_REQUIRED).
+  Borrow player attestation (seed + coercion), don't rotate clients/headers.
+- **Playlist pages have no `movie_player`** — Tier 1.7 needs the seeded watch page.
+- **Do NOT copy cookies between profiles** (app-bound encryption); `npm run e2e:login`.
+- **Row 0 of LL is not a fixture**; `_errors.txt`-only ZIP is a bug, not BotGuard.
+- **Proxy must be up**; no `--disable-software-rasterizer`; `activeTab` suffices for tab nav.
 - Full history in `docs/LESSONS.md`.
