@@ -461,6 +461,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // === PLAYER READINESS PROBE (Tier 1.7 seed) ===
+  // Reports whether this tab hosts a usable movie_player for loadVideoById
+  // coercion. Used by _ensureWatchPlayer to decide if a navigation is needed.
+  if (msg.type === 'CHECK_PLAYER_READY') {
+    const player = document.getElementById('movie_player');
+    sendResponse({
+      ready: !!player && typeof player.loadVideoById === 'function',
+    });
+    return true;
+  }
+
   // === TIER 0.5: Player API ===
   if (msg.type === 'GET_PLAYER_TRACKS') {
     (async () => {

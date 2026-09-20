@@ -441,6 +441,65 @@ export class TranslationManager {
   });       // outer promise
 }
 
+  /**
+   * Seed the active YouTube tab to a /watch page ONCE per batch so Tier 1.7
+   * player coercion has a real movie_player to drive via loadVideoById.
+   * No-op when the tab is already on /watch. Saves the pre-batch URL for
+   * restoreOriginalTab. Resolves true when a usable player is present.
+   */
+  async seedWatchPage(videoId, playlistId = null, timeout = 45000) {
+    const tab = await new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        resolve(tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null);
+      });
+    });
+    if (!tab) {
+      console.log('[WatchSeed] No YouTube tab found');
+      return false;
+    }
+
+    if (!this._originalTabUrl) this._originalTabUrl = tab.url;
+
+    if (!/youtube\.com\/watch\?/.test(tab.url || '')) {
+      let url = `https://www.youtube.com/watch?v=${videoId}`;
+      if (playlistId) url += `&list=${playlistId}`;
+      console.log(`[WatchSeed] Navigating tab ${tab.id} once to ${url}`);
+      await chrome.tabs.update(tab.id, { url });
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        }, 30000);
+        const onUpdated = (tabId, changeInfo) => {
+          if (tabId === tab.id && changeInfo.status === 'complete') {
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+      });
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+
+    const deadline = Date.now() + Math.max(timeout - 33000, 5000);
+    while (Date.now() < deadline) {
+      const ready = await new Promise((resolve) => {
+        chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
+          if (chrome.runtime.lastError) return resolve(false);
+          resolve(resp?.ready === true);
+        });
+      });
+      if (ready) {
+        console.log('[WatchSeed] Player ready');
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    console.log('[WatchSeed] Player never became ready');
+    return false;
+  }
+
   // ─────────────────────────────────────────────────────────────
   // RESTORE ORIGINAL TAB (after batch navigation is done)
   // ─────────────────────────────────────────────────────────────
@@ -2011,12 +2070,13 @@ export class TranslationManager {
     }
 
     // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
-    // Calls player.loadVideoById() on the existing movie_player in the active
-    // YouTube tab — same-page video switch, no navigation, no page load. The
-    // REAL player solves BotGuard and makes PoToken-authenticated timedtext
-    // requests, captured by the MAIN-world sniffer. Calls serialize on
-    // _coerceLock since all workers drive the one shared player; API tiers
-    // above stay parallel. Only runs when a YouTube tab exists.
+    // Switches videos in-page via player.loadVideoById() — no navigation, no
+    // page load — so the REAL player solves BotGuard and makes
+    // PoToken-authenticated timedtext requests, captured by the MAIN-world
+    // sniffer. Requires the tab to already be on a /watch page (batch seeds
+    // it once via seedWatchPage in main.mjs); otherwise the content script
+    // fails fast. Calls serialize on _coerceLock since all workers drive the
+    // one shared player; API tiers above stay parallel.
     try {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
       const coerced = await this._coercePlayerTranscript(videoId, {

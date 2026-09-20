@@ -405,7 +405,13 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       }
     });
 
-    // Run batch processing
+    // Seed the tab ONCE to a /watch page so Tier 1.7 player coercion has a
+    // real movie_player to drive via loadVideoById (one navigation per
+    // batch; later videos switch in-page). Keeps playlist context (&list=).
+    // restoreOriginalTab (end of batch) returns the user to the list page.
+    if (videos.length > 0) {
+      await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
+    }
     results = await processor.process(videos, options);
 
     // Create ZIP with subtitles
