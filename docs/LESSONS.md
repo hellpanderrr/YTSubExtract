@@ -286,3 +286,11 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   fetch/XHR hooks install. Batch showed "arms but zero timedtext" — the drive
   never ran at all. Fixed `8c9e44f` (close over local `player`). Rule: every
   sniffer identifier must be declared or closed over; no implicit globals.
+- **Stealing page attestation cannot unlock Hegel (content binding is real).**
+  2026-09-20 probes (temp specs, deleted): (1) donor video `KkOY9Arrg1Y`
+  yielded a real `pot=` (124 chars) + `ru` track; replaying Hegel `/player`
+  with the donor pot → still `LOGIN_REQUIRED`, tracks=0; donor timedtext URL
+  with `v=` swapped to Hegel → HTTP 404, not a body. (2) Hegel's own watch
+  page fired ZERO `/youtubei/v1/player|next` POSTs in 20s — no Hegel-bound
+  token exists on the page to steal. Steal is dead; only fresh per-video
+  minting (BgUtils `WebPoMinter.mint(videoId)`) remains on the table.

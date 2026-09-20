@@ -14,8 +14,11 @@ Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
   headed, playerState=1, zero timedtext requests pre/post arm. The 2/4 wins are the
   correct account holder's attested payload, not reproducible here. Don't chase
   client tricks (menu-button drive, SAPISIDHASH InnerTube): page already yields no
-  tracklist to drive against. Next real lever: bgutil-style PoToken minting (see
-  trials doc) — or accept 2C tab-nav as the ceiling.
+  tracklist to drive against. Steal ruled out 2026-09-20: donor `pot` fails on
+  Hegel (`LOGIN_REQUIRED`; swapped timedtext URL → 404), and Hegel's page fires
+  zero Innertube POSTs to steal from. Next real lever: fresh per-video minting
+  (BgUtils `WebPoMinter.mint(videoId)`; youtubei.js already accepts `po_token`)
+  — or accept 2C tab-nav as the ceiling.
 - **Single-video path uses ~10 dead ISOLATED player handlers** (`FORCE_CC_TRIGGER`,
   `GET_PLAYER_TRACKS`, `GET_PAGE_CONTEXT_*`, `FETCH_TIER2_*` — class sweep done,
   fixes not): route via scripting or retire.
