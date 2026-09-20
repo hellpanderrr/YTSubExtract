@@ -3,25 +3,30 @@
 _Updated 2026-09-20 — branch playlist-download_
 
 ## State
-Batch now extracts ASR-gated videos: seed-once watch nav + Tier 1.7 player
-coercion (`30ac102`; 1.6/1.7 wiring in `5d4376b`/`8ace6db`). Verified: 3-video
-LL probe 2/3 with a real 556-cue Hegel SRT; LL spec **2 passed (46.7s)**.
+Proved ISOLATED→MAIN is a wall: Tier 1.7 never touched the player since June
+(injection doesn't execute, cross-world postMessage doesn't arrive). Rerouted
+via sniffer bridge + `chrome.scripting` MAIN fallback (`6f790ed`); dropped dead
+Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
 
 ## Open threads
-- **Player-path flake**: Hegel succeeded 2/4 runs (attestation/readiness timing).
-  Start: lengthen `seedWatchPage` readiness wait in `translation-manager.mjs`.
-- **Public batch on ASR-only content** + **single-video ~1-in-4 flake**: still open.
-- **Weekly CI smoke test** (public specs + auto-issue): designed, not written —
-  needs `.github/workflows/weekly-e2e.yml` + `.puppeteer-profile/` gitignore line.
+- **Hegel still gated**: player arms (`respTracks=0`) but issues zero timedtext
+  requests; cold tiers 400, embed has no tracks. Next: headed run (headless may
+  be the whole problem), then SAPISIDHASH-authenticated InnerTube from background.
+- **Single-video path uses ~10 dead ISOLATED player handlers** (`FORCE_CC_TRIGGER`,
+  `GET_PLAYER_TRACKS`, `GET_PAGE_CONTEXT_*`, `FETCH_TIER2_*` — class sweep done,
+  fixes not): route via scripting or retire.
+- **Weekly CI smoke test**: designed, not written — `.github/workflows/weekly-e2e.yml`.
 
 ## Running / unfinished
 - Nothing in background. Golden profile holds the working login (gitignored).
+- All temp probe specs deleted; `e2e/` holds only the 5 permanent specs.
 
 ## Don't redo
-- **Cold API calls can never serve ASR-gated tracks** (all clients → LOGIN_REQUIRED).
-  Borrow player attestation (seed + coercion), don't rotate clients/headers.
-- **Playlist pages have no `movie_player`** — Tier 1.7 needs the seeded watch page.
-- **Do NOT copy cookies between profiles** (app-bound encryption); `npm run e2e:login`.
-- **Row 0 of LL is not a fixture**; `_errors.txt`-only ZIP is a bug, not BotGuard.
-- **Proxy must be up**; no `--disable-software-rasterizer`; `activeTab` suffices for tab nav.
+- **Never inject `<script>` from ISOLATED world, never cross-world postMessage**
+  — use document_start MAIN script or `chrome.scripting` (`scripting` perm added).
+- **Don't `event.source`-filter the sniffer listener**; type+requestId is the boundary.
+- **Track truth = `getPlayerResponse`, not `getOption`** (empty in headless).
+- **Seed URL pinned to batch video + `autoplay=0`**; bare `/watch?` check let YT wander.
+- **Cold API can't serve ASR-gated tracks**; cookies don't replace PoToken.
+- **No cookie copies** (app-bound encryption); **proxy must be up**; stash≠baseline when `dist/` untracked.
 - Full history in `docs/LESSONS.md`.

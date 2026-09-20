@@ -236,3 +236,38 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   probe (1 std + 2 ASR) is the meaningful benchmark: 2/3 in ~80s with a real
   556-cue Hegel SRT. Per-batch tier timeouts dominate failing videos; skip
   tiers per batch (not per video) if that ever matters.
+
+## 2026-09-20 (pm) — ISOLATED↔MAIN is a wall, not a membrane
+
+- **Script injection from an ISOLATED content script does not execute on
+  youtube.com, and ISOLATED→MAIN `window.postMessage` does not cross worlds.**
+  Proven by probe: injected `document.documentElement.dataset` flag never
+  appeared page-side; sniffer-bridge messages never answered. Consequence: every
+  `loadVideoById` drive and every MAIN-world player read issued from
+  `content.js` silently did nothing since June — Tier 1.7's 2/4 Hegel wins came
+  from cold tiers getting lucky, not coercion. Sweep rule: any content-script
+  code that touches page JS (player API, page globals) must route through a
+  document_start MAIN-world script or `chrome.scripting.executeScript`
+  (`{world:'MAIN'}`); never inject, never cross-world postMessage.
+  ✅ enforced by `src/background/main.mjs` (`PROBE_PLAYER_MAIN` /
+  `DRIVE_PLAYER_MAIN` via `chrome.scripting`, `scripting` permission in
+  `manifest.json`) + `src/content/sniffer.js` (MAIN-world probe/drive fns).
+- **Do NOT filter the sniffer's message listener by `event.source`.** The one
+  `if (event.source !== window) return` that remains (MAIN_WORLD_FETCH handler)
+  drops exactly the ISOLATED-world messages the bridge exists for. Type +
+  requestId matching is the trust boundary.
+- **`getOption('captions','tracklist')` stays empty in headless even when
+  `getPlayerResponse` carries tracks.** Seed saw `en/asr` via the response while
+  drive saw zero via getOption in the same session. Track source of truth is
+  `getPlayerResponse`; arm via setOption + toggle unconditionally.
+- **Pin the seed URL to the batch video (`&autoplay=0`).** YT auto-navigated to
+  "up next" mid-batch (seed reported ready for `swR4nszZcCA` while coercing
+  `u-CLv5-hbqk`); checking only `/watch?` let the wrong video validate.
+- **A `git stash` baseline is invalid when `dist/` is untracked and rebuilt.**
+  Stashing `src/` while `dist/` still holds the new build tests the new code
+  and calls it baseline. Rebuild from stashed source or check `git status`
+  for untracked build output first.
+- **Tier 1.6 (nocookie embed iframe) is dead weight in batch.** Probes: never
+  fired a caption request for ASR-gated videos; embed page carries no
+  `captionTracks` for Hegel at all. Removed from the batch chain (handler kept
+  for single/manual use).
