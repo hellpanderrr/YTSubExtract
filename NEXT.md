@@ -1,42 +1,36 @@
 # Next
 
-_Updated 2026-09-20 — branch playlist-download_
+_Updated 2026-09-21 — branch playlist-download_
 
 ## State
-Proved ISOLATED→MAIN is a wall: Tier 1.7 never touched the player since June
-(injection doesn't execute, cross-world postMessage doesn't arrive). Rerouted
-via sniffer bridge + `chrome.scripting` MAIN fallback (`6f790ed`); dropped dead
-Tier 1.6 from batch. LL spec **2 passed (40.4s), EXIT=0**.
+Stale `dist/` (Sep-20 11:47, pre-1.7 wiring) was the whole bug. Fresh build:
+9/9 Difference-and-Repetition in-page, Hegel in batch, LL 5/6 (only the
+captionless meme fails). Latency trims shipped in `4d35ce2` (settled-fast 1.7,
+fast-abort 2C, `iOS` fix); smoke 3 + LL spec 2 passed. All temp probe specs
+deleted; `e2e/` holds only the 5 permanent specs.
 
 ## Open threads
-- **Hegel trust gap, precisely shaped** (2026-09-21, real ID `PJ2ThKDsbmc`):
-  test browser (headless AND headed, signed in) gets `en/asr` tracklist, fires
-  timedtext WITH 120-char `pot`, receives HTTP 200 + 0-byte body. User's Chrome:
-  556 segments. So the page DOES attest — the server just rejects this session's
-  token. Prior `u-CLv5-hbqk` probes are VOID (8s meme, no subs — zero tracks is
-  correct). Replay discriminator 2026-09-21: exact rejected URL via curl on
-  machine egress (REDACTED) → 200 + 0 bytes, with and without the
-  `cbr=HeadlessChrome` marker. Token genuinely bad (H1 lives, H2 out). Steal
-  experiments INVALID per review — untested, not dead. Next: BgUtils Node spike
-  (mint → getBasicInfo → captionTracks?; watch issue #48 WEB-client caveat).
-- **Single-video path uses ~10 dead ISOLATED player handlers** (`FORCE_CC_TRIGGER`,
-  `GET_PLAYER_TRACKS`, `GET_PAGE_CONTEXT_*`, `FETCH_TIER2_*` — class sweep done,
-  fixes not): route via scripting or retire.
-- **Weekly CI smoke test**: designed, not written — `.github/workflows/weekly-e2e.yml`.
+- **Unified page-leg lock**: `_coerceLock` (1.7) and `_tabNavLock` (2C) are
+  independent locks over one tab; under concurrency 3 a 2C nav can kill an
+  in-flight drive. One lock for both. Start: `translation-manager.mjs:310,366`.
+- **Circuit breaker**: after K consecutive full-chain failures, shorten
+  timeouts for the rest of the batch. Never designed, just proposed.
+- **Attestation findings UNSUPPORTED**: H1/H2, steal status, lock-race theory
+  were derived from stale-build runs — treat as open. Proposed guard: e2e
+  asserting the `[Tier 1.7 Player Coercion]` log line appears per video.
 
 ## Running / unfinished
 - Nothing in background. Golden profile holds the working login (gitignored).
-- All temp probe specs deleted; `e2e/` holds only the 5 permanent specs.
+- User reloads the extension from fresh `dist/` after each build (stale-build
+  lesson); remind them when shipping code for user-side runs.
 
 ## Don't redo
-- **Never inject `<script>` from ISOLATED world, never cross-world postMessage**
-  — use document_start MAIN script or `chrome.scripting` (`scripting` perm added).
-- **Don't `event.source`-filter the sniffer listener**; type+requestId is the boundary.
-- **`playerRef`-style undeclared globals inside the sniffer IIFE are fatal**:
-  optional-chained read still throws ReferenceError under `'use strict'`,
-  killing the fetch/XHR hook install. Close over locals, declare everything.
-- **Track truth = `getPlayerResponse`, not `getOption`** (empty in headless).
-- **Seed URL pinned to batch video + `autoplay=0`**; bare `/watch?` check let YT wander.
-- **Cold API can't serve ASR-gated tracks**; cookies don't replace PoToken.
-- **No cookie copies** (app-bound encryption); **proxy must be up**; stash≠baseline when `dist/` untracked.
+- **Rebuild + reload before ANY batch diagnosis** — check `dist/` mtimes vs
+  HEAD, grep bundle for tier markers. A whole saga was a stale bundle.
+- **Never inject `<script>` from ISOLATED, never cross-world postMessage** —
+  document_start MAIN script or `chrome.scripting` (`scripting` perm added).
+- **A raced 0-tracks never gates other tiers**; settled (videoId match × 2
+  polls) only short-circuits its own wait. Auth always runs (0.7s).
+- **Track truth = `getPlayerResponse`, not `getOption`**; seed pinned to batch
+  video + `autoplay=0`; no cookie copies; proxy must be up.
 - Full history in `docs/LESSONS.md`.

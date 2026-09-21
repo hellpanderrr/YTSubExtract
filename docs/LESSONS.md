@@ -308,3 +308,29 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   H1 (bad token) lives; H2 (distrusted egress) is out for this URL. Minting
   earns its cost — next: BgUtils Node spike (fresh `WebPoMinter.mint(videoId)`
   → `getBasicInfo`, check captionTracks; watch issue #48 WEB-client caveat).
+- **RESOLVED 2026-09-21: the whole attestation saga was a stale `dist/`.**
+  The user's Chrome ran a Sep-20-11:47 bundle predating Tier 1.7-in-batch
+  wiring — `_errors.txt` showed no 1.7 lines at all. Fresh `npm run build` +
+  extension reload: 9/9 Difference-and-Repetition SRTs in-page (no per-video
+  navigation), Hegel `PJ2ThKDsbmc` downloads in batch, LL 5/6 with the only
+  failure the captionless meme. Rule: **rebuild + reload before ANY batch
+  diagnosis** — check `dist/` mtimes vs HEAD and grep the bundle for the
+  tier markers first. The H1/H2 verdict, steal status, and lock-race theory
+  above were all derived from runs of the stale build and are UNSUPPORTED —
+  treat them as open, not settled.
+  ✅ enforced by nothing yet — proposed: e2e batch spec asserting the
+  `[Tier 1.7 Player Coercion]` line appears in per-video logs.
+- **A raced 0-tracks reading must never gate other tiers.** 2026-09-21
+  proposal (skip 2C/0.5 Auth when 1.7 reports 0 tracks) vetoed by two outside
+  reviews: the shared player under concurrency 3 can report 0 mid-switch /
+  wrong-video, and 0.5 Auth is an independent 0.7s path. Shipped instead:
+  settled-fast 1.7 (confirmed-this-video 0 on 2 polls reports immediately),
+  fast-abort 2C (~10s via `settledNoTracks`), Auth always runs.
+  ✅ enforced by `src/content/sniffer.js` (settledZeroStreak) +
+  `src/background/main.mjs` (scripting fallback mirror) +
+  `src/content/content.js` (POLL_TRANSCRIPT settledNoTracks) +
+  `src/background/translation-manager.mjs` (2C fast-abort).
+- **youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly.**
+  `'IOS'` logs `Unknown client name` and falls through to a default session;
+  the correct string is `'iOS'`. Found 2026-09-21 in SW console.
+  ✅ enforced by `src/background/tier3-worker.mjs` (`createFreshSession('iOS')`).

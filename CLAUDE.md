@@ -73,14 +73,15 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 0.1 (batch) | /next Transcript | Yes | No | `/youtubei/v1/next` engagement panel transcript (blocked for PoToken videos) |
 | 1 | InnerTube API | Yes | No | Direct API fetch with multiple client profiles (IOS, MWEB, WEB..., LOGIN_REQUIRED) |
 | 1.5 | Embed Page | Yes | No | Scrapes `/embed/{videoId}` for caption data (age-restricted, may be EMBEDDER_IDENTITY_DENIED) |
+| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via `_coerceLock`. Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. |
 | 2 | youtube-transcript | — | Yes | Uses `@playzone/youtube-transcript` library via content script |
-| 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. The only reliable method for PoToken-restricted videos. Serialized via `_tabNavLock` promise chain. |
+| 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via `_tabNavLock` promise chain. Fast-abort: settled-0-tracks via POLL_TRANSCRIPT aborts the 30s wait in ~10s. |
 | 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker |
 | 3 Native | | — | Yes | Content script fetch + background fetch with retry |
 | 4 | Page Context | — | Yes | Injects into page to get player response, multiple format fallbacks |
 | 0.5 Auth | Credentialed Fetch | Yes | Yes | Content script fetches watch page HTML with cookies, extracts ytInitialPlayerResponse captions |
 
-**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 3 (youtubei.js) → Tier 1 (InnerTube chain) → Tier 1.5 (embed page) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch)
+**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 3 (youtubei.js) → Tier 1 (InnerTube chain) → Tier 1.5 (embed page) → Tier 1.7 (player coercion) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch). youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly (`'iOS'`, not `'IOS'`).
 
 ### Key Architectural Decisions
 
