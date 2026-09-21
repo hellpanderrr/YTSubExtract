@@ -1800,7 +1800,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const { videoId } = msg;
     const videoMap = capturedTranscripts.get(videoId);
     if (!videoMap || videoMap.size === 0) {
-      sendResponse({ success: false, error: 'Not yet captured' });
+      // No capture yet — but report whether the page has SETTLED with 0
+      // tracks (confirmed-this-video response, nothing to wait for) vs still
+      // navigating (videoId mismatch). Lets TabNav fast-abort the wait while
+      // keeping the independent 0.5 Auth path. NOTE: this ISOLATED-side read
+      // only sees the API when page JS has attached it; an unreadable player
+      // reports not-settled (never a false "no tracks").
+      let settledNoTracks = false;
+      try {
+        const player = document.getElementById('movie_player');
+        const resp = (player && typeof player.getPlayerResponse === 'function')
+          ? player.getPlayerResponse()
+          : null;
+        if (resp && resp.videoDetails?.videoId === videoId) {
+          const tracks = resp.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+          settledNoTracks = tracks.length === 0;
+        }
+      } catch (e) { /* unreadable player → not settled */ }
+      sendResponse({ success: false, error: 'Not yet captured', settledNoTracks });
       return true;
     }
 

@@ -102,11 +102,24 @@ const MAIN_DRIVE_FUNC = (videoId, wantLang) => {
     if (cur?.videoDetails?.videoId === videoId && respTracks().length > 0) needLoad = false;
   } catch (e) {}
   const armCaptions = () => {
+    // Settled-fast (mirrors sniffer drivePlayerCoercion): a confirmed-this-
+    // video response with 0 tracks on 2 consecutive polls means nothing to
+    // arm against — report immediately instead of the full 25-try budget.
+    const settledVideoId = () => {
+      try { return player?.getPlayerResponse?.()?.videoDetails?.videoId || null; }
+      catch (e) { return null; }
+    };
     let trackTries = 0;
+    let settledZeroStreak = 0;
     const trackTimer = setInterval(() => {
       trackTries++;
       const tracks = respTracks();
-      if (tracks.length > 0 || trackTries > 25) {
+      if (tracks.length === 0 && settledVideoId() === videoId) {
+        settledZeroStreak++;
+      } else {
+        settledZeroStreak = 0;
+      }
+      if (tracks.length > 0 || trackTries > 25 || settledZeroStreak >= 2) {
         clearInterval(trackTimer);
         let pick = null;
         if (wantLang) pick = tracks.find((t) => t.languageCode === wantLang) || null;

@@ -419,6 +419,13 @@ export class TranslationManager {
           passThrough(null);
         }, timeout);
 
+        // Fast-abort: after navigation, check the player tracklist once
+        // settled. A confirmed-this-video response with 0 tracks means the
+        // page has nothing to capture — abort in ~10s instead of the full
+        // timeout. A videoId mismatch (mid-navigation response) is NOT
+        // settled and keeps polling. 0.5 Auth still runs afterwards (0.7s,
+        // independent path) so this aborts only the tab wait, not the video.
+        let settledZeroStreak = 0;
         const startPolling = () => {
           pollTimer = setInterval(() => {
             chrome.tabs.sendMessage(tab.id, {
@@ -431,6 +438,18 @@ export class TranslationManager {
                 resolved = true;
                 cleanup();
                 passThrough(response.result);
+                return;
+              }
+              if (response?.settledNoTracks === true) {
+                settledZeroStreak++;
+                if (settledZeroStreak >= 2) {
+                  console.log('[TabNav] Settled with 0 tracks, aborting wait (~10s, Auth still runs)');
+                  resolved = true;
+                  cleanup();
+                  passThrough(null);
+                }
+              } else {
+                settledZeroStreak = 0;
               }
             });
           }, 800);

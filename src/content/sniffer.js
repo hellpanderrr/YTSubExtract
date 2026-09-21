@@ -276,11 +276,27 @@
             // payload), not getOption (UI state, empty in headless). Poll the
             // response, then arm unconditionally: loadModule + setOption +
             // toggle. The player's own timedtext request is what we capture.
+            // Settled-fast: when the response is confirmed for THIS video
+            // (videoId matches) and tracks are still absent on 2 consecutive
+            // polls, the video has no tracklist to arm against — report 0
+            // immediately instead of burning the full 25-try budget. A 0 from
+            // a mid-switch response (videoId mismatch) is NOT settled and
+            // keeps polling.
+            const settledVideoId = () => {
+                try { return player?.getPlayerResponse?.()?.videoDetails?.videoId || null; }
+                catch (e) { return null; }
+            };
             let trackTries = 0;
+            let settledZeroStreak = 0;
             const trackTimer = setInterval(() => {
                 trackTries++;
                 const tracks = respTracks();
-                if (tracks.length > 0 || trackTries > 25) {
+                if (tracks.length === 0 && settledVideoId() === videoId) {
+                    settledZeroStreak++;
+                } else {
+                    settledZeroStreak = 0;
+                }
+                if (tracks.length > 0 || trackTries > 25 || settledZeroStreak >= 2) {
                     clearInterval(trackTimer);
                     window.postMessage({ type: 'COERCE_TRACKLIST', requestId, videoId,
                         tracks: tracks.map((t) => ({ languageCode: t.languageCode, kind: t.kind || null })) }, '*');

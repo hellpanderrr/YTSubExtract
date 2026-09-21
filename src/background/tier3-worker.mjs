@@ -25,7 +25,10 @@ if (typeof window === 'undefined') {
 // depending on the session's visitorData/poToken state. A fresh session
 // with IOS client gives the best chance of getting caption data.
 
-async function createFreshSession(client = 'IOS') {
+// NOTE: youtubei.js matches client_type against CLIENTS[*].NAME, which is
+// 'iOS' (lowercase i), NOT 'IOS' — 'IOS' logs "Unknown client name" and falls
+// through to a default session. (Found 2026-09-21 via SW log.)
+async function createFreshSession(client = 'iOS') {
   return await Innertube.create({
     lang: 'en',
     location: 'US',
@@ -99,7 +102,7 @@ export async function fetchTier3Transcript(videoId, options = {}) {
         targetLang = options.targetLang || 'ru';
     }
 
-    const yt = await createFreshSession('IOS');
+    const yt = await createFreshSession('iOS');
 
     // First, try IOS client for info (best for caption discovery).
     let info;
@@ -284,7 +287,7 @@ export async function fetchTier3Transcript(videoId, options = {}) {
 
 export async function getVideoMetadata(videoId) {
   try {
-    const yt = await createFreshSession('IOS');
+    const yt = await createFreshSession('iOS');
     let info;
     try {
       info = await yt.getInfo(videoId);
