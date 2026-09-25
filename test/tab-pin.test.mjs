@@ -231,3 +231,57 @@ test('_probeSettledNoTracks runs its probe in MAIN world and fails safe', async 
     state.scriptingHandler = null;
   }
 });
+
+test('a throwing page-leg cannot poison the lock chain', async () => {
+  state.tabs.push({ id: 1, url: 'https://www.youtube.com/', active: true });
+  tm._batchTabId = 1;
+  const orig = tm._resolvePageLegTab.bind(tm);
+
+  // First call: the leg's tab resolution throws synchronously inside the
+  // lock executor — this caller is lost (no timer started yet), but the
+  // CHAIN must survive. Without the _enqueuePageLeg .catch, _pageLegLock
+  // stays rejected forever and every later leg silently stalls.
+  tm._resolvePageLegTab = () => {
+    throw new Error('synthetic executor failure');
+  };
+  tm._coercePlayerTranscript('v1', { timeout: 500 }); // abandoned on purpose
+  await new Promise((r) => setTimeout(r, 30));
+  tm._resolvePageLegTab = orig;
+
+  // Second leg must fully execute (reach sendMessage) — with a poisoned
+  // chain its executor never runs and this await hangs forever, so race it
+  // against a hang detector.
+  const before = state.sentMessages.length;
+  const second = await Promise.race([
+    tm._coercePlayerTranscript('v2', { timeout: 2000 }),
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('second leg hung — lock chain poisoned')), 800)
+    ),
+  ]);
+  assert.ok(
+    state.sentMessages.length > before,
+    'second leg must reach sendMessage — chain not poisoned'
+  );
+  assert.equal(second, null);
+});
+
+test('re-pin re-captures the restore target from the replacement tab', async () => {
+  state.tabs.push(
+    { id: 1, url: 'https://www.youtube.com/feed/subscriptions', active: true },
+    { id: 7, url: 'https://www.youtube.com/@somechannel/videos', active: false }
+  );
+  // Batch seeded tab 42 (now closed); restore would carry ITS url
+  tm._batchTabId = 42;
+  tm._originalTabUrl = 'https://www.youtube.com/playlist?list=PLdead';
+
+  const tab = await tm._resolvePageLegTab();
+  assert.equal(tab.id, 1, 'fallback picked');
+  assert.equal(tm._batchTabId, 1, 're-pinned');
+  // The replacement tab must be restored to ITS OWN page, not the dead
+  // tab's playlist URL (round-3 review).
+  assert.equal(
+    tm._originalTabUrl,
+    'https://www.youtube.com/feed/subscriptions',
+    'restore target re-captured from the replacement tab'
+  );
+});

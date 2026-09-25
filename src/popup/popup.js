@@ -426,7 +426,12 @@ async function recoverStoppedZip(progress) {
     console.log('[Popup] Storage check for stopped ZIP failed:', e.message);
     return 'none';
   }
-  if (!tryAcquireZipDownloadLock()) return 'none';
+  if (!tryAcquireZipDownloadLock()) {
+    // Contention: another delivery is in progress — that is NOT "nothing
+    // parked". Report 'failed' so the caller keeps the record until the
+    // in-flight delivery decides (success clears, failure keeps).
+    return 'failed';
+  }
   try {
     // Swallows its own errors internally and returns whether it delivered.
     const delivered = await downloadCompletedZip(progress.downloadId);

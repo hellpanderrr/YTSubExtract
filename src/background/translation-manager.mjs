@@ -38,6 +38,22 @@ export class TranslationManager {
     this._batchCancelled = false;
   }
 
+  /**
+   * Queue one page-leg operation on the shared lock chain.
+   * The trailing .catch is load-bearing: without it, a single executor that
+   * throws before passThrough would leave _pageLegLock permanently rejected
+   * and EVERY future page-leg would silently stall for the rest of the
+   * service worker's life (round-3 review finding). The failed leg's own
+   * caller still times out via its timer; the chain survives.
+   */
+  _enqueuePageLeg(fn) {
+    this._pageLegLock = this._pageLegLock
+      .then(fn)
+      .catch((e) => {
+        console.error('[PageLeg] page-leg threw — lock chain recovered:', e);
+      });
+  }
+
   // ─────────────────────────────────────────────────────────────
   // Resolve the tab for a MUTATING page-leg call.
   // Prefers the batch-pinned tab; falls back to active-or-first only when
@@ -56,7 +72,11 @@ export class TranslationManager {
         const pick = tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null;
         if (pick && rePin) {
           this._batchTabId = pick.id;
-          console.log(`[PageLeg] Re-pinned driver tab to ${pick.id} after pin death`);
+          // Restore must return THIS tab to ITS OWN page — not dead tab's
+          // URL (round-3 review: re-pin without re-capture navigates the
+          // replacement tab to a playlist the user never had there).
+          if (pick.url) this._originalTabUrl = pick.url;
+          console.log(`[PageLeg] Re-pinned driver tab to ${pick.id} after pin death (restore target: ${this._originalTabUrl})`);
         }
         resolve(pick);
       };
@@ -306,7 +326,7 @@ export class TranslationManager {
       // Embed-frame shares the page with Tier 1.7's coercion, so concurrent
       // batch workers would inject/remove the same fixed iframe id. Serialize
       // on the coercion lock — it is the same shared surface.
-      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
+      this._enqueuePageLeg(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);
@@ -363,7 +383,7 @@ export class TranslationManager {
     const { lang = 'auto', timeout = 25000 } = options;
     // Serialize: every caller drives the same movie_player via loadVideoById.
     return new Promise((resolve) => {
-      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
+      this._enqueuePageLeg(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);
@@ -422,7 +442,7 @@ export class TranslationManager {
     const { timeout = 30000 } = options;
     // Serialize via lock to prevent concurrent tab navigations
     return new Promise((resolve) => {
-      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
+      this._enqueuePageLeg(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);

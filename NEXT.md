@@ -43,6 +43,10 @@ smoke 3 passed. CLAUDE.md lock docs synced.
 - **#13** Docs drift: CLAUDE.md's "DNR rule 4 (iOS UA spoof on timedtext)"
   does not exist in `rules.json`; single-video tier table lists 1.7/2C/Auth
   for `extractWithTranslation` (batch-only in code).
+- **#14** A permanently undeliverable parked ZIP retries on every popup open
+  with no dismiss/abandon affordance (round-3 review, minor UX).
+- **#15** Chain comment slightly overclaims: cache-hit returns before
+  `throwIfStopped` (desirable behavior, comment says every boundary).
 
 ## Running / unfinished
 - 4+ commits ready locally for push (review-fix series + this fix pass).
