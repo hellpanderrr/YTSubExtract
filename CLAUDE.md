@@ -72,7 +72,7 @@ src/
 ### Multi-Tier Extraction System
 
 Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`).
-**Single video** (`extractWithTranslation`) uses all tiers; **playlist batch** (`getTranscriptForPlaylist`) uses only the API/navigation tiers:
+**Single video** (`extractWithTranslation`) runs the non-tab-nav tiers; **1.7/2C/0.5 Auth are batch-only** (verified 2026-09-25: the single-video chain never calls them); **playlist batch** (`getTranscriptForPlaylist`) uses the API/navigation tiers:
 
 | Tier | Name | Batch? | Active Tab? | Description |
 |------|------|--------|-------------|-------------|
@@ -98,11 +98,12 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 - **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. `content.js` (document_idle, ISOLATED world) injects a bootstrap script that reads this global and relays it via `postMessage` to the ISOLATED-world `capturedTranscripts` Map. This solves the timing gap where the content script's message listener doesn't exist when the sniffer fires at document_start.
 - **event.source filtering**: `content.js` **must not** use `if (event.source !== window) return;` for `YTSUB_CAPTURED_TRANSCRIPT` messages — iframes send `window.parent.postMessage()` where `event.source` is the iframe window, not the top window.
 - **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7/embed so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
-- **DNR rules** (`rules.json`):
-  - Rule 1: Remove `X-Frame-Options`, `Content-Security-Policy`, `CSP-Report-Only` from `youtube.com` sub_frame responses (enables watch page in iframe)
-  - Rule 2: Same for `youtube-nocookie.com` sub_frames
-  - Rule 3: Set `Origin: https://www.youtube.com` on youtube.com API requests
-  - Rule 4: Remove `Sec-Ch-Ua` headers, spoof iOS UA on timedtext requests
+- **DNR rules** (`rules.json` — 4 rules, ids 1/3/4/5; verified 2026-09-25):
+  - id 4: Remove `X-Frame-Options`/`Content-Security-Policy`/`CSP-Report-Only` from `youtube.com` sub_frame responses (enables watch page in iframe)
+  - id 5: Same for `youtube-nocookie.com` sub_frames
+  - id 1: Set `Origin`/`Referer` on `youtubei/v1` requests, remove `Sec-Ch-Ua*` request headers
+  - id 3: Set `Origin`/`Referer` on `youtube.com/watch` API requests
+  (There is no timedtext iOS-UA-spoof rule — the old "Rule 4" claim never existed in the file.)
 - **fflate** (sync) used for ZIP creation since Web Workers don't work in Service Workers
 - **Batch processing** uses a semaphore (concurrency: 3, 300ms delay with jitter) to rate-limit playlist downloads
 - **Progress polling**: background writes to `chrome.storage.local`, popup polls every 500ms

@@ -330,7 +330,45 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   `src/background/main.mjs` (scripting fallback mirror) +
   `src/content/content.js` (POLL_TRANSCRIPT settledNoTracks) +
   `src/background/translation-manager.mjs` (2C fast-abort).
+  ⚠ SUPERSEDED 2026-09-25: the `settledNoTracks` legs of this annotation
+  never worked — an ISOLATED-world `getPlayerResponse()` read is always
+  dead (the wall entry above, also documented in content.js:467 itself),
+  so the shipped fast-abort silently never fired. Re-routed to the
+  MAIN-world `_probeSettledNoTracks` (`chrome.scripting world:'MAIN'`).
+  ✅ now also enforced by `test/tab-pin.test.mjs` (probe + chain tests).
 - **youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly.**
   `'IOS'` logs `Unknown client name` and falls through to a default session;
   the correct string is `'iOS'`. Found 2026-09-21 in SW console.
   ✅ enforced by `src/background/tier3-worker.mjs` (`createFreshSession('iOS')`).
+
+## 2026-09-25 — full-review fix-pass round
+- **Never `git checkout -- <file>` to undo a test mutation while the file
+  holds uncommitted work.** Used twice this session, wiping all of that
+  file's edits twice (recovered verbatim both times). Standing form: commit
+  first, then mutate and `git checkout` — or reverse the mutation with an
+  exact-string script. Mutation-testing itself is now standard here: every
+  guard added this session was proven by breaking it and watching the right
+  test fail.
+  ✅ enforced by this entry + NEXT.md Don't-redo.
+- **A shipped feature can ship carrying its own refutation in a comment.**
+  2C fast-abort used an ISOLATED-world player read that content.js:467
+  (same file!) documented as always-dead, and LESSONS' own ISOLATED↔MAIN
+  wall entry predated the feature. Rule: any new probe must be checked
+  against the wall entry before shipping; "fail-safe to false" hides the
+  breakage (it just never fires).
+  ✅ enforced by `test/tab-pin.test.mjs` (`_probeSettledNoTracks`).
+- **Async phase-transition tests pass vacuously unless the phase is pinned.**
+  The stop-then-throw test initially passed because Stop could land before
+  the worker entered the gated call (the worker was then skipped, and the
+  ZIP-throw never happened). Rule: `waitFor(() => inFlight)` BEFORE sending
+  the signal that must be observed mid-phase.
+  ✅ enforced by `test/stop-state.test.mjs` (in-flight waits).
+- **Large python heredocs (~150+ lines) break shell parsing in this
+  environment** (twice: `unexpected EOF while looking for matching '`).
+  Write the script to a file, run it, delete it.
+- **CLAUDE.md's DNR block described rules 1-4 that did not match
+  `rules.json` ids (1/3/4/5) and claimed a timedtext iOS-UA-spoof rule that
+  never existed**; its single-video tier line also implied 1.7/2C/Auth run
+  single-video (batch-only). Both corrected in place 2026-09-25 per the
+  close-skill stale-doc rule; the superseded claims live here with their
+  date.
