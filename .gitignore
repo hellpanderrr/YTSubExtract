@@ -14,3 +14,7 @@ builds/
 logs/
 test-results/
 playwright-report/
+
+# local secrets / session artifacts (oauth client_secret, live PoToken probes)
+*oauth*.json
+YOUTUBE_POTOKEN_TRIALS.md

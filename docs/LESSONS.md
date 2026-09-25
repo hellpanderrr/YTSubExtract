@@ -302,7 +302,7 @@ append `✅ enforced by <path>` to that entry rather than removing it.
 - **Replay discriminator (2026-09-21): the rejected token is genuinely bad,
   not environment-blocked.** Exact unmodified timedtext URL from the test
   browser (120-char `pot`, `ip=0.0.0.0` so not IP-bound by signature) fetched
-  via curl on the machine's own egress (REDACTED, `--noproxy '*'`) and
+  via curl on the machine's own egress (IP redacted, `--noproxy '*'`) and
   with `cbr=HeadlessChrome`→`Chrome` → HTTP 200 + 0 bytes both times. The
   token travels cleanly; the server empties the body for the token itself.
   H1 (bad token) lives; H2 (distrusted egress) is out for this URL. Minting
