@@ -18,8 +18,8 @@ on ok), **#14** "Discard ZIP" button when a parked ZIP won't deliver, **#15**
 cache-hit comment corrected. `npm test` 37/37 (+10 new cases, every new
 behavior mutation-checked), build green, smoke 3/3. A DS `/adv` review of
 the pass was addressed same session.
-**Unpushed: `390d706` + `9a3d4a6` + `b8eb27b` + `db4607f` + `0645794`
-(5 ahead).**
+**Unpushed: 7 ahead of origin (from `390d706` through this file's own
+docs commit — live list: `git log --oneline origin/playlist-download..HEAD`).**
 
 ## Open threads
 - Push when asked; then the user's manual proof from a fresh `dist/`:
