@@ -1,6 +1,7 @@
 import { toSRT, toVTT, toTXT } from '../utils/subtitle-formats.js';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import { isPlaylistUrl, extractPlaylistId, fetchPlaylistVideos } from '../utils/playlist-extractor.js';
+import { extractVideoId, isYouTubeHost } from '../utils/video-url.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
@@ -49,12 +50,13 @@ function setStatus(msg, type = 'info', loading = false) {
   statusEl.textContent = msg;
   statusEl.title = msg; // Tooltip for long text
   statusEl.style.color = type === 'error' ? '#d32f2f' : (type === 'success' ? '#2e7d32' : '#666');
-  
-  if (loading) {
-    statusIcon.classList.remove('hidden');
-  } else {
-    statusIcon.classList.add('hidden');
-  }
+
+  // CSS keys visibility off `.spinner.active` (`.spinner` itself is
+  // display:none); `hidden` is belt-and-braces. Toggling only `hidden` — as
+  // this did until 2026-09-25 — left the spinner invisible in EVERY loading
+  // state (playlist load, "Fetching languages…", batch start/progress).
+  statusIcon.classList.toggle('active', loading);
+  statusIcon.classList.toggle('hidden', !loading);
 }
 
 function showLogs(logs) {
@@ -109,6 +111,36 @@ function updateTranslationState() {
   }
 }
 
+/**
+ * Last-resort video-ID detection for YouTube URLs that carry no ID in the URL
+ * itself (e.g. /@channel/live). Reads the player from the MAIN world — the
+ * ISOLATED popup cannot touch page-JS expandos like getPlayerResponse.
+ * Returns null on any failure (no player, non-injectable tab, etc).
+ */
+async function probePageVideoId(tabId) {
+  if (tabId == null || !chrome.scripting) return null;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        try {
+          const p = document.getElementById('movie_player');
+          const r = (p && typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+          const id = r?.videoDetails?.videoId;
+          if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return id;
+        } catch (e) { /* fall through */ }
+        const m = location.pathname.match(/^\/(?:live|shorts|embed|v)\/([A-Za-z0-9_-]{11})/);
+        return m ? m[1] : null;
+      },
+    });
+    return res?.result || null;
+  } catch (e) {
+    console.log('[Popup] probePageVideoId failed:', e.message);
+    return null;
+  }
+}
+
 async function init() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -135,38 +167,44 @@ async function init() {
       if (controlsEl) controlsEl.classList.add('hidden');
       playlistModeEl.classList.remove('hidden');
 
-      await loadPlaylistVideos(currentPlaylistId);
-
-      // Check if there's an active download for this playlist
-      await checkAndRestoreProgress();
-
-      // Enable download button only after confirming no active download
-      const selected = currentPlaylistVideos.filter(v => v.selected).length;
-      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
+      const videos = await loadPlaylistVideos(currentPlaylistId);
+      if (videos) {
+        await finalizePlaylistLoad(videos);
+      }
       return;
     }
-    
-    // Single video mode
-    if (url.hostname.includes('youtube.com') && url.searchParams.has('v')) {
-      currentVideoId = url.searchParams.get('v');
-      isPlaylistMode = false;
-      
-      // Don't trust tab.title immediately as it might be stale from previous video
-      currentVideoTitle = 'Loading title...';
 
-      // Show reset button
-      btnReset.style.display = 'flex';
-      setStatus(`Video found: ${currentVideoId}`);
-      
-      // Show single video controls, hide playlist UI
-      if (controlsEl) controlsEl.classList.remove('hidden');
-      playlistModeEl.classList.add('hidden');
-      
-      fetchLanguages(currentVideoId);
-    } else {
-      btnReset.style.display = 'none';
-      setStatus('Not a YouTube video or playlist page', 'error');
+    // Single video mode — accepts /watch?v=, /live/ID, /shorts/ID, /embed/ID
+    // and youtu.be/ID. If the URL carries no ID (e.g. /@channel/live), fall
+    // back to a MAIN-world probe of the player before giving up.
+    if (isYouTubeHost(url.hostname)) {
+      let videoId = extractVideoId(tab.url);
+      if (!videoId) {
+        videoId = await probePageVideoId(tab.id);
+      }
+
+      if (videoId) {
+        currentVideoId = videoId;
+        isPlaylistMode = false;
+
+        // Don't trust tab.title immediately as it might be stale from previous video
+        currentVideoTitle = 'Loading title...';
+
+        // Show reset button
+        btnReset.style.display = 'flex';
+        setStatus(`Video found: ${currentVideoId}`);
+
+        // Show single video controls, hide playlist UI
+        if (controlsEl) controlsEl.classList.remove('hidden');
+        playlistModeEl.classList.add('hidden');
+
+        fetchLanguages(currentVideoId);
+        return;
+      }
     }
+
+    btnReset.style.display = 'none';
+    setStatus('Not a YouTube video or playlist page', 'error');
   } catch (e) {
     setStatus('Error: ' + e.message, 'error');
   }
@@ -175,6 +213,9 @@ async function init() {
 async function loadPlaylistVideos(playlistId) {
   setStatus('Loading playlist videos...', 'info', true);
   btnDownloadZip.disabled = true;
+  playlistCountEl.textContent = 'Loading…';
+  playlistVideosEl.innerHTML =
+    '<div style="padding: 20px; text-align: center; color: #666;">Loading videos…</div>';
 
   try {
     console.log('[Popup] Fetching playlist:', playlistId);
@@ -185,29 +226,64 @@ async function loadPlaylistVideos(playlistId) {
     currentPlaylistTitle = result.title || '';
     currentPlaylistVideos = videos.map((v) => ({ ...v, selected: true }));
 
-    setStatus(`Loaded ${videos.length} videos${currentPlaylistTitle ? ' from "' + currentPlaylistTitle + '"' : ''}`, 'success');
     playlistCountEl.textContent = `${videos.length} videos`;
 
     renderPlaylistVideos();
     updateSelectedCount();
-    // Keep button disabled initially - will enable after checkAndRestoreProgress confirms no active download
+    // Keep button disabled until finalizePlaylistLoad confirms no active download
     btnDownloadZip.disabled = true;
 
-    // Fetch languages from first video to populate playlist language dropdown
-    if (videos.length > 0) {
-      await fetchPlaylistLanguages(videos[0].videoId);
-    }
-
-    // Populate target language dropdown for translation
-    populatePlaylistTargetLanguageSelect();
-
-    // Restore saved settings now that dropdowns are populated
-    loadPlaylistSettings();
-
+    return videos;
   } catch (e) {
     console.error('[Popup] Failed to load playlist:', e);
     setStatus('Failed to load playlist: ' + e.message, 'error');
     playlistCountEl.textContent = 'Error';
+    playlistVideosEl.innerHTML =
+      '<div style="padding: 20px; text-align: center; color: #d32f2f;">Failed to load playlist</div>';
+    return null;
+  }
+}
+
+/**
+ * Phase 2 of playlist init: language/settings fetch + progress restore, then
+ * enable the ZIP button and stamp the final status.
+ *
+ * These two awaits used to run SEQUENTIALLY behind a status that already said
+ * "Loaded N videos" — the reported grey-button-with-no-feedback window
+ * (2026-09-25). They are independent, so they now run in parallel and the
+ * status says what is actually happening ("Fetching languages…", spinner on).
+ *
+ * @param {Array} videos - videos returned by loadPlaylistVideos (non-null).
+ * @param {{reloaded?: boolean}} [opts]
+ */
+async function finalizePlaylistLoad(videos, { reloaded = false } = {}) {
+  const langReady = (async () => {
+    setStatus('Fetching languages…', 'info', true);
+    // Fetch languages from first video to populate playlist language dropdown
+    if (videos.length > 0) {
+      await fetchPlaylistLanguages(videos[0].videoId);
+    }
+    // Populate target language dropdown for translation
+    populatePlaylistTargetLanguageSelect();
+    // Restore saved settings now that dropdowns are populated
+    loadPlaylistSettings();
+  })();
+
+  // Restore may claim the status line (running/stopped/zip-delivery states);
+  // if so, never overwrite it with a generic "Loaded".
+  const statusOwned = await checkAndRestoreProgress();
+  await langReady;
+
+  const selected = currentPlaylistVideos.filter(v => v.selected).length;
+  btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
+
+  if (!statusOwned && currentDownloadId === null) {
+    const verb = reloaded ? 'Reloaded' : 'Loaded';
+    setStatus(
+      `${verb} ${videos.length} videos` +
+        (currentPlaylistTitle ? ' from "' + currentPlaylistTitle + '"' : ''),
+      'success'
+    );
   }
 }
 
@@ -536,18 +612,26 @@ async function downloadPlaylistSubtitles() {
   }
 }
 
+/**
+ * Restore any persisted batch state into the UI.
+ * @returns {Promise<boolean>} statusOwned — true when this function claimed the
+ * status line (any running/stopping/stopped/completed/error branch, plus the
+ * zip-lock-skip path, where polling owns the line). Callers must NOT stamp a
+ * generic "Loaded…" over an owned status.
+ */
 async function checkAndRestoreProgress() {
+  let statusOwned = false;
   try {
     const response = await chrome.runtime.sendMessage({
       type: 'GET_DOWNLOAD_PROGRESS'
     });
 
-    if (!response || !response.success) return;
+    if (!response || !response.success) return false;
 
     const progress = effectiveProgress(response.data);
-    if (!progress || progress.playlistId !== currentPlaylistId) return;
+    if (!progress || progress.playlistId !== currentPlaylistId) return false;
     // Also verify downloadId to avoid restoring stale batches
-    if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return;
+    if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return false;
 
     // If there's an active or completed download, restore UI
     if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error' ||
@@ -575,6 +659,7 @@ async function checkAndRestoreProgress() {
         }
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
+        statusOwned = true;
       } else if (progress.status === 'stopping') {
         if (progress.downloadId) {
           currentDownloadId = progress.downloadId;
@@ -583,6 +668,7 @@ async function checkAndRestoreProgress() {
         btnStopDownload.textContent = 'Stopping…';
         startProgressPolling(progress.total);
         setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
+        statusOwned = true;
       } else if (progress.status === 'stopped') {
         const recovery = await recoverStoppedZip(progress);
         const saved = progress.swDownloaded || progress.stoppedSaved || recovery === 'delivered';
@@ -600,7 +686,7 @@ async function checkAndRestoreProgress() {
         } finally {
           resetDownloadState();
         }
-        return;
+        return true;
       } else if (progress.status === 'completed' && progress.downloadId) {
         if (progress.swDownloaded) {
           // SW already downloaded the file
@@ -610,12 +696,13 @@ async function checkAndRestoreProgress() {
           playlistProgressEl.classList.add('hidden');
           await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
           resetDownloadState();
-          return;
+          return true;
         }
         // Atomic guard: acquire lock or skip
         if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress from polling, skipping');
-          return;
+          // Polling owns the status line here (it will report the delivery).
+          return true;
         }
 
         try {
@@ -631,21 +718,28 @@ async function checkAndRestoreProgress() {
         } finally {
           resetDownloadState();
         }
+        // downloadCompletedZip always stamps a status (delivered or failed).
+        statusOwned = true;
       } else if (progress.status === 'error') {
         // Error occurred
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
-        
+
         try {
           await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
         } finally {
           resetDownloadState();
         }
+        statusOwned = true;
       }
+      // `completed` WITHOUT downloadId falls through every branch and sets no
+      // status — statusOwned stays false so the caller may stamp its own.
     }
+    return statusOwned;
   } catch (err) {
     console.error('[Popup] Failed to restore progress:', err);
+    return statusOwned;
   }
 }
 
@@ -1013,7 +1107,9 @@ playlistTranslateLang?.addEventListener('change', savePlaylistSettings);
 playlistLangSelect?.addEventListener('change', savePlaylistSettings);
 playlistFormatSelect?.addEventListener('change', savePlaylistSettings);
 
-// Note: loadPlaylistSettings is now called after dropdowns are populated in loadPlaylistVideos
+// Note: loadPlaylistSettings is called from finalizePlaylistLoad, after the
+// language dropdowns are populated (restoring a source language needs the
+// options to exist).
 
 async function fetchLanguages(videoId) {
   setStatus('Fetching languages...', 'info', true);
@@ -1255,15 +1351,12 @@ btnReset.addEventListener('click', async () => {
       currentPlaylistVideos = [];
       resetDownloadState();
 
-      // Re-fetch playlist
-      await loadPlaylistVideos(currentPlaylistId);
-      await checkAndRestoreProgress();
-
-      // Enable download button if appropriate
-      const selected = currentPlaylistVideos.filter(v => v.selected).length;
-      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
-
-      setStatus(`Reloaded ${currentPlaylistVideos.length} videos`, 'success');
+      // Re-fetch playlist; on failure loadPlaylistVideos has already stamped
+      // the error status — do NOT clobber it with "Reloaded 0 videos".
+      const videos = await loadPlaylistVideos(currentPlaylistId);
+      if (videos) {
+        await finalizePlaylistLoad(videos, { reloaded: true });
+      }
     } catch (e) {
       setStatus('Reload failed: ' + e.message, 'error');
       console.error(e);

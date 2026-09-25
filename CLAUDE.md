@@ -13,8 +13,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Unit tests (node:test, no network, no browser)
 
 - `npm test` — runs `test/*.test.mjs`: batch Stop state machine
-  (`running→stopping→stopped`, finalize refusal, `err.wasStopped`) and tab
-  pinning (`_resolvePageLegTab`, cancel checkpoints, restore). Background
+  (`running→stopping→stopped`, finalize refusal, `err.wasStopped`), tab
+  pinning (`_resolvePageLegTab`, cancel checkpoints, restore), and popup
+  URL detection (`test/video-url.test.mjs`, pure). Background
   modules are imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
@@ -67,6 +68,7 @@ src/
     subtitle-formats.js           SRT, VTT, TXT converters + transcript normalizer
     languages.js                  List of ~100 supported language codes
     zip-generator.js              ZIP creation via fflate (sync, for SW context)
+    video-url.js                  Pure YouTube URL → videoId detection (strict host check)
 ```
 
 ### Multi-Tier Extraction System

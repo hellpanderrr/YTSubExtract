@@ -372,3 +372,25 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   single-video (batch-only). Both corrected in place 2026-09-25 per the
   close-skill stale-doc rule; the superseded claims live here with their
   date.
+- **A CSS spinner keyed on `.active` while the JS toggled `hidden` meant
+  every loading status in the popup showed NO indicator** — `.spinner` is
+  `display:none` and only `.spinner.active` renders, but `setStatus()` only
+  ever touched `hidden`. `loading=true` therefore looked identical to idle
+  for the whole feature's life (reported 2026-09-25 as "no progress
+  indicator" on playlist load, language fetch, and batch start).
+  Rule: when a class list is split across CSS and JS, grep BOTH sides for
+  the class name — never assume the toggle in JS matches the selector.
+  Not unit-testable without a popup DOM harness; verified manually.
+- **Popup init stamped "Loaded N videos" (success) BEFORE the two slow
+  awaits that follow it** (language fetch + progress restore), leaving the
+  ZIP button grey with a green status and no feedback. `loadPlaylistVideos`
+  now fetches/renders only, `finalizePlaylistLoad` runs the two independent
+  awaits in parallel, and `checkAndRestoreProgress` returns `statusOwned`
+  so a restored running/stopped status is never clobbered by "Loaded".
+  ✅ enforced by e2e `playlist-listing.spec.mjs` (`Loaded` + zip enabled).
+- **`hostname.includes('youtube.com') && ?v=` rejected `/live/ID`,
+  `/shorts/ID`, `/embed/ID` and `youtu.be` URLs** ("not a video page" on
+  live streams), and matched look-alike hosts (`evilyoutube.com`).
+  Detection moved to pure `src/utils/video-url.js` with a MAIN-world
+  player probe as last resort for ID-less URLs (`/@channel/live`).
+  ✅ enforced by `test/video-url.test.mjs`.
