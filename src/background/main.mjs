@@ -49,6 +49,12 @@ if (typeof globalThis.isBatchProcessing === 'undefined') {
 if (typeof globalThis.activeBatchProcessor === 'undefined') {
   globalThis.activeBatchProcessor = null;
 }
+// True from "processor.process resolved" until the terminal status write.
+// STOP refuses to act during finalization: writing 'stopping' after the
+// terminal status would soft-lock the popup (nothing writes progress again).
+if (typeof globalThis.batchFinalizing === 'undefined') {
+  globalThis.batchFinalizing = false;
+}
 
 // Memoization for GET_DOWNLOAD_PROGRESS to prevent redundant storage reads
 if (typeof globalThis.restoreProgressPromise === 'undefined') {
@@ -281,6 +287,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     translationManager._batchCancelled = false;
     translationManager._batchTabId = null;
     translationManager._originalTabUrl = null;
+    globalThis.batchFinalizing = false;
 
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
     // Initialize progress atomically so popup sees it on first poll (fire-and-forget)
@@ -297,10 +304,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId)
       .catch((err) => {
         console.error('[Background] Batch download failed:', err);
-        // Atomic error state update (fire-and-forget)
+        // Atomic error state update (fire-and-forget) — unless the failure
+        // followed an accepted Stop (restore already cleared the flag, so
+        // trust the marker handleBatchDownloadPlaylist attached).
         atomicProgressUpdate({
           playlistId: request.playlistId,
-          status: 'error',
+          status: err.wasStopped ? 'stopped' : 'error',
           error: err.message,
           total: request.videos.length
         }, { force: true }).catch(() => {});
@@ -309,6 +318,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // ALWAYS reset the guard when batch completes (success, error, or stopped)
         globalThis.isBatchProcessing = false;
         globalThis.activeBatchProcessor = null;
+        globalThis.batchFinalizing = false;
         console.log('[Main] Batch processing guard reset');
       });
     // Return immediately so popup can start polling
@@ -320,6 +330,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'STOP_BATCH_DOWNLOAD') {
     if (!globalThis.isBatchProcessing) {
       sendResponse({ success: false, error: 'No batch running' });
+      return true;
+    }
+    // Finalizing (ZIP + restore) — the terminal status write is imminent or
+    // done. Writing 'stopping' now would clobber 'stopped'/'completed' and
+    // nothing would ever write progress again (permanently stuck popup).
+    if (globalThis.batchFinalizing) {
+      sendResponse({ success: false, error: 'Batch already finished' });
       return true;
     }
     // Cooperative cancel: queued videos skip, page-leg tiers bail at their
@@ -602,6 +619,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
     }
     results = await processor.process(videos, options);
+    // Phase flip: from here only the terminal write may touch progress status.
+    globalThis.batchFinalizing = true;
     const wasStopped = translationManager._batchCancelled;
 
     // Create ZIP with subtitles — skipped entirely when the user stopped the
@@ -712,9 +731,14 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     };
 
   } catch (err) {
+    // If this failure happened after an accepted Stop, the user's terminal
+    // state is 'stopped', not 'error' — capture the flag before restore
+    // clears it and mark the error for the outer catch.
+    const stoppedAlready = translationManager._batchCancelled;
+    err.wasStopped = stoppedAlready;
     console.error('[Background] Batch download failed:', err);
 
-    // Update progress to error state so popup can see it
+    // Update progress to error/stopped state so popup can see it
     try {
       const stored = await chrome.storage.local.get('currentDownloadProgress');
       const current = stored.currentDownloadProgress || {};
@@ -722,7 +746,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       globalThis.currentDownloadProgress = {
         ...current,
         playlistId,
-        status: 'error',
+        status: stoppedAlready ? 'stopped' : 'error',
         completed: results?.success?.length || current.completed || 0,
         total: videos.length,
         failed: results?.errors?.length || current.failed || 0,

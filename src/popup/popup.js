@@ -382,6 +382,30 @@ function releaseZipDownloadLock() {
   isDownloadingZip = false;
 }
 
+/**
+ * Stopped-state ZIP recovery: when chrome.downloads.download failed during a
+ * stop, the partial ZIP is parked in storage under downloadId. Deliver it
+ * (downloadCompletedZip also schedules the storage-key cleanup) before the
+ * progress record is cleared, otherwise the key is orphaned forever.
+ * Pre-checks storage so the 0-success stop (no ZIP at all) doesn't flash
+ * downloadCompletedZip's "Failed to download ZIP" error.
+ * Returns true when a parked ZIP was found and delivery was initiated.
+ */
+async function recoverStoppedZip(progress) {
+  if (progress.swDownloaded || progress.stoppedSaved || !progress.downloadId) return false;
+  try {
+    const result = await chrome.storage.local.get(progress.downloadId);
+    if (!result[progress.downloadId]) return false;
+  } catch (e) {
+    console.log('[Popup] Storage check for stopped ZIP failed:', e.message);
+    return false;
+  }
+  if (!tryAcquireZipDownloadLock()) return false;
+  // Swallows its own errors and runs resetDownloadState() in finally.
+  await downloadCompletedZip(progress.downloadId);
+  return true;
+}
+
 async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
   if (currentDownloadId !== null) {
@@ -510,7 +534,9 @@ async function checkAndRestoreProgress() {
         startProgressPolling(progress.total);
         setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'stopped') {
-        setStatus(`Stopped — ${progress.completed}/${progress.total} done${progress.swDownloaded || progress.stoppedSaved ? ' (partial ZIP saved)' : ''}`, 'info');
+        const recoveredZip = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recoveredZip;
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${saved ? ' (partial ZIP saved)' : ''}`, 'info');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
         try {
@@ -690,16 +716,19 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
+        const recoveredZip = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recoveredZip;
+
         appendPlaylistLog(`=== Download Stopped ===`);
         appendPlaylistLog(`Progress: ${progress.completed}/${progress.total}`);
         if (progress.failed > 0) {
           appendPlaylistLog(`Failed before stop: ${progress.failed}`);
         }
-        if (progress.swDownloaded || progress.stoppedSaved) {
+        if (saved) {
           appendPlaylistLog('Partial ZIP saved to Downloads');
         }
 
-        setStatus(`Stopped — ${progress.completed}/${progress.total} done${progress.swDownloaded || progress.stoppedSaved ? ' (partial ZIP saved)' : ''}`, 'info');
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${saved ? ' (partial ZIP saved)' : ''}`, 'info');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
 
