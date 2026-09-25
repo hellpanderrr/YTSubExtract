@@ -5,7 +5,7 @@ _Updated 2026-09-21 — branch playlist-download_
 ## State
 Stale `dist/` (Sep-20 11:47, pre-1.7 wiring) was the whole bug. Fresh build:
 9/9 Difference-and-Repetition in-page, Hegel in batch, LL 5/6 (only the
-captionless meme fails). Latency trims shipped in `4d35ce2` (settled-fast 1.7,
+captionless meme fails). Latency trims shipped in `70e8205` (settled-fast 1.7,
 fast-abort 2C, `iOS` fix); smoke 3 + LL spec 2 passed. All temp probe specs
 deleted; `e2e/` holds only the 5 permanent specs.
 
