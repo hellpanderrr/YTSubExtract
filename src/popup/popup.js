@@ -5,6 +5,7 @@ import { extractVideoId, isYouTubeHost } from '../utils/video-url.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
+const btnDiscardParked = document.getElementById('discard-parked-zip');
 const btnReset = document.getElementById('reset-btn');
 const langSelect = document.getElementById('lang-select');
 const btnSrt = document.getElementById('btn-srt');
@@ -520,6 +521,45 @@ async function recoverStoppedZip(progress) {
   }
 }
 
+// ── #14: dismiss affordance for a permanently undeliverable parked ZIP ──
+// Failed-delivery paths keep the progress record forever (it is the only
+// pointer to the parked ZIP — retry runs on every popup open). Correct for
+// transient failures, but a missing/corrupt key would retry-and-fail forever
+// with no way out. This button is the explicit intent to abandon: drop the
+// parked key AND the record.
+let parkedZipDownloadId = null;
+
+function showParkedZipDiscard(downloadId) {
+  if (!downloadId) return; // no parked key possible without a downloadId
+  parkedZipDownloadId = downloadId;
+  btnDiscardParked?.classList.remove('hidden');
+}
+
+function hideParkedZipDiscard() {
+  parkedZipDownloadId = null;
+  btnDiscardParked?.classList.add('hidden');
+}
+
+btnDiscardParked?.addEventListener('click', async () => {
+  const downloadId = parkedZipDownloadId;
+  if (!downloadId) return;
+  btnDiscardParked.disabled = true;
+  try {
+    // The 5-minute key cleanup only ever runs on successful delivery, so an
+    // abandoned key must be removed explicitly before clearing the record.
+    await chrome.storage.local.remove(downloadId);
+    await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+    hideParkedZipDiscard();
+    setStatus('Stored ZIP discarded', 'success');
+    appendPlaylistLog('Stored ZIP discarded — record cleared');
+  } catch (err) {
+    console.error('[Popup] Discard failed:', err);
+    setStatus('Discard failed: ' + err.message, 'error');
+  } finally {
+    btnDiscardParked.disabled = false;
+  }
+});
+
 async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
   if (currentDownloadId !== null) {
@@ -682,6 +722,7 @@ async function checkAndRestoreProgress() {
             await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
           } else {
             setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
           }
         } finally {
           resetDownloadState();
@@ -712,6 +753,7 @@ async function checkAndRestoreProgress() {
           } else {
             // Keep the record — it is the only pointer to the parked ZIP.
             setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
           }
         } catch (err) {
           console.error('[Popup] Failed to handle completed ZIP:', err);
@@ -860,6 +902,7 @@ function startProgressPolling(totalVideos) {
           } else {
             appendPlaylistLog('ZIP delivery FAILED — progress kept for retry on next popup open');
             setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
           }
         } catch (err) {
           console.error('[Popup] Polling completion error:', err);
@@ -900,6 +943,7 @@ function startProgressPolling(totalVideos) {
             await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
           } else {
             setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
           }
         } finally {
           resetDownloadState();
@@ -969,6 +1013,8 @@ async function downloadCompletedZip(downloadId) {
       `Downloaded successfully!`,
       'success'
     );
+    // A previously shown discard affordance is moot now (#14).
+    hideParkedZipDiscard();
 
     // DEFERRED CLEANUP: Wait 5 minutes before removing from storage
     // to ensure user had time to save it even if OS was slow.

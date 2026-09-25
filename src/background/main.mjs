@@ -334,14 +334,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const intended = globalThis.batchTerminalStatus;
         if (intended) {
           try {
-            const stored = await chrome.storage.local.get('currentDownloadProgress');
-            const cur = stored.currentDownloadProgress;
-            if (cur && cur.status !== intended) {
-              console.warn(`[Main] Terminal status clobbered (${cur.status} → ${intended}), re-asserting`);
-              const fixed = { ...cur, status: intended, updatedAt: Date.now() };
-              globalThis.currentDownloadProgress = fixed;
-              await chrome.storage.local.set({ currentDownloadProgress: fixed });
-            }
+            // Queued (#11): this read-check-write must not interleave with
+            // any straggling progress writer.
+            await queueProgressWrite(async () => {
+              const stored = await chrome.storage.local.get('currentDownloadProgress');
+              const cur = stored.currentDownloadProgress;
+              if (cur && cur.status !== intended) {
+                console.warn(`[Main] Terminal status clobbered (${cur.status} → ${intended}), re-asserting`);
+                const fixed = { ...cur, status: intended, updatedAt: Date.now() };
+                globalThis.currentDownloadProgress = fixed;
+                await chrome.storage.local.set({ currentDownloadProgress: fixed });
+              }
+            });
           } catch (e) {
             console.warn('[Main] Terminal re-assert failed:', e.message);
           }
@@ -653,30 +657,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       concurrency: 3,
       delayMs: 300,
       onProgress: async (progress) => {
-        // Atomic state update: read, merge, write
-        try {
-          const stored = await chrome.storage.local.get('currentDownloadProgress');
-          const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
-          
-          // Don't overwrite terminal/stop states from a potentially stale processor
-          if (current.status === 'completed' || current.status === 'error' ||
-              current.status === 'stopping' || current.status === 'stopped') {
-             // If we already finished (or are stopping) in storage, just keep it
-             globalThis.currentDownloadProgress = current;
-             return;
-          }
-
-          globalThis.currentDownloadProgress = {
-            ...progress,
-            playlistId,
-            status: 'running',
-            downloadId: downloadId,
-            updatedAt: Date.now()
-          };
-          await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
-        } catch (e) {
-          console.error('[Background] Progress update failed:', e);
-        }
+        // Queued read-guard-write (#11) — see persistBatchProgress.
+        await persistBatchProgress(progress, { playlistId, downloadId });
       },
       onVideoComplete: (result) => {
         console.log(`[Batch] Completed: ${result.videoId}`);
@@ -774,27 +756,30 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     }
     } // end !stopWithoutResults
 
-    // Update progress to completed/stopped
+    // Update progress to completed/stopped — queued (#11) so a racing STOP
+    // write lands before or after this, never inside its read-write window.
     try {
-      const stored = await chrome.storage.local.get('currentDownloadProgress');
-      const current = stored.currentDownloadProgress || {};
+      await queueProgressWrite(async () => {
+        const stored = await chrome.storage.local.get('currentDownloadProgress');
+        const current = stored.currentDownloadProgress || {};
 
-      const terminalStatus = wasStopped ? 'stopped' : 'completed';
-      globalThis.currentDownloadProgress = {
-        ...current,
-        playlistId,
-        status: terminalStatus,
-        completed: results.success.length + results.errors.length,
-        total: videos.length,
-        failed: results.errors.length,
-        downloadId,
-        autoDownloaded: false,
-        swDownloaded,
-        updatedAt: Date.now(),
-        ...(wasStopped ? { stoppedSaved: swDownloaded } : {})
-      };
-      globalThis.batchTerminalStatus = terminalStatus;
-      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+        const terminalStatus = wasStopped ? 'stopped' : 'completed';
+        globalThis.currentDownloadProgress = {
+          ...current,
+          playlistId,
+          status: terminalStatus,
+          completed: results.success.length + results.errors.length,
+          total: videos.length,
+          failed: results.errors.length,
+          downloadId,
+          autoDownloaded: false,
+          swDownloaded,
+          updatedAt: Date.now(),
+          ...(wasStopped ? { stoppedSaved: swDownloaded } : {})
+        };
+        globalThis.batchTerminalStatus = terminalStatus;
+        await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+      });
     } catch (e) {
       console.error('[Background] Final progress update failed:', e);
     }
@@ -817,25 +802,28 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     err.wasStopped = stoppedAlready;
     console.error('[Background] Batch download failed:', err);
 
-    // Update progress to error/stopped state so popup can see it
+    // Update progress to error/stopped state so popup can see it — queued
+    // (#11) like the terminal write above.
     try {
-      const stored = await chrome.storage.local.get('currentDownloadProgress');
-      const current = stored.currentDownloadProgress || {};
+      await queueProgressWrite(async () => {
+        const stored = await chrome.storage.local.get('currentDownloadProgress');
+        const current = stored.currentDownloadProgress || {};
 
-      const errorStatus = stoppedAlready ? 'stopped' : 'error';
-      globalThis.currentDownloadProgress = {
-        ...current,
-        playlistId,
-        status: errorStatus,
-        completed: results?.success?.length || current.completed || 0,
-        total: videos.length,
-        failed: results?.errors?.length || current.failed || 0,
-        error: err.message,
-        downloadId,
-        updatedAt: Date.now()
-      };
-      globalThis.batchTerminalStatus = errorStatus;
-      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+        const errorStatus = stoppedAlready ? 'stopped' : 'error';
+        globalThis.currentDownloadProgress = {
+          ...current,
+          playlistId,
+          status: errorStatus,
+          completed: results?.success?.length || current.completed || 0,
+          total: videos.length,
+          failed: results?.errors?.length || current.failed || 0,
+          error: err.message,
+          downloadId,
+          updatedAt: Date.now()
+        };
+        globalThis.batchTerminalStatus = errorStatus;
+        await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+      });
     } catch (e) {
       console.error('[Background] Error state update failed:', e);
     }
@@ -850,44 +838,103 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
 }
 
 /**
+ * Progress write queue (#11). chrome.storage has no compare-and-set, but the
+ * SW is single-threaded: running every read-modify-write below as ONE queued
+ * unit means each guard sees every prior write's committed state. Before
+ * this, onProgress read at one moment and wrote later — a STOP's 'stopping'
+ * landing in between was clobbered back to 'running' (the popup showed
+ * "Downloading…" instead of "Stopping…" until the terminal write).
+ *
+ * INVARIANT: a site either calls atomicProgressUpdate/persistBatchProgress
+ * (queued inside) or wraps its own raw body in queueProgressWrite — never
+ * queues a call that itself calls one of those (self-wait = deadlock).
+ */
+let progressWriteChain = Promise.resolve();
+function queueProgressWrite(fn) {
+  const run = progressWriteChain.then(fn, fn);
+  progressWriteChain = run.then(() => {}, () => {});
+  return run;
+}
+
+/**
+ * Per-video progress tick from BatchProcessor.onProgress (exported for
+ * tests). Guarded: a record already terminal/stopping in storage is never
+ * overwritten by a stale processor; with the write queue the read and the
+ * write cannot be interleaved by another writer.
+ */
+export async function persistBatchProgress(progress, { playlistId, downloadId }) {
+  return queueProgressWrite(async () => {
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+
+      // Don't overwrite terminal/stop states from a potentially stale processor
+      if (current.status === 'completed' || current.status === 'error' ||
+          current.status === 'stopping' || current.status === 'stopped') {
+        // If we already finished (or are stopping) in storage, just keep it
+        globalThis.currentDownloadProgress = current;
+        return current;
+      }
+
+      const next = {
+        ...progress,
+        playlistId,
+        status: 'running',
+        downloadId,
+        updatedAt: Date.now()
+      };
+      globalThis.currentDownloadProgress = next;
+      await chrome.storage.local.set({ currentDownloadProgress: next });
+      return next;
+    } catch (e) {
+      console.error('[Background] Progress update failed:', e);
+      return globalThis.currentDownloadProgress;
+    }
+  });
+}
+
+/**
  * Atomic progress update helper
  * Reads current state from storage, merges with updates, writes back.
  * Prevents stale state overwrites from concurrent updates or SW restarts.
+ * Serialized through the progress write queue (see INVARIANT above).
  */
-async function atomicProgressUpdate(updates, options = {}) {
-  try {
-    const stored = await chrome.storage.local.get('currentDownloadProgress');
-    const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+export function atomicProgressUpdate(updates, options = {}) {
+  return queueProgressWrite(async () => {
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
 
-    // Terminal states are only ever overwritten by force writes that were
-    // not explicitly told to respect them (STOP uses refuseIfTerminal so a
-    // racing terminal write always wins over 'stopping').
-    const isTerminal =
-      current.status === 'completed' || current.status === 'error' || current.status === 'stopped';
-    if (isTerminal && (options.refuseIfTerminal || !options.force)) {
-      globalThis.currentDownloadProgress = current;
-      return current;
+      // Terminal states are only ever overwritten by force writes that were
+      // not explicitly told to respect them (STOP uses refuseIfTerminal so a
+      // racing terminal write always wins over 'stopping').
+      const isTerminal =
+        current.status === 'completed' || current.status === 'error' || current.status === 'stopped';
+      if (isTerminal && (options.refuseIfTerminal || !options.force)) {
+        globalThis.currentDownloadProgress = current;
+        return current;
+      }
+
+      const merged = {
+        ...current,
+        ...updates,
+        // Preserve critical fields if not explicitly provided
+        playlistId: updates.playlistId ?? current.playlistId,
+        downloadId: updates.downloadId ?? current.downloadId,
+        // Freshness stamp for the popup's staleness guard (SW-death recovery)
+        updatedAt: Date.now()
+      };
+
+      globalThis.currentDownloadProgress = merged;
+      await chrome.storage.local.set({ currentDownloadProgress: merged });
+      return merged;
+    } catch (e) {
+      console.error('[Main] Atomic progress update failed:', e);
+      // Fallback: just update globalThis
+      globalThis.currentDownloadProgress = { ...globalThis.currentDownloadProgress, ...updates };
+      return globalThis.currentDownloadProgress;
     }
-
-    const merged = {
-      ...current,
-      ...updates,
-      // Preserve critical fields if not explicitly provided
-      playlistId: updates.playlistId ?? current.playlistId,
-      downloadId: updates.downloadId ?? current.downloadId,
-      // Freshness stamp for the popup's staleness guard (SW-death recovery)
-      updatedAt: Date.now()
-    };
-
-    globalThis.currentDownloadProgress = merged;
-    await chrome.storage.local.set({ currentDownloadProgress: merged });
-    return merged;
-  } catch (e) {
-    console.error('[Main] Atomic progress update failed:', e);
-    // Fallback: just update globalThis
-    globalThis.currentDownloadProgress = { ...globalThis.currentDownloadProgress, ...updates };
-    return globalThis.currentDownloadProgress;
-  }
+  });
 }
 
 // Helper function to convert transcript to SRT

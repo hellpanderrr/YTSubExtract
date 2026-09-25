@@ -5,7 +5,7 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { installChrome, waitFor } from './helpers/chrome-mock.mjs';
 
-const { state } = installChrome();
+const { state, emitTabUpdated } = installChrome();
 const { translationManager: tm } = await import(
   '../src/background/translation-manager.mjs'
 );
@@ -17,6 +17,8 @@ beforeEach(() => {
   state.tabs.length = 0;
   state.tabUpdates.length = 0;
   state.sentMessages.length = 0;
+  state.tabUpdatedListeners.length = 0;
+  state.sendMessageHandler = null;
 });
 
 test('_resolvePageLegTab drives the pinned tab even when another is active', async () => {
@@ -284,4 +286,62 @@ test('re-pin re-captures the restore target from the replacement tab', async () 
     'https://www.youtube.com/feed/subscriptions',
     'restore target re-captured from the replacement tab'
   );
+});
+
+test('#7 a second complete while polling must not leak a poll interval', async (t) => {
+  // Simulated browser clock: the whole scenario (3s settle delay, 800ms
+  // polls, 10s nav timeout) runs in milliseconds of real time.
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const drain = () => new Promise((r) => setImmediate(r));
+  const pollCount = () =>
+    state.sentMessages.filter((m) => m.message?.type === 'POLL_TRANSCRIPT')
+      .length;
+
+  state.tabs.push({
+    id: 4,
+    url: 'https://www.youtube.com/playlist?list=PLtest',
+    active: true,
+  });
+  state.sendMessageHandler = () => ({ success: false });
+
+  try {
+    const navDone = tm._fetchTranscriptViaTabNav('vid7leaktest', {
+      timeout: 10000,
+    });
+    await drain(); // reach addListener + tabs.update
+
+    // First document load (consent/redirect chains load twice) → settle
+    // timer → polling starts.
+    emitTabUpdated(4, { status: 'complete' });
+    t.mock.timers.tick(3000);
+    t.mock.timers.tick(800);
+    await drain();
+    assert.ok(pollCount() > 0, 'polling must have started (positive control)');
+
+    // Second complete while the first interval is ALREADY running.
+    emitTabUpdated(4, { status: 'complete' });
+    t.mock.timers.tick(3000);
+    await drain();
+
+    // Run out the nav timeout; cleanup resolves the leg.
+    t.mock.timers.tick(4000);
+    await drain();
+    const result = await navDone;
+    assert.equal(result, null, 'nav timed out with no transcript');
+
+    // The leaked interval would keep POLL_TRANSCRIPT-ing forever (each
+    // sendMessage resets the MV3 SW idle timer — finding #7).
+    const atResolve = pollCount();
+    t.mock.timers.tick(800);
+    await drain();
+    t.mock.timers.tick(800);
+    await drain();
+    assert.equal(
+      pollCount(),
+      atResolve,
+      'no POLL_TRANSCRIPT may fire after the leg completed'
+    );
+  } finally {
+    state.sendMessageHandler = null;
+  }
 });

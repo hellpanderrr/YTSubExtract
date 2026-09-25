@@ -481,11 +481,13 @@ export class TranslationManager {
         let resolved = false;
         let pollTimer = null;
         let timeoutTimer = null;
+        let startTimer = null;
 
         const cleanup = () => {
           resolved = true;
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
           if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+          if (startTimer) { clearTimeout(startTimer); startTimer = null; }
           chrome.tabs.onUpdated.removeListener(onUpdated);
         };
 
@@ -506,6 +508,13 @@ export class TranslationManager {
         let settledZeroStreak = 0;
         let probeInFlight = false;
         const startPolling = () => {
+          // #7: a second `complete` (consent/redirect chains load the
+          // document twice) used to schedule another startPolling, and a
+          // second setInterval overwrote pollTimer — cleanup then cleared
+          // only the latest and the first kept POLLING forever, resetting
+          // the MV3 SW idle timer on every tick. Idempotent by construction:
+          // resolved → the leg is done; pollTimer → already polling.
+          if (resolved || pollTimer) return;
           pollTimer = setInterval(() => {
             if (this._batchCancelled && !resolved) {
               console.log('[TabNav] Batch stopped, aborting wait');
@@ -555,8 +564,11 @@ export class TranslationManager {
 
         const onUpdated = (tabId, changeInfo) => {
           if (tabId === tab.id && changeInfo.status === 'complete') {
-            setTimeout(() => {
-              if (!resolved) startPolling();
+            // Replace any pending settle timer so only the LATEST load's
+            // 3s window survives; cleanup clears whatever is pending.
+            if (startTimer) clearTimeout(startTimer);
+            startTimer = setTimeout(() => {
+              startPolling();
             }, 3000);
           }
         };
@@ -1798,7 +1810,16 @@ export class TranslationManager {
           }
       }
 
-      const response = { 
+      // #5: never cache or return an empty transcript as success — every other
+      // tier length-checks before caching. JSON3 can parse with `events`
+      // present but no usable segs (brand-new video, cue-less ASR); returning
+      // [] here returned "Done!" + an empty .srt and poisoned the cache until
+      // Reset. Throwing lands in the catch below → next tier, nothing cached.
+      if (!result || result.length === 0) {
+        throw new Error('No usable segments in caption response');
+      }
+
+      const response = {
         source: 'tier3-native-bg', 
         result, 
         translated: translate, 
@@ -2071,9 +2092,11 @@ export class TranslationManager {
 
     const errors = [];
 
-    // Stop checkpoints: the Stop button sets _batchCancelled; each remaining
-    // tier boundary throws a `stopped` error (BatchProcessor does not count
-    // these as failures) instead of spending seconds on more tiers.
+    // Stop checkpoints: the Stop button sets _batchCancelled; every tier
+    // boundary below throws a `stopped` error (BatchProcessor does not count
+    // these as failures) instead of spending seconds on more tiers. The cache
+    // check above intentionally returns before the first checkpoint (#15): a
+    // cached lookup completes instantly, so there are no boundaries to guard.
     const throwIfStopped = () => {
       if (!this._batchCancelled) return;
       log('[Batch] Stopped — aborting remaining tiers for this video');
@@ -2361,9 +2384,11 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   // Cache Clear
   // ─────────────────────────────────────────────────────────────
-  clearCache() {
-    this.cache.clear();
-  }
+  // NOTE: only ONE clearCache may exist on the class. A no-arg duplicate here
+  // (removed 2026-09-25) shadowed the per-video definition above, so
+  // main.mjs:253's videoId argument was ignored and Reset wiped everything
+  // including playlist:* entries (#10). The definition at the top handles
+  // both shapes: videoId → scoped clear, no arg → clear all.
 }
 
 // Singleton

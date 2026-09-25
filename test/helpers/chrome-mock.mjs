@@ -3,6 +3,7 @@
 //   - chrome.tabs.query(query, cb)          (callback)
 //   - chrome.tabs.get(id, cb) / get(id)     (callback AND promise)
 //   - chrome.tabs.update(id, {url})         (promise)
+//   - chrome.tabs.onUpdated add/remove/emit (emitTabUpdated helper)
 //   - chrome.storage.local.get/set/remove   (promise)
 //   - chrome.downloads.download             (promise)
 //   - chrome.runtime.onMessage.addListener  (captured for send())
@@ -23,6 +24,7 @@ export function installChrome() {
     listeners: [],
     downloads: [],
     tabUpdates: [],
+    tabUpdatedListeners: [],
     sentMessages: [],
     downloadMode: 'ok', // 'ok' | 'fail'
     storageLatencyMs: 0, // >0 makes storage ops slow, to expose write-ordering races
@@ -69,7 +71,15 @@ export function installChrome() {
       },
     },
     tabs: {
-      onUpdated: { addListener() {}, removeListener() {} },
+      onUpdated: {
+        addListener(fn) {
+          state.tabUpdatedListeners.push(fn);
+        },
+        removeListener(fn) {
+          const i = state.tabUpdatedListeners.indexOf(fn);
+          if (i >= 0) state.tabUpdatedListeners.splice(i, 1);
+        },
+      },
       query(query, cb) {
         let tabs = state.tabs.slice();
         if (query && query.url) {
@@ -170,7 +180,14 @@ export function installChrome() {
     });
   }
 
-  return { chrome, state, send };
+  /** Fire chrome.tabs.onUpdated listeners like the browser would. */
+  function emitTabUpdated(tabId, changeInfo, tab) {
+    for (const fn of [...state.tabUpdatedListeners]) {
+      fn(tabId, changeInfo, tab);
+    }
+  }
+
+  return { chrome, state, send, emitTabUpdated };
 }
 
 /** Poll until fn() is truthy; throw with label on timeout. */

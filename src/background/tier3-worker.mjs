@@ -1,4 +1,5 @@
 import { Innertube, UniversalCache } from 'youtubei.js';
+import { fetchTextWithTimeout } from '../utils/fetch-timeout.js';
 
 // Polyfill for youtubei.js environment detection
 if (typeof document === 'undefined') {
@@ -174,12 +175,12 @@ export async function fetchTier3Transcript(videoId, options = {}) {
                     };
                     if (client.ua) headers['User-Agent'] = client.ua;
 
-                    const resp = await fetch(
+                    const resp = await fetchTextWithTimeout(
                         'https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
                         { method: 'POST', headers, body: JSON.stringify(playerPayload) }
                     );
                     if (resp.ok) {
-                        const data = await resp.json();
+                        const data = JSON.parse(resp.text);
                         const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
                             || data?.playerOverlays?.playerOverlayRenderer?.playerOverlayPayload?.playerOverlayCaptionRenderer?.captionTracks;
                         if (raw?.length > 0) {
@@ -223,11 +224,11 @@ export async function fetchTier3Transcript(videoId, options = {}) {
             }
             
             console.log(`[Tier 3] Fetching from URL: ${fetchUrl}`);
-            const response = await fetch(fetchUrl);
+            const response = await fetchTextWithTimeout(fetchUrl);
             if (!response.ok) {
                 throw new Error(`Failed to fetch caption track: ${response.status}`);
             }
-            const xml = await response.text();
+            const xml = response.text;
             
             // Validate XML
             if (!xml || !xml.includes('<transcript>')) {
@@ -327,13 +328,13 @@ export async function getVideoMetadata(videoId) {
             const vd = Array.from({length: 11}, () =>
               'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'.charAt(Math.floor(Math.random() * 63))
             ).join('');
-            const resp = await fetch('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
+            const resp = await fetchTextWithTimeout('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Version': c.version, 'X-Youtube-Client-Name': c.id, Origin: 'https://www.youtube.com', Referer: 'https://www.youtube.com/' },
               body: JSON.stringify({ context: { client: { hl: 'en', gl: 'US', clientName: c.name, clientVersion: c.version, visitorData: vd, ...c.extras } }, videoId, contentCheckOk: true, racyCheckOk: true, params: 'CgIQBg==' }),
             });
             if (resp.ok) {
-              const data = await resp.json();
+              const data = JSON.parse(resp.text);
               const raw = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
               if (raw?.length > 0) {
                 languages = raw.map(track => ({ code: track.languageCode, name: track.name?.simpleText || track.languageCode, isAuto: track.kind === 'asr', isTranslation: false }));

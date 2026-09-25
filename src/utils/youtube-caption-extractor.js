@@ -1,5 +1,6 @@
 import he from 'he';
 import striptags from 'striptags';
+import { fetchTextWithTimeout } from './fetch-timeout.js';
 
 // Universal logger
 const createLogger = (namespace) => {
@@ -454,7 +455,7 @@ async function getSubtitlesFromCaptions(videoID, playerData, lang = 'en', option
     captionUrl += `&tlang=${targetLang}`;
   }
 
-  const response = await fetch(captionUrl, {
+  const response = await fetchTextWithTimeout(captionUrl, {
     headers: {
       'User-Agent': INNERTUBE_CONFIG.CLIENT.IOS.USER_AGENT,
       Referer: `https://www.youtube.com/watch?v=${videoID}`,
@@ -465,7 +466,7 @@ async function getSubtitlesFromCaptions(videoID, playerData, lang = 'en', option
     throw new Error(`Caption fetch failed: ${response.status}`);
   }
 
-  const xmlText = await response.text();
+  const xmlText = response.text;
 
   if (!xmlText.trim() || !xmlText.includes('<text')) {
     throw new Error('Caption content is empty or invalid');
@@ -610,8 +611,8 @@ export const getSubtitles = async ({ videoID, lang = 'en', translate, translateL
         url += `&tlang=${translateLang}`;
     }
 
-    const response = await fetch(url);
-    const xml = await response.text();
+    const response = await fetchTextWithTimeout(url);
+    const xml = response.text;
     
     // Parse XML to segments...
      // Chrome Service Workers do not have DOMParser. We need a simple XML parser or regex.
@@ -729,7 +730,7 @@ export async function getTranscriptViaAndroid(videoId, lang = 'auto', options = 
   url += '&fmt=json3';
 
   const androidUA = INNERTUBE_CONFIG.CLIENT.ANDROID.USER_AGENT;
-  const timedtextResp = await fetch(url, {
+  const timedtextResp = await fetchTextWithTimeout(url, {
     headers: {
       'User-Agent': androidUA,
       'Accept': 'application/json, text/plain, */*',
@@ -737,7 +738,7 @@ export async function getTranscriptViaAndroid(videoId, lang = 'auto', options = 
   });
 
   if (timedtextResp.ok) {
-    const text = await timedtextResp.text();
+    const text = timedtextResp.text;
     if (text && text.trim().length > 0) {
       try {
         const json = JSON.parse(text);

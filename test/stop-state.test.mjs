@@ -16,7 +16,9 @@ const { state, send } = installChrome();
 const { translationManager: tm } = await import(
   '../src/background/translation-manager.mjs'
 );
-await import('../src/background/main.mjs'); // registers the onMessage listener
+const { persistBatchProgress, atomicProgressUpdate } = await import(
+  '../src/background/main.mjs'
+); // also registers the onMessage listener
 
 const progress = () => state.storageData.get('currentDownloadProgress');
 
@@ -333,4 +335,49 @@ test('batch pins the click-time tabId from the payload, not the active tab', asy
   assert.equal(resp2.success, true);
   await waitFor(() => progress()?.status === 'completed', { label: 'second batch done' });
   assert.equal(pinDuringRun, null, 'non-YouTube click tab must not be pinned');
+});
+
+test('#11 queued writes: a stale running-write cannot clobber an accepted Stop', async () => {
+  // Seed an active batch record.
+  await atomicProgressUpdate(
+    { playlistId: 'PLunit', status: 'running', downloadId: 'd1', completed: 1, total: 3 },
+    { force: true }
+  );
+
+  // Wide read→write window: without the write queue the running-write's
+  // guard reads the pre-Stop value and its write lands AFTER the Stop's —
+  // storage ends up 'running' though the Stop was accepted (finding #11).
+  state.storageLatencyMs = 30;
+
+  const stopWrite = atomicProgressUpdate(
+    { status: 'stopping' },
+    { force: true, refuseIfTerminal: true }
+  );
+  const progressWrite = persistBatchProgress(
+    { completed: 2, total: 3, failed: 0, current: 'v2' },
+    { playlistId: 'PLunit', downloadId: 'd1' }
+  );
+  await Promise.all([stopWrite, progressWrite]);
+  state.storageLatencyMs = 0;
+
+  assert.equal(
+    progress()?.status,
+    'stopping',
+    'the Stop write must win over the racing progress tick'
+  );
+});
+
+test('#11 progress tick alone refuses a terminal or stopping record', async () => {
+  await atomicProgressUpdate(
+    { playlistId: 'PLunit', status: 'stopping', downloadId: 'd1', completed: 1, total: 3 },
+    { force: true }
+  );
+
+  await persistBatchProgress(
+    { completed: 2, total: 3, failed: 0, current: 'v2' },
+    { playlistId: 'PLunit', downloadId: 'd1' }
+  );
+
+  assert.equal(progress()?.status, 'stopping', 'guard keeps the stop state');
+  assert.equal(progress()?.completed, 1, 'stale tick must not advance counters');
 });
