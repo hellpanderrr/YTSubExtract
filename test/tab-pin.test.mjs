@@ -39,16 +39,19 @@ test('a dead pin falls back to active-or-first and clears the pin', async () => 
   assert.equal(tm._batchTabId, null, 'dead pin must be released');
 });
 
-test('a pin whose tab left youtube.com is released', async () => {
+test('a pin whose tab left youtube.com is NOT released (no one-way door)', async () => {
+  // A transient URL mismatch (mid-navigation state, youtube-nocookie, or the
+  // user browsing elsewhere in the batch tab) must not drop the pin —
+  // releasing it reverts the batch to follow-the-focus behavior.
   state.tabs.push(
     { id: 1, url: 'https://www.youtube.com/', active: true },
     { id: 5, url: 'https://example.com/somewhere', active: false }
   );
-  tm._batchTabId = 5; // user navigated the batch tab away themselves
+  tm._batchTabId = 5;
 
   const tab = await tm._resolvePageLegTab();
-  assert.equal(tab.id, 1);
-  assert.equal(tm._batchTabId, null);
+  assert.equal(tab.id, 5, 'pin stays authoritative even off youtube.com');
+  assert.equal(tm._batchTabId, 5, 'pin must not be released on URL mismatch');
 });
 
 test('without a pin behavior is unchanged (active, else first)', async () => {

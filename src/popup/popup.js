@@ -383,13 +383,29 @@ function releaseZipDownloadLock() {
 }
 
 /**
+ * Staleness guard: a non-terminal progress record whose writer has been
+ * silent longer than STALE_PROGRESS_MS means the service worker died
+ * mid-batch (or a stop was lost) — nothing will ever update it again.
+ * Treat it as 'stopped' so the UI (Download button, polling) recovers
+ * instead of soft-locking on this playlist forever.
+ */
+const STALE_PROGRESS_MS = 60000;
+function effectiveProgress(p) {
+  if (!p || !p.status) return p;
+  const terminal = p.status === 'completed' || p.status === 'error' || p.status === 'stopped';
+  if (terminal || !p.updatedAt) return p;
+  if (Date.now() - p.updatedAt <= STALE_PROGRESS_MS) return p;
+  return { ...p, status: 'stopped', stale: true };
+}
+
+/**
  * Stopped-state ZIP recovery: when chrome.downloads.download failed during a
  * stop, the partial ZIP is parked in storage under downloadId. Deliver it
  * (downloadCompletedZip also schedules the storage-key cleanup) before the
  * progress record is cleared, otherwise the key is orphaned forever.
  * Pre-checks storage so the 0-success stop (no ZIP at all) doesn't flash
  * downloadCompletedZip's "Failed to download ZIP" error.
- * Returns true when a parked ZIP was found and delivery was initiated.
+ * Returns true only when delivery was actually initiated successfully.
  */
 async function recoverStoppedZip(progress) {
   if (progress.swDownloaded || progress.stoppedSaved || !progress.downloadId) return false;
@@ -401,9 +417,16 @@ async function recoverStoppedZip(progress) {
     return false;
   }
   if (!tryAcquireZipDownloadLock()) return false;
-  // Swallows its own errors and runs resetDownloadState() in finally.
-  await downloadCompletedZip(progress.downloadId);
-  return true;
+  try {
+    // Swallows its own errors internally and returns whether it delivered.
+    const delivered = await downloadCompletedZip(progress.downloadId);
+    if (!delivered) {
+      appendPlaylistLog('Stored partial ZIP existed but delivery failed');
+    }
+    return delivered;
+  } finally {
+    releaseZipDownloadLock();
+  }
 }
 
 async function downloadPlaylistSubtitles() {
@@ -442,6 +465,17 @@ async function downloadPlaylistSubtitles() {
   btnDownloadZip.disabled = true;
   playlistProgressEl.classList.remove('hidden');
 
+  // Capture the tab the user is on RIGHT NOW: the background pins this as
+  // the batch's driver tab. Resolving "active tab" later (after a cold
+  // service-worker wake) could pick a tab the user switched to meanwhile.
+  let clickTabId = null;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    clickTabId = tab?.id ?? null;
+  } catch (e) {
+    console.warn('[Popup] Could not capture click-time tab:', e.message);
+  }
+
   try {
     // Start batch download in background
     console.log('[Popup] Sending BATCH_DOWNLOAD_PLAYLIST message...');
@@ -450,6 +484,7 @@ async function downloadPlaylistSubtitles() {
       videos: selectedVideos,
       playlistId: currentPlaylistId,
       playlistTitle: currentPlaylistTitle,
+      tabId: clickTabId,
       options: {
         format,
         sourceLang,
@@ -494,7 +529,7 @@ async function checkAndRestoreProgress() {
 
     if (!response || !response.success) return;
 
-    const progress = response.data;
+    const progress = effectiveProgress(response.data);
     if (!progress || progress.playlistId !== currentPlaylistId) return;
     // Also verify downloadId to avoid restoring stale batches
     if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return;
@@ -619,7 +654,7 @@ function startProgressPolling(totalVideos) {
         return;
       }
 
-      const progress = response.data;
+      const progress = effectiveProgress(response.data);
       console.log('[Popup] Got progress:', progress);
 
       if (!progress) {
@@ -720,6 +755,9 @@ function startProgressPolling(totalVideos) {
         const saved = progress.swDownloaded || progress.stoppedSaved || recoveredZip;
 
         appendPlaylistLog(`=== Download Stopped ===`);
+        if (progress.stale) {
+          appendPlaylistLog('Progress record was stale (service worker went quiet) — recovered as stopped');
+        }
         appendPlaylistLog(`Progress: ${progress.completed}/${progress.total}`);
         if (progress.failed > 0) {
           appendPlaylistLog(`Failed before stop: ${progress.failed}`);
@@ -803,7 +841,7 @@ async function downloadCompletedZip(downloadId) {
       'success'
     );
 
-    // DEFERRED CLEANUP: Wait 5 minutes before removing from storage 
+    // DEFERRED CLEANUP: Wait 5 minutes before removing from storage
     // to ensure user had time to save it even if OS was slow.
     setTimeout(async () => {
       try {
@@ -814,8 +852,10 @@ async function downloadCompletedZip(downloadId) {
       }
     }, 300000);
 
+    return true;
   } catch (err) {
     setStatus('Failed to download ZIP: ' + err.message, 'error');
+    return false;
   } finally {
     btnDownloadZip.disabled = false;
     playlistProgressEl.classList.add('hidden');

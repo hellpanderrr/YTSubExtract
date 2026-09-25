@@ -25,7 +25,13 @@ export function installChrome() {
     tabUpdates: [],
     sentMessages: [],
     downloadMode: 'ok', // 'ok' | 'fail'
+    storageLatencyMs: 0, // >0 makes storage ops slow, to expose write-ordering races
   };
+
+  const storageDelay = () =>
+    state.storageLatencyMs > 0
+      ? new Promise((r) => setTimeout(r, state.storageLatencyMs))
+      : Promise.resolve();
 
   const chrome = {
     runtime: {
@@ -40,6 +46,7 @@ export function installChrome() {
     storage: {
       local: {
         async get(keys) {
+          await storageDelay();
           if (keys == null) return Object.fromEntries(state.storageData);
           const list = Array.isArray(keys) ? keys : [keys];
           const out = {};
@@ -49,9 +56,11 @@ export function installChrome() {
           return out;
         },
         async set(items) {
+          await storageDelay();
           for (const [k, v] of Object.entries(items)) state.storageData.set(k, v);
         },
         async remove(keys) {
+          await storageDelay();
           const list = Array.isArray(keys) ? keys : [keys];
           for (const k of list) state.storageData.delete(k);
         },

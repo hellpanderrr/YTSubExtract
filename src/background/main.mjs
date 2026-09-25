@@ -55,6 +55,12 @@ if (typeof globalThis.activeBatchProcessor === 'undefined') {
 if (typeof globalThis.batchFinalizing === 'undefined') {
   globalThis.batchFinalizing = false;
 }
+// The terminal status this batch intends to publish ('stopped'/'completed'/
+// 'error'). Re-asserted in the handler's .finally in case a straggling
+// STOP write landed after the terminal write.
+if (typeof globalThis.batchTerminalStatus === 'undefined') {
+  globalThis.batchTerminalStatus = null;
+}
 
 // Memoization for GET_DOWNLOAD_PROGRESS to prevent redundant storage reads
 if (typeof globalThis.restoreProgressPromise === 'undefined') {
@@ -288,6 +294,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     translationManager._batchTabId = null;
     translationManager._originalTabUrl = null;
     globalThis.batchFinalizing = false;
+    globalThis.batchTerminalStatus = null;
 
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
     // Initialize progress atomically so popup sees it on first poll (fire-and-forget)
@@ -301,7 +308,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       downloadId
     }, { force: true }).catch(() => {});
     // Fire-and-forget: process in background, popup polls via GET_DOWNLOAD_PROGRESS
-    handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId)
+    handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId, request.tabId)
       .catch((err) => {
         console.error('[Background] Batch download failed:', err);
         // Atomic error state update (fire-and-forget) — unless the failure
@@ -313,12 +320,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           error: err.message,
           total: request.videos.length
         }, { force: true }).catch(() => {});
+        globalThis.batchTerminalStatus = err.wasStopped ? 'stopped' : 'error';
       })
-      .finally(() => {
+      .finally(async () => {
         // ALWAYS reset the guard when batch completes (success, error, or stopped)
         globalThis.isBatchProcessing = false;
         globalThis.activeBatchProcessor = null;
         globalThis.batchFinalizing = false;
+        // Backstop: a STOP write accepted moments before finalization could
+        // theoretically land after the terminal write. Nothing writes after
+        // this point (guards cleared), so re-assert the intended terminal
+        // status if it was clobbered.
+        const intended = globalThis.batchTerminalStatus;
+        if (intended) {
+          try {
+            const stored = await chrome.storage.local.get('currentDownloadProgress');
+            const cur = stored.currentDownloadProgress;
+            if (cur && cur.status !== intended) {
+              console.warn(`[Main] Terminal status clobbered (${cur.status} → ${intended}), re-asserting`);
+              const fixed = { ...cur, status: intended, updatedAt: Date.now() };
+              globalThis.currentDownloadProgress = fixed;
+              await chrome.storage.local.set({ currentDownloadProgress: fixed });
+            }
+          } catch (e) {
+            console.warn('[Main] Terminal re-assert failed:', e.message);
+          }
+        }
+        globalThis.batchTerminalStatus = null;
         console.log('[Main] Batch processing guard reset');
       });
     // Return immediately so popup can start polling
@@ -339,13 +367,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ success: false, error: 'Batch already finished' });
       return true;
     }
-    // Cooperative cancel: queued videos skip, page-leg tiers bail at their
-    // next checkpoint, 2C aborts its poll within one tick.
-    translationManager._batchCancelled = true;
-    if (globalThis.activeBatchProcessor) globalThis.activeBatchProcessor.stop();
-    atomicProgressUpdate({ status: 'stopping' }, { force: true }).catch(() => {});
-    console.log('[Main] Stop requested for active batch');
-    sendResponse({ success: true });
+    // AWAITED (not fire-and-forget): the response is sent only after the
+    // write lands, so ordering against the terminal write is structural.
+    // refuseIfTerminal: if a terminal status won the race, keep it and
+    // report the stop as already-finished. The cooperative cancel flag and
+    // processor stop are only applied when the write was accepted — a
+    // refused stop must not mutate batch state.
+    atomicProgressUpdate({ status: 'stopping' }, { force: true, refuseIfTerminal: true })
+      .then((merged) => {
+        const accepted = merged?.status === 'stopping';
+        if (accepted) {
+          // Cooperative cancel: queued videos skip, page-leg tiers bail at
+          // their next checkpoint, 2C aborts its poll within one tick.
+          translationManager._batchCancelled = true;
+          if (globalThis.activeBatchProcessor) globalThis.activeBatchProcessor.stop();
+        }
+        console.log(
+          '[Main] Stop requested for active batch' +
+            (accepted ? '' : ' — refused, batch already finished')
+        );
+        sendResponse(
+          accepted
+            ? { success: true }
+            : { success: false, error: 'Batch already finished' }
+        );
+      })
+      .catch((e) => {
+        console.error('[Main] Stop write failed:', e);
+        sendResponse({ success: false, error: e.message });
+      });
     return true;
   }
 
@@ -568,12 +618,37 @@ async function handleGetPlaylistTranscript(videoId, options = {}) {
   }
 }
 
-async function handleBatchDownloadPlaylist(videos, options, playlistId, playlistTitle = '', downloadId) {
+async function handleBatchDownloadPlaylist(videos, options, playlistId, playlistTitle = '', downloadId, sourceTabId = null) {
   // Progress is already initialized by the message handler
 
   let results = null;
+  // Heartbeat: keeps updatedAt fresh (popup staleness guard) and helps the
+  // MV3 service worker stay alive while the batch runs. Stops in finally.
+  // .unref() (Node only) so an abandoned test batch can't pin the process.
+  const heartbeat = setInterval(() => {
+    atomicProgressUpdate({}, {}).catch(() => {});
+  }, 15000);
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
   try {
+    // Pin the tab captured at CLICK time (popup sends it in the payload) —
+    // resolving "active tab" here could pick a tab the user switched to
+    // during a cold service-worker wake. Validated as a YouTube tab; seed
+    // falls back to active-or-first if this one is gone.
+    if (sourceTabId != null) {
+      try {
+        const t = await chrome.tabs.get(sourceTabId);
+        if (t && /https?:\/\/([^/]+\.)?youtube\.com\//.test(t.url || '')) {
+          translationManager._batchTabId = t.id;
+          console.log(`[Batch] Pinned driver tab from click-time tabId: ${t.id}`);
+        } else {
+          console.log(`[Batch] Click-time tab ${sourceTabId} not a YouTube tab, seed will resolve`);
+        }
+      } catch (e) {
+        console.log(`[Batch] Click-time tab ${sourceTabId} unavailable (${e.message}), seed will resolve`);
+      }
+    }
+
     const processor = new BatchProcessor({
       concurrency: 3,
       delayMs: 300,
@@ -595,7 +670,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
             ...progress,
             playlistId,
             status: 'running',
-            downloadId: downloadId
+            downloadId: downloadId,
+            updatedAt: Date.now()
           };
           await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
         } catch (e) {
@@ -703,18 +779,21 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       const stored = await chrome.storage.local.get('currentDownloadProgress');
       const current = stored.currentDownloadProgress || {};
 
+      const terminalStatus = wasStopped ? 'stopped' : 'completed';
       globalThis.currentDownloadProgress = {
         ...current,
         playlistId,
-        status: wasStopped ? 'stopped' : 'completed',
+        status: terminalStatus,
         completed: results.success.length + results.errors.length,
         total: videos.length,
         failed: results.errors.length,
         downloadId,
         autoDownloaded: false,
         swDownloaded,
+        updatedAt: Date.now(),
         ...(wasStopped ? { stoppedSaved: swDownloaded } : {})
       };
+      globalThis.batchTerminalStatus = terminalStatus;
       await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
     } catch (e) {
       console.error('[Background] Final progress update failed:', e);
@@ -743,16 +822,19 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       const stored = await chrome.storage.local.get('currentDownloadProgress');
       const current = stored.currentDownloadProgress || {};
 
+      const errorStatus = stoppedAlready ? 'stopped' : 'error';
       globalThis.currentDownloadProgress = {
         ...current,
         playlistId,
-        status: stoppedAlready ? 'stopped' : 'error',
+        status: errorStatus,
         completed: results?.success?.length || current.completed || 0,
         total: videos.length,
         failed: results?.errors?.length || current.failed || 0,
         error: err.message,
-        downloadId
+        downloadId,
+        updatedAt: Date.now()
       };
+      globalThis.batchTerminalStatus = errorStatus;
       await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
     } catch (e) {
       console.error('[Background] Error state update failed:', e);
@@ -762,6 +844,8 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     await translationManager.restoreOriginalTab();
 
     throw err;
+  } finally {
+    clearInterval(heartbeat);
   }
 }
 
@@ -775,8 +859,12 @@ async function atomicProgressUpdate(updates, options = {}) {
     const stored = await chrome.storage.local.get('currentDownloadProgress');
     const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
 
-    // By default, don't overwrite completed/error states with running updates
-    if (!options.force && (current.status === 'completed' || current.status === 'error')) {
+    // Terminal states are only ever overwritten by force writes that were
+    // not explicitly told to respect them (STOP uses refuseIfTerminal so a
+    // racing terminal write always wins over 'stopping').
+    const isTerminal =
+      current.status === 'completed' || current.status === 'error' || current.status === 'stopped';
+    if (isTerminal && (options.refuseIfTerminal || !options.force)) {
       globalThis.currentDownloadProgress = current;
       return current;
     }
@@ -786,7 +874,9 @@ async function atomicProgressUpdate(updates, options = {}) {
       ...updates,
       // Preserve critical fields if not explicitly provided
       playlistId: updates.playlistId ?? current.playlistId,
-      downloadId: updates.downloadId ?? current.downloadId
+      downloadId: updates.downloadId ?? current.downloadId,
+      // Freshness stamp for the popup's staleness guard (SW-death recovery)
+      updatedAt: Date.now()
     };
 
     globalThis.currentDownloadProgress = merged;

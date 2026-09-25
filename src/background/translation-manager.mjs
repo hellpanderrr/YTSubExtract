@@ -42,7 +42,11 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   // Resolve the tab for a MUTATING page-leg call.
   // Prefers the batch-pinned tab; falls back to active-or-first only when
-  // no pin is set (single video) or the pinned tab died mid-batch.
+  // no pin is set (single video) or the pinned tab was CLOSED mid-batch.
+  // The pin is validated as a YouTube tab when it is set (batch start);
+  // after that a URL mismatch is NOT released — the batch's own navigations
+  // and transient url states (mid-nav, nocookie) must not drop the pin,
+  // which would revert the whole batch to follow-the-focus behavior.
   // ─────────────────────────────────────────────────────────────
   _resolvePageLegTab() {
     return new Promise((resolve) => {
@@ -56,13 +60,6 @@ export class TranslationManager {
       chrome.tabs.get(pinnedId, (tab) => {
         if (chrome.runtime.lastError || !tab) {
           console.log(`[PageLeg] Pinned tab ${pinnedId} gone (${chrome.runtime.lastError?.message || 'closed'}), re-resolving`);
-          this._batchTabId = null;
-          chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
-          return;
-        }
-        if (!/https?:\/\/([^/]+\.)?youtube\.com\//.test(tab.url || '')) {
-          // User navigated the pinned tab away themselves — release it.
-          console.log(`[PageLeg] Pinned tab ${pinnedId} left youtube.com (${tab.url}), releasing pin`);
           this._batchTabId = null;
           chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
           return;
