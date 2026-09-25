@@ -45,6 +45,10 @@ if (typeof localStorage === 'undefined') {
 if (typeof globalThis.isBatchProcessing === 'undefined') {
   globalThis.isBatchProcessing = false;
 }
+// Live BatchProcessor instance for the active batch (Stop button target).
+if (typeof globalThis.activeBatchProcessor === 'undefined') {
+  globalThis.activeBatchProcessor = null;
+}
 
 // Memoization for GET_DOWNLOAD_PROGRESS to prevent redundant storage reads
 if (typeof globalThis.restoreProgressPromise === 'undefined') {
@@ -273,6 +277,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     // Set guard atomically before any async operations
     globalThis.isBatchProcessing = true;
+    // Fresh batch: clear any stale Stop request / driver-tab pin from a previous run
+    translationManager._batchCancelled = false;
+    translationManager._batchTabId = null;
+    translationManager._originalTabUrl = null;
 
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
     // Initialize progress atomically so popup sees it on first poll (fire-and-forget)
@@ -300,10 +308,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .finally(() => {
         // ALWAYS reset the guard when batch completes (success, error, or stopped)
         globalThis.isBatchProcessing = false;
+        globalThis.activeBatchProcessor = null;
         console.log('[Main] Batch processing guard reset');
       });
     // Return immediately so popup can start polling
     sendResponse({ success: true, data: { downloadId } });
+    return true;
+  }
+
+  // 5b. Stop the active batch download (Stop button)
+  if (request.type === 'STOP_BATCH_DOWNLOAD') {
+    if (!globalThis.isBatchProcessing) {
+      sendResponse({ success: false, error: 'No batch running' });
+      return true;
+    }
+    // Cooperative cancel: queued videos skip, page-leg tiers bail at their
+    // next checkpoint, 2C aborts its poll within one tick.
+    translationManager._batchCancelled = true;
+    if (globalThis.activeBatchProcessor) globalThis.activeBatchProcessor.stop();
+    atomicProgressUpdate({ status: 'stopping' }, { force: true }).catch(() => {});
+    console.log('[Main] Stop requested for active batch');
+    sendResponse({ success: true });
     return true;
   }
 
@@ -541,9 +566,10 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
           const stored = await chrome.storage.local.get('currentDownloadProgress');
           const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
           
-          // Don't overwrite completed or error status with running from a potentially stale processor
-          if (current.status === 'completed' || current.status === 'error') {
-             // If we already finished in storage, just keep it
+          // Don't overwrite terminal/stop states from a potentially stale processor
+          if (current.status === 'completed' || current.status === 'error' ||
+              current.status === 'stopping' || current.status === 'stopped') {
+             // If we already finished (or are stopping) in storage, just keep it
              globalThis.currentDownloadProgress = current;
              return;
           }
@@ -566,6 +592,7 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
         console.log(`[Batch] Failed: ${error.videoId} - ${error.error}`);
       }
     });
+    globalThis.activeBatchProcessor = processor;
 
     // Seed the tab ONCE to a /watch page so Tier 1.7 player coercion has a
     // real movie_player to drive via loadVideoById (one navigation per
@@ -575,8 +602,17 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
     }
     results = await processor.process(videos, options);
+    const wasStopped = translationManager._batchCancelled;
 
-    // Create ZIP with subtitles
+    // Create ZIP with subtitles — skipped entirely when the user stopped the
+    // batch with zero successes (nothing to deliver). A partial batch with
+    // successes still ships a ZIP, saved silently (no Save-As dialog) since
+    // the user just asked everything to stop.
+    const stopWithoutResults = wasStopped && results.success.length === 0;
+    let swDownloaded = false;
+    if (stopWithoutResults) {
+      console.log('[Background] Batch stopped with no successful transcripts — skipping ZIP');
+    } else {
     const zipData = {};
     const format = options.format || 'srt';
     const lang = options.translate ? options.targetLang : options.sourceLang;
@@ -618,12 +654,11 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     }
     const dataUrl = 'data:application/zip;base64,' + btoa(binary);
 
-    let swDownloaded = false;
     try {
       await chrome.downloads.download({
         url: dataUrl,
         filename: filename,
-        saveAs: true
+        saveAs: !wasStopped // silent partial download when stopping
       });
       // Mark that SW already triggered the download — popup just needs to show success
       swDownloaded = true;
@@ -642,22 +677,24 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
         console.error('[Background] Storage fallback also failed:', storeErr);
       }
     }
+    } // end !stopWithoutResults
 
-    // Update progress to completed
+    // Update progress to completed/stopped
     try {
       const stored = await chrome.storage.local.get('currentDownloadProgress');
       const current = stored.currentDownloadProgress || {};
-      
+
       globalThis.currentDownloadProgress = {
         ...current,
         playlistId,
-        status: 'completed',
+        status: wasStopped ? 'stopped' : 'completed',
         completed: results.success.length + results.errors.length,
         total: videos.length,
         failed: results.errors.length,
         downloadId,
         autoDownloaded: false,
-        swDownloaded
+        swDownloaded,
+        ...(wasStopped ? { stoppedSaved: swDownloaded } : {})
       };
       await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
     } catch (e) {

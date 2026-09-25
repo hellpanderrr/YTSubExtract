@@ -27,6 +27,49 @@ export class TranslationManager {
 
     // Original tab URL before tab navigation (used to restore after batch)
     this._originalTabUrl = null;
+
+    // Batch-pinned driver tab: seedWatchPage records the tab the user was on
+    // when they clicked Download, and every mutating page-leg (1.5 inject,
+    // 1.7 coercion, 2C navigation, restore) drives THAT tab — never whichever
+    // YouTube tab happens to be active when the call runs. Null outside batch.
+    this._batchTabId = null;
+
+    // Cooperative batch cancellation (Stop button). Checked before starting
+    // page-leg tiers and while waiting on their locks/polls.
+    this._batchCancelled = false;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Resolve the tab for a MUTATING page-leg call.
+  // Prefers the batch-pinned tab; falls back to active-or-first only when
+  // no pin is set (single video) or the pinned tab died mid-batch.
+  // ─────────────────────────────────────────────────────────────
+  _resolvePageLegTab() {
+    return new Promise((resolve) => {
+      const fallback = (tabs) => resolve(tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null);
+
+      if (this._batchTabId == null) {
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
+        return;
+      }
+      const pinnedId = this._batchTabId;
+      chrome.tabs.get(pinnedId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          console.log(`[PageLeg] Pinned tab ${pinnedId} gone (${chrome.runtime.lastError?.message || 'closed'}), re-resolving`);
+          this._batchTabId = null;
+          chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
+          return;
+        }
+        if (!/https?:\/\/([^/]+\.)?youtube\.com\//.test(tab.url || '')) {
+          // User navigated the pinned tab away themselves — release it.
+          console.log(`[PageLeg] Pinned tab ${pinnedId} left youtube.com (${tab.url}), releasing pin`);
+          this._batchTabId = null;
+          chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
+          return;
+        }
+        resolve(tab);
+      });
+    });
   }
 
   /**
@@ -262,12 +305,15 @@ export class TranslationManager {
           resolve(result);
           innerResolve(result);
         };
-        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-          if (tabs.length === 0) {
+        this._resolvePageLegTab().then((tab) => {
+          if (this._batchCancelled) {
+            console.log('[EmbedFrame] Batch stopped, skipping');
+            return passThrough(null);
+          }
+          if (!tab) {
             console.log('[EmbedFrame] No YouTube tab found');
             return passThrough(null);
           }
-          const tab = tabs.find(t => t.active) || tabs[0];
           const timer = setTimeout(() => {
             console.log('[EmbedFrame] Timeout');
             passThrough(null);
@@ -316,12 +362,15 @@ export class TranslationManager {
           resolve(result);
           innerResolve(result);
         };
-        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-          if (tabs.length === 0) {
+        if (this._batchCancelled) {
+          console.log('[CoercePlayer] Batch stopped, skipping');
+          return passThrough(null);
+        }
+        this._resolvePageLegTab().then((tab) => {
+          if (!tab) {
             console.log('[CoercePlayer] No YouTube tab found');
             return passThrough(null);
           }
-          const tab = tabs.find(t => t.active) || tabs[0];
           const timer = setTimeout(() => {
             console.log('[CoercePlayer] Timeout');
             passThrough(null);
@@ -372,13 +421,16 @@ export class TranslationManager {
           resolve(result);
           innerResolve(result);
         };
-        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-        if (tabs.length === 0) {
+        if (this._batchCancelled) {
+          console.log('[TabNav] Batch stopped, skipping navigation');
+          return passThrough(null);
+        }
+        this._resolvePageLegTab().then((tab) => {
+        if (!tab) {
           console.log('[TabNav] No YouTube tab found');
           return passThrough(null);
         }
 
-        const tab = tabs.find(t => t.active) || tabs[0];
         const originalUrl = tab.url;
 
         // Preserve playlist context by extracting list param from original URL
@@ -428,6 +480,12 @@ export class TranslationManager {
         let settledZeroStreak = 0;
         const startPolling = () => {
           pollTimer = setInterval(() => {
+            if (this._batchCancelled && !resolved) {
+              console.log('[TabNav] Batch stopped, aborting wait');
+              resolved = true;
+              cleanup();
+              return passThrough(null);
+            }
             chrome.tabs.sendMessage(tab.id, {
               type: 'POLL_TRANSCRIPT',
               videoId
@@ -477,15 +535,15 @@ export class TranslationManager {
    * restoreOriginalTab. Resolves true when a usable player is present.
    */
   async seedWatchPage(videoId, playlistId = null, timeout = 45000) {
-    const tab = await new Promise((resolve) => {
-      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
-        resolve(tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null);
-      });
-    });
+    const tab = await this._resolvePageLegTab();
     if (!tab) {
       console.log('[WatchSeed] No YouTube tab found');
       return false;
     }
+
+    // Pin THIS tab for the whole batch — later 1.5/1.7/2C/restore calls must
+    // keep driving it even if the user switches to another YouTube tab.
+    this._batchTabId = tab.id;
 
     if (!this._originalTabUrl) this._originalTabUrl = tab.url;
 
@@ -567,14 +625,20 @@ export class TranslationManager {
   async restoreOriginalTab() {
     const originalUrl = this._originalTabUrl;
     this._originalTabUrl = null;
+    const pinnedId = this._batchTabId;
+    this._batchTabId = null;
+    this._batchCancelled = false;
     if (!originalUrl) return;
 
     try {
-      const tabs = await chrome.tabs.query({ url: '*://*.youtube.com/*' });
-      if (tabs.length === 0) return;
-      const tab = tabs.find(t => t.active) || tabs[0];
+      // Restore the tab the batch actually drove (the pin), not whichever
+      // YouTube tab happens to be active now.
+      const tab = (pinnedId != null)
+        ? await chrome.tabs.get(pinnedId).catch(() => null)
+        : await this._resolvePageLegTab();
+      if (!tab) return;
       if (tab.url && tab.url.includes('/watch')) {
-        console.log(`[TabNav] Restoring original URL: ${originalUrl}`);
+        console.log(`[TabNav] Restoring tab ${tab.id} to original URL: ${originalUrl}`);
         await chrome.tabs.update(tab.id, { url: originalUrl });
       }
     } catch (e) {
@@ -1939,6 +2003,19 @@ export class TranslationManager {
 
     const errors = [];
 
+    // Stop checkpoints: the Stop button sets _batchCancelled; each remaining
+    // tier boundary throws a `stopped` error (BatchProcessor does not count
+    // these as failures) instead of spending seconds on more tiers.
+    const throwIfStopped = () => {
+      if (!this._batchCancelled) return;
+      log('[Batch] Stopped — aborting remaining tiers for this video');
+      const stopped = new Error(`Batch stopped for ${videoId}`);
+      stopped.logs = logs;
+      stopped.stopped = true;
+      throw stopped;
+    };
+    throwIfStopped();
+
     // === TIER 0 (Primary): Android API Bypass ===
     // ANDROID client often works without PoToken for /get_transcript.
     // Uses player endpoint with ANDROID context to get params,
@@ -2075,6 +2152,7 @@ export class TranslationManager {
     }
 
     // === LAST RESORT: Embed Page ===
+    throwIfStopped();
     try {
       log('[Tier 1.5] Attempting embed page (last resort)...');
       const result = await this._extractFromEmbed(videoId, sourceLang, translate, targetLang);
@@ -2112,6 +2190,7 @@ export class TranslationManager {
     // it once via seedWatchPage in main.mjs); otherwise the content script
     // fails fast. Calls serialize on _coerceLock since all workers drive the
     // one shared player; API tiers above stay parallel.
+    throwIfStopped();
     try {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
       const coerced = await this._coercePlayerTranscript(videoId, {
@@ -2144,6 +2223,7 @@ export class TranslationManager {
     // timedtext request. The sniffer captures the response body.
     // This is the only tier that reliably works for heavily restricted
     // videos. The tab briefly visits each video.
+    throwIfStopped();
     try {
       log('[Tier 2C Tab Nav] Navigating tab to watch page...');
       const tabResult = await this._fetchTranscriptViaTabNav(videoId, {
@@ -2171,6 +2251,7 @@ export class TranslationManager {
     // === TIER 0.5 AUTH (last resort): Credentialed transcript fetch ===
     // Only works if user has a YouTube tab open (content script needs cookies).
     // Used when all API-only tiers fail with LOGIN_REQUIRED.
+    throwIfStopped();
     try {
       log('[Tier 0.5 Auth] Attempting credentialed transcript fetch...');
       const authResult = await this._fetchTranscriptAuth(videoId, {

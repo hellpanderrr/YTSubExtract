@@ -35,6 +35,7 @@ const btnDownloadZip = document.getElementById('btn-download-zip');
 const playlistProgressEl = document.getElementById('playlist-progress');
 const progressFillEl = document.getElementById('progress-fill');
 const progressTextEl = document.getElementById('progress-text');
+const btnStopDownload = document.getElementById('btn-stop-download');
 const controlsEl = document.querySelector('.controls');
 
 // Playlist language controls
@@ -353,6 +354,11 @@ function resetDownloadState() {
   // Reset download tracking
   currentDownloadId = null;
   releaseZipDownloadLock();
+  // Reset stop button for the next batch
+  if (btnStopDownload) {
+    btnStopDownload.disabled = false;
+    btnStopDownload.textContent = 'Stop';
+  }
 }
 
 /**
@@ -470,7 +476,8 @@ async function checkAndRestoreProgress() {
     if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return;
 
     // If there's an active or completed download, restore UI
-    if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error') {
+    if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error' ||
+        progress.status === 'stopping' || progress.status === 'stopped') {
       console.log('[Popup] Restoring progress:', progress);
 
       // Show progress UI
@@ -494,6 +501,24 @@ async function checkAndRestoreProgress() {
         }
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
+      } else if (progress.status === 'stopping') {
+        if (progress.downloadId) {
+          currentDownloadId = progress.downloadId;
+        }
+        btnStopDownload.disabled = true;
+        btnStopDownload.textContent = 'Stopping…';
+        startProgressPolling(progress.total);
+        setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
+      } else if (progress.status === 'stopped') {
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${progress.swDownloaded || progress.stoppedSaved ? ' (partial ZIP saved)' : ''}`, 'info');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+        try {
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } finally {
+          resetDownloadState();
+        }
+        return;
       } else if (progress.status === 'completed' && progress.downloadId) {
         if (progress.swDownloaded) {
           // SW already downloaded the file
@@ -607,6 +632,12 @@ function startProgressPolling(totalVideos) {
           }
           setStatus(`Downloading... ${progress.completed}/${progress.total} (${progress.failed || 0} failed)`, 'info', true);
         }
+
+        if (progress.status === 'stopping') {
+          btnStopDownload.disabled = true;
+          btnStopDownload.textContent = 'Stopping…';
+          setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
+        }
       } else {
         console.log('[Popup] Total is 0, cannot calculate progress');
       }
@@ -652,6 +683,32 @@ function startProgressPolling(totalVideos) {
         } finally {
           resetDownloadState();
         }
+      }
+
+      // Check if stopped by the user
+      if (progress.status === 'stopped') {
+        clearInterval(progressCheckInterval);
+        progressCheckInterval = null;
+
+        appendPlaylistLog(`=== Download Stopped ===`);
+        appendPlaylistLog(`Progress: ${progress.completed}/${progress.total}`);
+        if (progress.failed > 0) {
+          appendPlaylistLog(`Failed before stop: ${progress.failed}`);
+        }
+        if (progress.swDownloaded || progress.stoppedSaved) {
+          appendPlaylistLog('Partial ZIP saved to Downloads');
+        }
+
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${progress.swDownloaded || progress.stoppedSaved ? ' (partial ZIP saved)' : ''}`, 'info');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+
+        try {
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+        } finally {
+          resetDownloadState();
+        }
+        return;
       }
 
       // Check if error occurred
@@ -750,6 +807,26 @@ selectAllCheck?.addEventListener('change', (e) => {
 });
 
 btnDownloadZip?.addEventListener('click', downloadPlaylistSubtitles);
+
+// Stop an in-progress batch download (cooperative — background cancels at
+// its next checkpoint and reports status 'stopping' → 'stopped').
+btnStopDownload?.addEventListener('click', async () => {
+  btnStopDownload.disabled = true;
+  btnStopDownload.textContent = 'Stopping…';
+  appendPlaylistLog('Stop requested — cancelling remaining videos...');
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'STOP_BATCH_DOWNLOAD' });
+    if (!resp?.success) {
+      appendPlaylistLog(`Stop failed: ${resp?.error || 'no response'}`);
+      btnStopDownload.disabled = false;
+      btnStopDownload.textContent = 'Stop';
+    }
+  } catch (err) {
+    appendPlaylistLog(`Stop error: ${err.message}`);
+    btnStopDownload.disabled = false;
+    btnStopDownload.textContent = 'Stop';
+  }
+});
 
 // Playlist translation toggle
 function updatePlaylistTranslationState() {
