@@ -3,7 +3,7 @@
 
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { installChrome } from './helpers/chrome-mock.mjs';
+import { installChrome, waitFor } from './helpers/chrome-mock.mjs';
 
 const { state } = installChrome();
 const { translationManager: tm } = await import(
@@ -30,13 +30,15 @@ test('_resolvePageLegTab drives the pinned tab even when another is active', asy
   assert.equal(tab.id, 2, 'must not follow the user focus');
 });
 
-test('a dead pin falls back to active-or-first and clears the pin', async () => {
+test('a dead pin falls back to active-or-first AND re-pins the fallback', async () => {
   state.tabs.push({ id: 1, url: 'https://www.youtube.com/', active: true });
   tm._batchTabId = 99; // closed — not in the mock
 
   const tab = await tm._resolvePageLegTab();
   assert.equal(tab.id, 1);
-  assert.equal(tm._batchTabId, null, 'dead pin must be released');
+  // The replacement becomes the new pin: without this, every later leg and
+  // the final restore re-follow the user's focus (the original bug).
+  assert.equal(tm._batchTabId, 1, 'fallback must be re-pinned, not just returned');
 });
 
 test('a pin whose tab left youtube.com is NOT released (no one-way door)', async () => {
@@ -123,4 +125,109 @@ test('restoreOriginalTab restores the pinned tab and clears all batch flags', as
   assert.equal(tm._originalTabUrl, null);
   assert.equal(tm._batchTabId, null);
   assert.equal(tm._batchCancelled, false, 'restore clears the stop flag');
+});
+
+test('Tier 1.7 and 2C cannot overlap on the shared tab (one page-leg lock)', async () => {
+  state.tabs.push({ id: 3, url: 'https://www.youtube.com/watch?v=seed', active: true });
+  tm._batchTabId = 3;
+  tm._originalTabUrl = 'https://www.youtube.com/playlist?list=PLunit';
+
+  // Hold the coercion's sendMessage open — that worker owns the lock.
+  let releaseCoerce = null;
+  state.sendMessageHandler = (tabId, message) => {
+    if (message.type === 'COERCE_PLAYER_TRANSCRIPT') {
+      return new Promise((resolve) => {
+        releaseCoerce = () =>
+          resolve({ success: true, result: [{ start: 0, duration: 1, text: 'a' }] });
+      });
+    }
+    return { success: false, error: 'nope' };
+  };
+
+  try {
+    const coerceP = tm._coercePlayerTranscript('vidA', { timeout: 5000 });
+    await waitFor(() => releaseCoerce !== null, { label: 'coercion holds the lock' });
+
+    // 2C queued behind 1.7: must NOT navigate while coercion is in flight.
+    const navP = tm._fetchTranscriptViaTabNav('vidB', { timeout: 250 });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(
+      state.tabUpdates.length,
+      0,
+      '2C must not navigate the tab while 1.7 holds the page-leg lock'
+    );
+
+    releaseCoerce();
+    const coerced = await coerceP;
+    assert.equal(coerced.length, 1);
+
+    // Lock released → 2C proceeds and navigates (then times out: the mock
+    // never fires tabs.onUpdated complete, so no polling starts).
+    const nav = await navP;
+    assert.ok(state.tabUpdates.length >= 1, '2C navigates after the lock is released');
+    assert.equal(nav, null);
+    assert.equal(state.tabUpdates[0].id, 3, 'navigation targets the pinned tab');
+  } finally {
+    state.sendMessageHandler = null;
+    if (releaseCoerce) releaseCoerce();
+  }
+});
+
+test('_probeSettledNoTracks runs its probe in MAIN world and fails safe', async () => {
+  const mkPlayer = (videoId, tracks) => ({
+    getPlayerResponse: () => ({
+      videoDetails: { videoId },
+      captions: tracks
+        ? { playerCaptionsTracklistRenderer: { captionTracks: tracks } }
+        : undefined,
+    }),
+  });
+
+  const runProbe = async (playerValue) => {
+    state.scriptingHandler = async (opts) => {
+      assert.equal(opts.world, 'MAIN', 'probe must run in MAIN world');
+      assert.equal(opts.target.tabId, 4);
+      const savedDoc = globalThis.document;
+      globalThis.document = { getElementById: () => playerValue };
+      try {
+        return [{ result: opts.func(...opts.args) }];
+      } finally {
+        globalThis.document = savedDoc;
+      }
+    };
+    try {
+      return await tm._probeSettledNoTracks(4, 'vidZ');
+    } finally {
+      state.scriptingHandler = null;
+    }
+  };
+
+  // Settled on our video, zero tracks → fast-abort candidate
+  const zero = await runProbe(mkPlayer('vidZ', []));
+  assert.deepEqual(zero, { settled: true, trackCount: 0 });
+
+  // Settled with tracks → keep waiting
+  const some = await runProbe(
+    mkPlayer('vidZ', [{ languageCode: 'en' }])
+  );
+  assert.deepEqual(some, { settled: true, trackCount: 1 });
+
+  // Wrong video (mid-navigation) → not settled
+  const wrongVideo = await runProbe(mkPlayer('otherVid', []));
+  assert.deepEqual(wrongVideo, { settled: false });
+
+  // No page API visible (ISOLATED-style dead player) → not settled
+  const noApi = await runProbe({ notAPlayer: true });
+  assert.deepEqual(noApi, { settled: false });
+
+  // executeScript throwing (tab mid-nav) → not settled, never a false abort
+  state.scriptingHandler = async () => {
+    throw new Error('No document with id movie_player');
+  };
+  try {
+    const failed = await tm._probeSettledNoTracks(4, 'vidZ');
+    assert.deepEqual(failed, { settled: false });
+  } finally {
+    state.scriptingHandler = null;
+  }
 });

@@ -32,8 +32,7 @@
   ],
   "host_permissions": [
     "*://*.youtube.com/*",
-    "*://*.youtube-nocookie.com/*",
-    "*://*.google.com/*"
+    "*://*.youtube-nocookie.com/*"
   ],
   "content_scripts": [
     {

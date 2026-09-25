@@ -393,9 +393,15 @@ const STALE_PROGRESS_MS = 60000;
 function effectiveProgress(p) {
   if (!p || !p.status) return p;
   const terminal = p.status === 'completed' || p.status === 'error' || p.status === 'stopped';
-  if (terminal || !p.updatedAt) return p;
-  if (Date.now() - p.updatedAt <= STALE_PROGRESS_MS) return p;
-  return { ...p, status: 'stopped', stale: true };
+  if (terminal) return p;
+  // Records with NO updatedAt are pre-upgrade (orphaned by a version that
+  // predates the stamp) — treat them as stale too, else a stuck 'running'
+  // from before the upgrade survives forever, which is the exact soft-lock
+  // this guard exists to break.
+  if (!p.updatedAt || Date.now() - p.updatedAt > STALE_PROGRESS_MS) {
+    return { ...p, status: 'stopped', stale: true };
+  }
+  return p;
 }
 
 /**
@@ -405,25 +411,29 @@ function effectiveProgress(p) {
  * progress record is cleared, otherwise the key is orphaned forever.
  * Pre-checks storage so the 0-success stop (no ZIP at all) doesn't flash
  * downloadCompletedZip's "Failed to download ZIP" error.
- * Returns true only when delivery was actually initiated successfully.
+ * Returns tri-state:
+ *   'none'      — nothing parked (safe to clear the progress record)
+ *   'delivered' — parked ZIP handed to the browser (safe to clear)
+ *   'failed'    — parked ZIP exists but delivery failed: DO NOT clear the
+ *                 record, or the only pointer to the ZIP is lost forever.
  */
 async function recoverStoppedZip(progress) {
-  if (progress.swDownloaded || progress.stoppedSaved || !progress.downloadId) return false;
+  if (progress.swDownloaded || progress.stoppedSaved || !progress.downloadId) return 'none';
   try {
     const result = await chrome.storage.local.get(progress.downloadId);
-    if (!result[progress.downloadId]) return false;
+    if (!result[progress.downloadId]) return 'none';
   } catch (e) {
     console.log('[Popup] Storage check for stopped ZIP failed:', e.message);
-    return false;
+    return 'none';
   }
-  if (!tryAcquireZipDownloadLock()) return false;
+  if (!tryAcquireZipDownloadLock()) return 'none';
   try {
     // Swallows its own errors internally and returns whether it delivered.
     const delivered = await downloadCompletedZip(progress.downloadId);
     if (!delivered) {
-      appendPlaylistLog('Stored partial ZIP existed but delivery failed');
+      appendPlaylistLog('Stored partial ZIP existed but delivery FAILED — progress kept for retry');
     }
-    return delivered;
+    return delivered ? 'delivered' : 'failed';
   } finally {
     releaseZipDownloadLock();
   }
@@ -569,13 +579,19 @@ async function checkAndRestoreProgress() {
         startProgressPolling(progress.total);
         setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
       } else if (progress.status === 'stopped') {
-        const recoveredZip = await recoverStoppedZip(progress);
-        const saved = progress.swDownloaded || progress.stoppedSaved || recoveredZip;
+        const recovery = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recovery === 'delivered';
         setStatus(`Stopped — ${progress.completed}/${progress.total} done${saved ? ' (partial ZIP saved)' : ''}`, 'info');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
         try {
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          // Never clear when a parked ZIP failed to deliver — the record is
+          // the only pointer to it (retry happens on next popup open).
+          if (recovery !== 'failed') {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+          }
         } finally {
           resetDownloadState();
         }
@@ -598,9 +614,13 @@ async function checkAndRestoreProgress() {
         }
 
         try {
-          await downloadCompletedZip(progress.downloadId);
-          // Only clear if download initiated successfully
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          const delivered = await downloadCompletedZip(progress.downloadId);
+          if (delivered) {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            // Keep the record — it is the only pointer to the parked ZIP.
+            setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+          }
         } catch (err) {
           console.error('[Popup] Failed to handle completed ZIP:', err);
         } finally {
@@ -734,10 +754,14 @@ function startProgressPolling(totalVideos) {
 
         try {
           appendPlaylistLog('Downloading ZIP file...');
-          await downloadCompletedZip(progress.downloadId);
-          appendPlaylistLog('ZIP download completed');
-          // Only clear if download initiated successfully
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          const delivered = await downloadCompletedZip(progress.downloadId);
+          if (delivered) {
+            appendPlaylistLog('ZIP download completed');
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            appendPlaylistLog('ZIP delivery FAILED — progress kept for retry on next popup open');
+            setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+          }
         } catch (err) {
           console.error('[Popup] Polling completion error:', err);
           appendPlaylistLog(`Error downloading ZIP: ${err.message}`);
@@ -751,8 +775,8 @@ function startProgressPolling(totalVideos) {
         clearInterval(progressCheckInterval);
         progressCheckInterval = null;
 
-        const recoveredZip = await recoverStoppedZip(progress);
-        const saved = progress.swDownloaded || progress.stoppedSaved || recoveredZip;
+        const recovery = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recovery === 'delivered';
 
         appendPlaylistLog(`=== Download Stopped ===`);
         if (progress.stale) {
@@ -771,7 +795,13 @@ function startProgressPolling(totalVideos) {
         playlistProgressEl.classList.add('hidden');
 
         try {
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          // Never clear when a parked ZIP failed to deliver — the record is
+          // the only pointer to it (retry happens on next popup open).
+          if (recovery !== 'failed') {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+          }
         } finally {
           resetDownloadState();
         }

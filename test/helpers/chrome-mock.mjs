@@ -26,6 +26,8 @@ export function installChrome() {
     sentMessages: [],
     downloadMode: 'ok', // 'ok' | 'fail'
     storageLatencyMs: 0, // >0 makes storage ops slow, to expose write-ordering races
+    sendMessageHandler: null, // (tabId, message) => response | Promise<response>
+    scriptingHandler: null, // async (executeScriptOpts) => [{result}]
   };
 
   const storageDelay = () =>
@@ -107,12 +109,21 @@ export function installChrome() {
       },
       sendMessage(tabId, message, cb) {
         state.sentMessages.push({ tabId, message });
-        const response = { success: false, error: 'sendMessage not stubbed' };
         if (typeof cb === 'function') {
-          cb(response);
+          if (!state.sendMessageHandler) {
+            cb({ success: false, error: 'sendMessage not stubbed' });
+            return;
+          }
+          Promise.resolve(state.sendMessageHandler(tabId, message)).then(
+            (r) => cb(r),
+            (e) => cb({ success: false, error: String((e && e.message) || e) })
+          );
           return;
         }
-        return Promise.resolve(response);
+        if (state.sendMessageHandler) {
+          return Promise.resolve(state.sendMessageHandler(tabId, message));
+        }
+        return Promise.resolve({ success: false, error: 'sendMessage not stubbed' });
       },
     },
     downloads: {
@@ -125,7 +136,8 @@ export function installChrome() {
       },
     },
     scripting: {
-      async executeScript() {
+      async executeScript(opts) {
+        if (state.scriptingHandler) return await state.scriptingHandler(opts);
         return [{ result: null }];
       },
     },

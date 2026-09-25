@@ -17,13 +17,12 @@ export class TranslationManager {
     this.pendingMetadataRequests = new Map(); // key: videoId -> Promise
     this.pendingTranscriptRequests = new Map(); // key: videoId:lang:translate:targetLang -> Promise
 
-    // Tab navigation lock (serializes tab navigation to prevent conflicts)
-    this._tabNavLock = Promise.resolve();
-
-    // Player-coercion lock: loadVideoById drives the ONE shared movie_player,
-    // so concurrent batch workers would clobber each other's video. Coercion
-    // calls serialize here; API tiers above stay parallel.
-    this._coerceLock = Promise.resolve();
+    // Page-leg lock: ONE lock for every operation that drives the batch's
+    // pinned tab (Tier 1.5 embed inject, Tier 1.7 player coercion, Tier 2C
+    // tab navigation). The previous pair (_coerceLock / _tabNavLock) let a
+    // 1.7 loadVideoById race a 2C navigation on the same tab under
+    // concurrency 3 — one shared tab gets one shared mutex.
+    this._pageLegLock = Promise.resolve();
 
     // Original tab URL before tab navigation (used to restore after batch)
     this._originalTabUrl = null;
@@ -50,10 +49,20 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   _resolvePageLegTab() {
     return new Promise((resolve) => {
-      const fallback = (tabs) => resolve(tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null);
+      // rePin: set only when we got here via PIN DEATH mid-batch — the
+      // replacement must become the new pin, otherwise every later leg and
+      // the final restore re-follow the user's focus (the original bug).
+      const pickFallback = (tabs, rePin) => {
+        const pick = tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null;
+        if (pick && rePin) {
+          this._batchTabId = pick.id;
+          console.log(`[PageLeg] Re-pinned driver tab to ${pick.id} after pin death`);
+        }
+        resolve(pick);
+      };
 
       if (this._batchTabId == null) {
-        chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => pickFallback(tabs, false));
         return;
       }
       const pinnedId = this._batchTabId;
@@ -61,7 +70,7 @@ export class TranslationManager {
         if (chrome.runtime.lastError || !tab) {
           console.log(`[PageLeg] Pinned tab ${pinnedId} gone (${chrome.runtime.lastError?.message || 'closed'}), re-resolving`);
           this._batchTabId = null;
-          chrome.tabs.query({ url: '*://*.youtube.com/*' }, fallback);
+          chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => pickFallback(tabs, true));
           return;
         }
         resolve(tab);
@@ -297,7 +306,7 @@ export class TranslationManager {
       // Embed-frame shares the page with Tier 1.7's coercion, so concurrent
       // batch workers would inject/remove the same fixed iframe id. Serialize
       // on the coercion lock — it is the same shared surface.
-      this._coerceLock = this._coerceLock.then(() => new Promise((innerResolve) => {
+      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);
@@ -354,7 +363,7 @@ export class TranslationManager {
     const { lang = 'auto', timeout = 25000 } = options;
     // Serialize: every caller drives the same movie_player via loadVideoById.
     return new Promise((resolve) => {
-      this._coerceLock = this._coerceLock.then(() => new Promise((innerResolve) => {
+      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);
@@ -413,7 +422,7 @@ export class TranslationManager {
     const { timeout = 30000 } = options;
     // Serialize via lock to prevent concurrent tab navigations
     return new Promise((resolve) => {
-      this._tabNavLock = this._tabNavLock.then(() => new Promise((innerResolve) => {
+      this._pageLegLock = this._pageLegLock.then(() => new Promise((innerResolve) => {
         const passThrough = (result) => {
           resolve(result);
           innerResolve(result);
@@ -475,6 +484,7 @@ export class TranslationManager {
         // settled and keeps polling. 0.5 Auth still runs afterwards (0.7s,
         // independent path) so this aborts only the tab wait, not the video.
         let settledZeroStreak = 0;
+        let probeInFlight = false;
         const startPolling = () => {
           pollTimer = setInterval(() => {
             if (this._batchCancelled && !resolved) {
@@ -495,17 +505,30 @@ export class TranslationManager {
                 passThrough(response.result);
                 return;
               }
-              if (response?.settledNoTracks === true) {
-                settledZeroStreak++;
-                if (settledZeroStreak >= 2) {
-                  console.log('[TabNav] Settled with 0 tracks, aborting wait (~10s, Auth still runs)');
-                  resolved = true;
-                  cleanup();
-                  passThrough(null);
+              // Settled-with-0-tracks: the ISOLATED-side answer is always
+              // false (dead read), so confirm via the MAIN-world probe.
+              // Async — skip this tick if a probe is already in flight.
+              if (probeInFlight) return;
+              probeInFlight = true;
+              const checkSettled = response?.settledNoTracks === true
+                ? Promise.resolve(true)
+                : this._probeSettledNoTracks(tab.id, videoId)
+                    .then((r) => r.settled && r.trackCount === 0);
+              checkSettled.then((settledZero) => {
+                probeInFlight = false;
+                if (resolved) return;
+                if (settledZero) {
+                  settledZeroStreak++;
+                  if (settledZeroStreak >= 2) {
+                    console.log('[TabNav] Settled with 0 tracks, aborting wait (~10s, Auth still runs)');
+                    resolved = true;
+                    cleanup();
+                    passThrough(null);
+                  }
+                } else {
+                  settledZeroStreak = 0;
                 }
-              } else {
-                settledZeroStreak = 0;
-              }
+              });
             });
           }, 800);
         };
@@ -521,9 +544,37 @@ export class TranslationManager {
         chrome.tabs.onUpdated.addListener(onUpdated);
         chrome.tabs.update(tab.id, { url: watchUrl });
       });   // chrome.tabs.query
-    }));    // inner promise + _tabNavLock.then()
+    }));    // inner promise + _pageLegLock.then()
   });       // outer promise
 }
+
+  /**
+   * MAIN-world probe: is the player settled on this video with 0 caption
+   * tracks? The ISOLATED-world POLL_TRANSCRIPT answer for this is dead code
+   * (content scripts cannot see page-JS expandos — proven 2026-09-20 and
+   * documented in content.js), so 2C's fast-abort reads the player here via
+   * chrome.scripting world:'MAIN' instead. Any failure = "not settled"
+   * (keeps polling; never a false abort).
+   */
+  async _probeSettledNoTracks(tabId, videoId) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: (vid) => {
+          const p = document.getElementById('movie_player');
+          const r = (p && typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+          if (!r || r.videoDetails?.videoId !== vid) return { settled: false };
+          const tracks = r.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+          return { settled: true, trackCount: tracks.length };
+        },
+        args: [videoId]
+      });
+      return res?.result || { settled: false };
+    } catch (e) {
+      return { settled: false };
+    }
+  }
 
   /**
    * Seed the active YouTube tab to a /watch page ONCE per batch so Tier 1.7
@@ -2043,6 +2094,7 @@ export class TranslationManager {
       log(`[Tier 0] Failed: ${err.message}`);
     }
 
+    throwIfStopped();
     // === TIER 0.1: /next Endpoint → Engagement Panel Transcript ===
     // Calls /youtubei/v1/next instead of /player to get engagement
     // panels, then extracts transcript via continuation token.
@@ -2073,6 +2125,7 @@ export class TranslationManager {
       log(`[Tier 0.1] Failed: ${err.message}`);
     }
 
+    throwIfStopped();
     // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
     try {
       log('[Tier 3] Attempting Innertube (primary)...');
@@ -2110,6 +2163,7 @@ export class TranslationManager {
       log(`[Tier 3] Failed: ${err.message}`);
     }
 
+    throwIfStopped();
     // === FALLBACK: Try Tier 1 (updated client chain: IOS -> MWEB -> WEB_EMBEDDED) ===
     // Only used if Tier 3 fails, for edge cases
     try {
@@ -2176,7 +2230,9 @@ export class TranslationManager {
     // Probes showed the nocookie iframe never fires a caption request for
     // ASR-gated videos — it burned 10-25s per video for zero captures and
     // shared the coercion lock (serialized dead wait). _fetchTranscriptViaEmbedFrame
-    // and the INJECT_EMBED_FRAME handler stay for manual/single use; batch
+    // and the INJECT_EMBED_FRAME content handler remain but currently have
+    // NO callers anywhere (verified 2026-09-25 — not even single-video);
+    // batch
     // goes straight from cold tiers to 1.7 player coercion. (2026-09-20)
 
     // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
@@ -2185,8 +2241,8 @@ export class TranslationManager {
     // PoToken-authenticated timedtext requests, captured by the MAIN-world
     // sniffer. Requires the tab to already be on a /watch page (batch seeds
     // it once via seedWatchPage in main.mjs); otherwise the content script
-    // fails fast. Calls serialize on _coerceLock since all workers drive the
-    // one shared player; API tiers above stay parallel.
+    // fails fast. Serialized on _pageLegLock — the ONE lock shared with 2C,
+    // because both drive the same pinned tab; API tiers above stay parallel.
     throwIfStopped();
     try {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
