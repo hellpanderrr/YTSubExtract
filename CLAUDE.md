@@ -82,9 +82,9 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 0.1 (batch) | /next Transcript | Yes | No | `/youtubei/v1/next` engagement panel transcript (blocked for PoToken videos) |
 | 1 | InnerTube API | Yes | No | Direct API fetch with multiple client profiles (IOS, MWEB, WEB..., LOGIN_REQUIRED) |
 | 1.5 | Embed Page | Yes | No | Scrapes `/embed/{videoId}` for caption data (age-restricted, may be EMBEDDER_IDENTITY_DENIED) |
-| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via `_coerceLock`. Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. |
+| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.5/1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. |
 | 2 | youtube-transcript | — | Yes | Uses `@playzone/youtube-transcript` library via content script |
-| 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via `_tabNavLock` promise chain. Fast-abort: settled-0-tracks via POLL_TRANSCRIPT aborts the 30s wait in ~10s. |
+| 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via the shared `_pageLegLock` (mutually exclusive with 1.7). Fast-abort: settled-0-tracks confirmed via a MAIN-world `chrome.scripting` probe (`_probeSettledNoTracks` — the ISOLATED-side read is dead) aborts the 30s wait in ~10s. |
 | 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker |
 | 3 Native | | — | Yes | Content script fetch + background fetch with retry |
 | 4 | Page Context | — | Yes | Injects into page to get player response, multiple format fallbacks |
@@ -97,7 +97,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 - **PoToken / BotGuard**: YouTube's JS VM generates runtime client attestation tokens. Timedtext requests without a valid PoToken return HTTP 200 with 0-byte body. The only reliable bypass is navigating a real YouTube tab to the watch page where the native player solves BotGuard.
 - **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. `content.js` (document_idle, ISOLATED world) injects a bootstrap script that reads this global and relays it via `postMessage` to the ISOLATED-world `capturedTranscripts` Map. This solves the timing gap where the content script's message listener doesn't exist when the sniffer fires at document_start.
 - **event.source filtering**: `content.js` **must not** use `if (event.source !== window) return;` for `YTSUB_CAPTURED_TRANSCRIPT` messages — iframes send `window.parent.postMessage()` where `event.source` is the iframe window, not the top window.
-- **Tab Navigation**: Uses a promise-chain mutex (`_tabNavLock`) to serialize tab navigations during batch processing. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
+- **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7/embed so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
 - **DNR rules** (`rules.json`):
   - Rule 1: Remove `X-Frame-Options`, `Content-Security-Policy`, `CSP-Report-Only` from `youtube.com` sub_frame responses (enables watch page in iframe)
   - Rule 2: Same for `youtube-nocookie.com` sub_frames
