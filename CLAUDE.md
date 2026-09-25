@@ -10,6 +10,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run zip` — Build + create `.zip` for Chrome Web Store upload
 - `npm run clean` — Remove `dist/` and `builds/`
 
+### Unit tests (node:test, no network, no browser)
+
+- `npm test` — runs `test/*.test.mjs`: batch Stop state machine
+  (`running→stopping→stopped`, finalize refusal, `err.wasStopped`) and tab
+  pinning (`_resolvePageLegTab`, cancel checkpoints, restore). Background
+  modules are imported for real with a `chrome.*` mock
+  (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
+  patched — no YouTube calls. Playwright specs stay in `e2e/`.
+
 ### E2E tests (Playwright, headless)
 
 - `npm run e2e:login` — ONE-TIME: opens a window to sign into YouTube, writing a
