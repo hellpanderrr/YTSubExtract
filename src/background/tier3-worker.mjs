@@ -37,6 +37,13 @@ async function createFreshSession(client = 'iOS') {
     generate_session_locally: true,
     device_category: 'desktop',
     client_type: client,
+    // RESIDUAL (#12, recorded 2026-09-25): every youtubei.js request goes
+    // through this passthrough with NO deadline — a stalled socket here
+    // pins Tier 3 (the batch's primary tier) while the popup heartbeat keeps
+    // showing `running`. The six plain `await fetch(...)` sites were wrapped
+    // in fetchTextWithTimeout; this one was not, because youtubei.js reads
+    // the body itself and needs a real Response. Wrap or accept explicitly
+    // before calling #12 fully closed.
     fetch: (input, init) => globalThis.fetch(input, init),
   });
 }

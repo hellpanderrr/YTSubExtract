@@ -848,6 +848,19 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
  * INVARIANT: a site either calls atomicProgressUpdate/persistBatchProgress
  * (queued inside) or wraps its own raw body in queueProgressWrite — never
  * queues a call that itself calls one of those (self-wait = deadlock).
+ *
+ * Two load-bearing properties, both consequences of the chain being
+ * appended SYNCHRONOUSLY (queueProgressWrite must stay sync-at-entry):
+ *  - BatchProcessor's fire-and-forget last onProgress (batch-processor.mjs
+ *    :75/:99/:139, not awaited) enqueues before handleBatch continues to the
+ *    terminal write, so the final tick always lands first. Making the queue
+ *    async-at-entry silently loses that ordering.
+ *  - CLEAR_DOWNLOAD_PROGRESS (popup remove, main.mjs handler) is deliberately
+ *    NOT queued: it only ever runs after a terminal write has landed (the
+ *    popup clears on terminal/delivery outcomes) and nothing enqueues after
+ *    it, so the bypass cannot interleave with a progress writer in the bad
+ *    order. Re-plumb it through the queue only if a writer is ever added
+ *    after terminal.
  */
 let progressWriteChain = Promise.resolve();
 function queueProgressWrite(fn) {

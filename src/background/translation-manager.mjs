@@ -128,10 +128,14 @@ export class TranslationManager {
     if (videoId) {
       // Clear metadata
       this.cache.delete(`metadata:${videoId}`);
-      
-      // Clear transcripts for this video
+
+      // Clear transcripts for this video — and its batch entries
+      // (playlist:<id>:<lang>:...): playlist-mode Reset sends no CLEAR_CACHE
+      // at all, so this loop is the ONLY per-video clear path a batch cache
+      // ever gets. The colon delimiter keeps the prefix match exact.
       for (const key of this.cache.keys()) {
-        if (key.startsWith(`transcript:${videoId}`)) {
+        if (key.startsWith(`transcript:${videoId}`) ||
+            key.startsWith(`playlist:${videoId}:`)) {
           this.cache.delete(key);
         }
       }

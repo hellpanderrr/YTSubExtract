@@ -22,6 +22,7 @@ test('#10 clearCache(videoId) removes only that video\'s entries', () => {
   tm.cache.set('metadata:v1', { ok: 1 });
   tm.cache.set('transcript:v1:en:false:', { ok: 1 });
   tm.cache.set('metadata:v2', { ok: 1 });
+  tm.cache.set('playlist:v1:en:false:', { ok: 1 });
   tm.cache.set('playlist:v2:en:false:', { ok: 1 });
 
   tm.clearCache('v1');
@@ -32,11 +33,16 @@ test('#10 clearCache(videoId) removes only that video\'s entries', () => {
     false,
     'transcript for v1 cleared'
   );
+  assert.equal(
+    tm.cache.has('playlist:v1:en:false:'),
+    false,
+    'batch entry for v1 cleared — Reset must reach it, playlist-mode Reset sends no CLEAR_CACHE'
+  );
   assert.equal(tm.cache.has('metadata:v2'), true, 'other video kept');
   assert.equal(
     tm.cache.has('playlist:v2:en:false:'),
     true,
-    'playlist batch entry kept'
+    'other video\'s batch entry kept'
   );
 });
 
