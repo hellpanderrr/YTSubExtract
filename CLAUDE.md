@@ -28,7 +28,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run e2e:login` — ONE-TIME: opens a window to sign into YouTube, writing a
   golden profile at `.e2e-profile-golden/` (each run copies it). Required for
   login-gated specs; they skip without it.
-- `npm run e2e` — build, then run the whole suite
+- `npm run e2e` — build, then run the whole suite. **Green ≠ full coverage**:
+  `playlist-listing`, `single-video`, and `batch-download` `test.skip` unless
+  `E2E_PLAYLIST_URL`/`E2E_VIDEO_URL` are set — read the ok/skip counts, not
+  just the exit code (`e2e/README.md` has the env table; `E2E_BATCH_LIMIT`
+  must not exceed the playlist's video count).
 - `npm run e2e:smoke` — harness self-test only (no YouTube content needed)
 - `npm run e2e:headed` — run with a visible browser
 

@@ -394,3 +394,26 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   Detection moved to pure `src/utils/video-url.js` with a MAIN-world
   player probe as last resort for ID-less URLs (`/@channel/live`).
   ✅ enforced by `test/video-url.test.mjs`.
+
+## 2026-09-25 (backlog pass close)
+
+- **A green `npm run e2e` can mean half the suite never ran.** Three specs
+  (`playlist-listing`, `single-video`, `batch-download`) `test.skip` without
+  `E2E_PLAYLIST_URL`/`E2E_VIDEO_URL` — the default run reported "5 passed"
+  at exit 0 while the pending-proof specs sat skipped. Always read the
+  ok/skip counts, not just the exit code; the env table lives in
+  `e2e/README.md`.
+- **Stale example data beats races as the default suspect.** The README's
+  example playlist had shrunk to 2 videos, so `E2E_BATCH_LIMIT=3` selection
+  failed twice; a fresh standalone Chromium showed 2 `yt-lockup-view-model`
+  rows — exactly what the popup saw — proving data, not a render race.
+  Ground-truth the source page before blaming the harness; the spec now
+  also waits for ≥LIMIT rendered rows before popup-open (the popup's Tier0.5
+  read accepts any partial count > 0 — only 0 falls back to the API).
+- **Playwright failure screenshots of extension popups are blank white.**
+  Both `test-failed-*.png` attachments were empty; diagnosis went through
+  `page.evaluate` counts and a standalone browser probe instead. Don't
+  spend attempts on popup screenshots.
+- **`reg query` from Git Bash fails with a syntax error/mojibake; read the
+  registry through PowerShell** — `Get-ItemProperty 'HKCU:\...'` (used to
+  confirm the system proxy: `127.0.0.1:7897`, `ProxyEnable=0`).
