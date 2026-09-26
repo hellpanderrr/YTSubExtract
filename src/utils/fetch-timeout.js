@@ -34,3 +34,33 @@ export async function fetchTextWithTimeout(
     clearTimeout(timer);
   }
 }
+
+// Same deadline, but returns the raw Response for callers that must read the
+// body themselves (youtubei.js calls .json()/.text() on it and checks .ok —
+// the {ok,status,text} shape above would break it). Used by the Innertube
+// fetch passthrough in tier3-worker.mjs (#12 residual): a stalled socket here
+// pins Tier 3 — the batch's primary tier — behind a fresh-looking `running`
+// heartbeat.
+//
+// The timer is deliberately NOT cleared when headers arrive: the body read
+// happens after this function returns, and it must stay covered by the same
+// deadline (clearing at header-arrival re-opens exactly the body-stall hole).
+// On the success path the timer is allowed to fire later — abort() on a
+// settled fetch whose body was already consumed is a spec no-op — and the
+// signal keeps guarding an unconsumed body until then. Only the rejection
+// path clears it (nothing left to guard).
+export function fetchResponseWithTimeout(
+  input,
+  init = {},
+  timeoutMs = DEFAULT_FETCH_TIMEOUT_MS
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const signal = init.signal
+    ? AbortSignal.any([init.signal, controller.signal])
+    : controller.signal;
+  return fetch(input, { ...init, signal }).catch((err) => {
+    clearTimeout(timer);
+    throw err;
+  });
+}

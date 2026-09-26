@@ -1,5 +1,5 @@
 import { Innertube, UniversalCache } from 'youtubei.js';
-import { fetchTextWithTimeout } from '../utils/fetch-timeout.js';
+import { fetchTextWithTimeout, fetchResponseWithTimeout } from '../utils/fetch-timeout.js';
 
 // Polyfill for youtubei.js environment detection
 if (typeof document === 'undefined') {
@@ -37,14 +37,14 @@ async function createFreshSession(client = 'iOS') {
     generate_session_locally: true,
     device_category: 'desktop',
     client_type: client,
-    // RESIDUAL (#12, recorded 2026-09-25): every youtubei.js request goes
-    // through this passthrough with NO deadline — a stalled socket here
-    // pins Tier 3 (the batch's primary tier) while the popup heartbeat keeps
-    // showing `running`. The six plain `await fetch(...)` sites were wrapped
-    // in fetchTextWithTimeout; this one was not, because youtubei.js reads
-    // the body itself and needs a real Response. Wrap or accept explicitly
-    // before calling #12 fully closed.
-    fetch: (input, init) => globalThis.fetch(input, init),
+    // #12 closed (2026-09-26): every youtubei.js request goes through this
+    // passthrough, which is now wrapped in fetchResponseWithTimeout — same
+    // 10s deadline as the six raw-fetch sites, but returning the raw
+    // Response because youtubei.js reads the body itself (.json()/.text()).
+    // Without it a stalled socket pinned Tier 3 (the batch's primary tier)
+    // behind a fresh-looking `running` heartbeat; now it aborts and the
+    // tier falls through like any other failed attempt.
+    fetch: (input, init) => fetchResponseWithTimeout(input, init),
   });
 }
 
