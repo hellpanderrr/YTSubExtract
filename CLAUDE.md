@@ -18,8 +18,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   (`_resolvePageLegTab`, cancel checkpoints, restore, TabNav poll-interval
   leak), translation-cache integrity (scoped `clearCache`, tier3-native
   empty-transcript rejection), popup URL detection
-  (`test/video-url.test.mjs`), and the fetch-timeout helper — all pure
-  node. Background modules are imported for real with a `chrome.*` mock
+  (`test/video-url.test.mjs`), the fetch-timeout helper (both the
+  `{ok,status,text}` and raw-Response variants), and `stable-read`
+  (Tier 0.5 hydration stabilization) — all pure node. Background modules are
+  imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
 
@@ -76,7 +78,9 @@ src/
     languages.js                  List of ~100 supported language codes
     zip-generator.js              ZIP creation via fflate (sync, for SW context)
     video-url.js                  Pure YouTube URL → videoId detection (strict host check)
-    fetch-timeout.js              fetchTextWithTimeout — 10s AbortController covering headers + body
+    fetch-timeout.js              fetchTextWithTimeout — 10s AbortController covering headers + body;
+                                  fetchResponseWithTimeout — same deadline, raw Response (youtubei.js)
+    stable-read.js                readUntilStable — re-read a live DOM snapshot until two counts agree
 ```
 
 ### Multi-Tier Extraction System

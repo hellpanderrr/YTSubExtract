@@ -41,10 +41,11 @@ test.describe('batch ZIP download', () => {
   }) => {
     const yt = await context.newPage();
     await yt.goto(BATCH_URL, { waitUntil: 'domcontentloaded' });
-    // Tier0.5 reads whatever rows are RENDERED at popup-open time (a partial
-    // count > 0 is accepted as complete; only 0 falls back to the API), so a
-    // slow — often proxy-latency — hydration yields a short list and the
-    // LIMIT selection below fails. Wait on the SOURCE page first.
+    // Tier0.5 re-reads the rendered rows until two consecutive counts agree
+    // (src/utils/stable-read.js), but a still-hydrating page can be stable at
+    // a short count — and the LIMIT selection below fails on a short list.
+    // Wait on the SOURCE page first: belt-and-braces over the popup-side
+    // stabilization added 2026-09-26.
     await yt
       .waitForFunction(
         (limit) =>

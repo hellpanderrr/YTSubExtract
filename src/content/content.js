@@ -1,4 +1,5 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
+import { readUntilStable } from '../utils/stable-read.js';
 
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
@@ -1229,16 +1230,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           '[data-playlist-item]'
         ];
 
-        let videoElements = [];
-        for (const selector of selectors) {
-          videoElements = document.querySelectorAll(selector);
-          if (videoElements.length > 0) {
-            log(`Found ${videoElements.length} videos using selector: ${selector}`);
-            break;
+        // One DOM snapshot: selector sweep + per-row extraction. Stabilized
+        // via readUntilStable — a one-shot read accepted any partial count
+        // > 0 as complete (slow/proxy hydration silently shortened the
+        // playlist; only 0 fell through to the API). Each read re-queries
+        // until two consecutive counts agree; bounded by DEFAULT_MAX_READS.
+        const readDomSnapshot = () => {
+          let videoElements = [];
+          for (const selector of selectors) {
+            videoElements = document.querySelectorAll(selector);
+            if (videoElements.length > 0) {
+              log(`Found ${videoElements.length} videos using selector: ${selector}`);
+              break;
+            }
           }
-        }
 
-        if (videoElements.length === 0) {
+          const rows = [];
+          for (const el of videoElements) {
+            try {
+              // Find video link
+              const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
+              if (!link) continue;
+
+              const href = link.getAttribute('href');
+              if (!href) continue;
+
+              // Extract video ID from href
+              const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+              if (!videoIdMatch) continue;
+              const videoId = videoIdMatch[1];
+
+              // Extract title
+              let title = 'Unknown';
+              const titleEl = el.querySelector('#video-title') ||
+                             el.querySelector('yt-lockup-metadata-view-model h3') ||
+                             el.querySelector('a[title]') ||
+                             el.querySelector('.ytd-video-meta-block #video-title') ||
+                             link;
+              if (titleEl) {
+                title = titleEl.getAttribute('title') ||
+                       titleEl.textContent?.trim() ||
+                       'Unknown';
+              }
+
+              // Extract duration
+              let duration = '';
+              const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                                el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
+                                el.querySelector('.badge-shape-wiz__text') ||
+                                el.querySelector('[class*="duration"]');
+              if (durationEl) {
+                duration = durationEl.textContent?.trim() || '';
+              }
+
+              rows.push({ videoId, title, duration });
+            } catch (e) {
+              log(`Error extracting video: ${e.message}`);
+            }
+          }
+          return rows;
+        };
+
+        const videos = await readUntilStable(readDomSnapshot);
+
+        if (videos.length === 0) {
           // Try to find in ytInitialData via page context
           log('Trying ytInitialData via getPageVariable...');
           try {
@@ -1317,51 +1372,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           log('No videos found in DOM or ytInitialData');
           sendResponse({ success: false, error: 'No videos found', logs });
           return;
-        }
-
-        // Extract from DOM elements
-        const videos = [];
-        for (const el of videoElements) {
-          try {
-            // Find video link
-            const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
-            if (!link) continue;
-
-            const href = link.getAttribute('href');
-            if (!href) continue;
-
-            // Extract video ID from href
-            const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-            if (!videoIdMatch) continue;
-            const videoId = videoIdMatch[1];
-
-            // Extract title
-            let title = 'Unknown';
-            const titleEl = el.querySelector('#video-title') ||
-                           el.querySelector('yt-lockup-metadata-view-model h3') ||
-                           el.querySelector('a[title]') ||
-                           el.querySelector('.ytd-video-meta-block #video-title') ||
-                           link;
-            if (titleEl) {
-              title = titleEl.getAttribute('title') ||
-                     titleEl.textContent?.trim() ||
-                     'Unknown';
-            }
-
-            // Extract duration
-            let duration = '';
-            const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
-                              el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
-                              el.querySelector('.badge-shape-wiz__text') ||
-                              el.querySelector('[class*="duration"]');
-            if (durationEl) {
-              duration = durationEl.textContent?.trim() || '';
-            }
-
-            videos.push({ videoId, title, duration });
-          } catch (e) {
-            log(`Error extracting video: ${e.message}`);
-          }
         }
 
         log(`Successfully extracted ${videos.length} videos from DOM`);
