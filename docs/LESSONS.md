@@ -410,6 +410,8 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   Ground-truth the source page before blaming the harness; the spec now
   also waits for ≥LIMIT rendered rows before popup-open (the popup's Tier0.5
   read accepts any partial count > 0 — only 0 falls back to the API).
+  ✅ enforced 2026-09-26 by `src/utils/stable-read.js` (popup-side
+  `readUntilStable`: two agreeing counts or fall back) + `test/stable-read.test.mjs`.
 - **Playwright failure screenshots of extension popups are blank white.**
   Both `test-failed-*.png` attachments were empty; diagnosis went through
   `page.evaluate` counts and a standalone browser probe instead. Don't
@@ -417,3 +419,23 @@ append `✅ enforced by <path>` to that entry rather than removing it.
 - **`reg query` from Git Bash fails with a syntax error/mojibake; read the
   registry through PowerShell** — `Get-ItemProperty 'HKCU:\...'` (used to
   confirm the system proxy: `127.0.0.1:7897`, `ProxyEnable=0`).
+
+## 2026-09-26 (open-threads close)
+
+- **Never enumerate unpushed shas/counts in `NEXT.md`.** Each commit (including
+  the one writing the file) invalidates the list. Stable phrasing: "Unpushed:
+  everything after `<last-pushed-sha>` — run
+  `git log --oneline origin/<branch>..HEAD` for the live list".
+- **`AbortSignal.any()` in the youtubei.js passthrough must combine the
+  caller's signal (`init.signal`) with the deadline controller's.** Dropping
+  one side either rescues nothing (caller cancel ignored) or re-opens the
+  stall (deadline ignored). Proved by mutation: signal-dropped and
+  timer-cleared-at-headers mutants both fail `test/fetch-timeout.test.mjs`.
+  ✅ enforced by `test/fetch-timeout.test.mjs` (raw-Response variant tests).
+- **Truthiness can't detect an empty array — check `.length`.** An `!next`
+  "empty is done" mutant in `readUntilStable` survived the suite because `[]`
+  is truthy; the real semantic needs `next.length === 0`. A mutant that looks
+  right but is semantically a no-op proves nothing — inspect a surviving
+  mutant before rerunning.
+  ✅ enforced by `test/stable-read.test.mjs` (mid-loop-empty test catches the
+  `next.length === 0` form).
