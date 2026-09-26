@@ -41,6 +41,22 @@ test.describe('batch ZIP download', () => {
   }) => {
     const yt = await context.newPage();
     await yt.goto(BATCH_URL, { waitUntil: 'domcontentloaded' });
+    // Tier0.5 reads whatever rows are RENDERED at popup-open time (a partial
+    // count > 0 is accepted as complete; only 0 falls back to the API), so a
+    // slow — often proxy-latency — hydration yields a short list and the
+    // LIMIT selection below fails. Wait on the SOURCE page first.
+    await yt
+      .waitForFunction(
+        (limit) =>
+          document.querySelectorAll(
+            'ytd-playlist-video-renderer, yt-lockup-view-model'
+          ).length >= limit,
+        LIMIT,
+        { timeout: 30_000 }
+      )
+      .catch(() => {
+        // Fall through — waitForPlaylistReady below reports the real count.
+      });
     await yt.waitForTimeout(3000);
 
     const popup = await openPopup(context, extensionId, yt);

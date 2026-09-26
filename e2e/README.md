@@ -57,7 +57,7 @@ when its variable is unset.
 | `E2E_PRIVATE_PLAYLIST_URL` | private-playlist | Defaults to Liked Videos (`list=LL`); needs login |
 | `E2E_VIDEO_URL` | single-video | A video with accessible captions |
 | `E2E_BATCH_URL` | batch-download | Falls back to `E2E_PLAYLIST_URL` |
-| `E2E_BATCH_LIMIT` | batch-download | How many videos to download (default 3) |
+| `E2E_BATCH_LIMIT` | batch-download | How many videos to download (default 3; must not exceed the playlist's video count) |
 | `E2E_BATCH_EXPECT_SUCCESS` | batch-download | Set to `1` to require every video to succeed |
 | `E2E_LL_EXPECT_SUCCESS` | private-playlist | Set to `0` to accept an accounted-for LL failure (default: require a real subtitle) |
 | `E2E_HEADED` | all | Set to `1` for a visible browser |
@@ -67,8 +67,14 @@ Example:
 ```bash
 E2E_VIDEO_URL="https://www.youtube.com/watch?v=KkOY9Arrg1Y" \
 E2E_PLAYLIST_URL="https://www.youtube.com/playlist?list=PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf" \
+E2E_BATCH_LIMIT=2 \
 npm run e2e
 ```
+
+The example playlist ("Select Lectures") currently has **2 videos**, so
+`E2E_BATCH_LIMIT` is pinned to 2 there — the batch spec selects LIMIT rows
+and fails if the playlist is shorter. Re-check the playlist size when
+changing either value.
 
 ## Specs
 
