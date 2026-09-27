@@ -2001,6 +2001,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // used to reject healthy watch pages ("no loadVideoById") is gone.
       const wantLang = desiredLang || lang || null;
 
+      // INSTRUMENTATION (2026-09-26): measure arm→tracklist and
+      // arm→first-capture latencies so a future wait-level fast-abort can be
+      // tuned from captioned positive controls instead of guessed. Log-only.
+      const t0 = performance.now();
+      let tracklistAt = null, tracklistCount = null, captureAt = null;
+      const noteTracklist = (tracks) => {
+        if (tracklistAt === null) {
+          tracklistAt = performance.now();
+          tracklistCount = tracks.length;
+        }
+      };
+
       try {
         log(`Coercing player to load video: ${videoId} (wantLang=${wantLang || 'auto'})`);
 
@@ -2069,8 +2081,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (event.data?.type === 'COERCE_TRACKLIST') {
               if (event.data?.requestId !== requestId) return;
               const tracks = event.data?.tracks || [];
+              noteTracklist(tracks);
               log(`Player reports ${tracks.length} tracks for ${event.data?.videoId || '?'}: ` +
-                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', '));
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
+                ` (arm+${Math.round(tracklistAt - t0)}ms)`);
               return;
             }
             if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT') return;
@@ -2081,7 +2095,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             const segments = parseSegments(text);
             if (segments) {
-              finish(segments, `Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'}), parsed ${segments.length} segments`);
+              if (captureAt === null) captureAt = performance.now();
+              finish(segments, `Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'}), parsed ${segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
             }
           };
 
@@ -2092,8 +2107,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (rid !== requestId && rid !== 'scripting') return;
             if (statusEvent.data?.type === 'COERCE_TRACKLIST') {
               const tracks = statusEvent.data?.tracks || [];
+              noteTracklist(tracks);
               log(`Player reports ${tracks.length} tracks: ` +
-                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', '));
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
+                ` (arm+${Math.round(tracklistAt - t0)}ms)`);
               return;
             }
             if (statusEvent.data?.type === 'COERCE_PLAYER_COMPLETE') {
@@ -2106,9 +2123,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const timer = setTimeout(() => {
             const hit = drainCache();
             if (hit) {
-              finish(hit.segments, `Late capture from cache: ${hit.bytes} bytes, parsed ${hit.segments.length} segments`);
+              if (captureAt === null) captureAt = performance.now();
+              finish(hit.segments, `Late capture from cache: ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
             } else {
-              finish(null, `Timeout after ${timeout}ms`);
+              finish(null, `Timeout after ${timeout}ms (tracklist: ` +
+                (tracklistAt === null ? 'never reported' : `${tracklistCount} tracks at arm+${Math.round(tracklistAt - t0)}ms`) + ')');
             }
           }, timeout);
 
@@ -2116,7 +2135,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (finished) return;
             const hit = drainCache();
             if (hit) {
-              finish(hit.segments, `Polled capture: ${hit.bytes} bytes, parsed ${hit.segments.length} segments`);
+              if (captureAt === null) captureAt = performance.now();
+              finish(hit.segments, `Polled capture: ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
             }
           }, 1500);
 
@@ -2135,7 +2155,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // before our listener attaches.
           const preHit = drainCache();
           if (preHit) {
-            finish(preHit.segments, `Pre-existing capture: ${preHit.bytes} bytes, parsed ${preHit.segments.length} segments`);
+            if (captureAt === null) captureAt = performance.now();
+            finish(preHit.segments, `Pre-existing capture: ${preHit.bytes} bytes, parsed ${preHit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
             return;
           }
 

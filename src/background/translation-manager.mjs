@@ -618,7 +618,7 @@ export class TranslationManager {
    * No-op when the tab is already on /watch. Saves the pre-batch URL for
    * restoreOriginalTab. Resolves true when a usable player is present.
    */
-  async seedWatchPage(videoId, playlistId = null, timeout = 45000) {
+  async seedWatchPage(videoId, playlistId = null, timeout = 45000, sleepMs = 1000) {
     const tab = await this._resolvePageLegTab();
     if (!tab) {
       console.log('[WatchSeed] No YouTube tab found');
@@ -672,9 +672,17 @@ export class TranslationManager {
     });
     const deadline = Date.now() + Math.max(timeout - 33000, 15000);
     let lastErr = null;
+    // The seed's contract is a *usable* player (loadVideoById present), not
+    // an attested tracklist — the return is boolean, nothing consumes the
+    // track count. A seed video with no captions would otherwise burn the
+    // whole loop waiting for a tracklist that never arrives, so sustained
+    // API-ready returns early (same two-consecutive-agree shape as
+    // readUntilStable).
+    let readyStreak = 0;
     while (Date.now() < deadline) {
       const state = await probe();
       if (state?.__err) {
+        readyStreak = 0;
         // No listener on this tab (navigating / wrong target) — log verbatim
         // so "messaging the wrong tab" is distinguishable from withheld tracks.
         if (state.__err !== lastErr) {
@@ -685,11 +693,19 @@ export class TranslationManager {
         console.log(`[WatchSeed] Player ready with attested tracklist (${state.trackCount}: ${state.tracks.join(', ')})`);
         return true;
       } else if (state?.ready === true) {
+        readyStreak++;
         console.log(`[WatchSeed] tab ${tab.id} API ready, no tracklist yet (state=${state.playerState}, page=${state.url})`);
-      } else if (state) {
-        console.log(`[WatchSeed] tab ${tab.id} hasPlayer=${state.hasPlayer} (page=${state.url})`);
+        if (readyStreak >= 2) {
+          console.log(`[WatchSeed] Player API ready, tracklist unconfirmed — proceeding (state=${state.playerState}, page=${state.url})`);
+          return true;
+        }
+      } else {
+        // Not-ready AND dropped (null) probes both break the streak: a gap
+        // is not evidence the player stayed ready across it.
+        readyStreak = 0;
+        if (state) console.log(`[WatchSeed] tab ${tab.id} hasPlayer=${state.hasPlayer} (page=${state.url})`);
       }
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, sleepMs));
     }
     // Best effort: the API may still serve even if the tracklist probe missed.
     const last = await probe();

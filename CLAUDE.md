@@ -19,8 +19,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   leak), translation-cache integrity (scoped `clearCache`, tier3-native
   empty-transcript rejection), popup URL detection
   (`test/video-url.test.mjs`), the fetch-timeout helper (both the
-  `{ok,status,text}` and raw-Response variants), and `stable-read`
-  (Tier 0.5 hydration stabilization) — all pure node. Background modules are
+  `{ok,status,text}` and raw-Response variants), `stable-read`
+  (Tier 0.5 hydration stabilization), and `seedWatchPage`'s ready-streak
+  early-return (`test/watch-seed.test.mjs`) — all pure node. Background modules are
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
@@ -34,7 +35,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `playlist-listing`, `single-video`, and `batch-download` `test.skip` unless
   `E2E_PLAYLIST_URL`/`E2E_VIDEO_URL` are set — read the ok/skip counts, not
   just the exit code (`e2e/README.md` has the env table; `E2E_BATCH_LIMIT`
-  must not exceed the playlist's video count).
+  must not exceed the playlist's video count). **`batch-download` green also
+  ≠ real extraction**: it asserts every video is accounted for (subtitle or
+  `_errors.txt`), so a run where every video fails is still a pass. Confirmed
+  2026-09-26: two runs against a real playlist got 0/6 real subtitles in
+  headless (`403 Forbidden` / `net::ERR_CONNECTION_CLOSED` on caption
+  fetches) where a manual browser got 4/6 the same day — see `docs/ISSUES.md`
+  #1. Set `E2E_BATCH_EXPECT_SUCCESS=1` to make a run fail on this instead of
+  passing silently.
 - `npm run e2e:smoke` — harness self-test only (no YouTube content needed)
 - `npm run e2e:headed` — run with a visible browser
 
@@ -44,6 +52,18 @@ harness crash) while other sites load fine. Check the proxy before a run.
 
 Specs live in `e2e/`; see `e2e/README.md` for env vars and per-spec coverage.
 Harness gotchas and dead ends are logged in `docs/LESSONS.md`.
+
+## Coding gotchas (standing rules — recurred twice, see `docs/LESSONS.md`)
+
+- **Never use bare truthiness/`??`/`||` to mean "is this empty/absent?" on a
+  value that can legitimately be `[]`, `0`, `''`, or a scripted `null` you
+  need to observe.** `!x` and `x ?? fallback` both treat a falsy-but-present
+  value as absent. Check the real predicate: `.length === 0`, `=== null`,
+  etc. Seen twice: `readUntilStable`'s `!next` couldn't detect an empty
+  array (`src/utils/stable-read.js`, 2026-09-26); a test harness's
+  `script.shift() ?? readyNoTracks()` silently substituted the default for a
+  scripted `null` instead of delivering it (`test/watch-seed.test.mjs`,
+  2026-09-26).
 
 ## Project Structure
 

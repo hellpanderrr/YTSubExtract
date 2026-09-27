@@ -439,3 +439,55 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   mutant before rerunning.
   ✅ enforced by `test/stable-read.test.mjs` (mid-loop-empty test catches the
   `next.length === 0` form).
+
+## 2026-09-26/27 (WatchSeed timing + 1.7 instrumentation)
+
+- **`??` silently eats a scripted `null`** — same falsy/nullish confusion
+  class as the `!next` lesson above, recurred in test-harness code instead
+  of production code. `script.shift() ?? readyNoTracks()` substituted the
+  default fallback for a deliberately-scripted `null` probe response instead
+  of delivering it, so the "dropped probe resets the streak" test asserted
+  nothing until the assertion itself caught the count mismatch (`2 !== 0`).
+  Fixed to a length check (`script.length ? script.shift() : ...`). Recurring
+  in a second area → promoted to a standing rule in `CLAUDE.md`
+  ("Coding gotchas").
+  ✅ enforced by `test/watch-seed.test.mjs` (null-probe test + probe-count
+  assertions).
+- **`readUntilStable`'s two-consecutive-agree shape generalizes past DOM
+  reads.** `seedWatchPage`'s tracklist-confirm loop had the exact same
+  one-shot-accepts-any-partial-state bug Tier0.5 had: it burned its whole
+  timeout waiting for an attested tracklist on a *captionless* seed video,
+  which can never arrive. Fix was a 2-consecutive-`ready`-without-tracklist
+  streak, same evidence bar as `readUntilStable`, applied to a different
+  probe shape (boolean "usable player", not a count).
+  ✅ enforced by `test/watch-seed.test.mjs` (mutation-killed: early-return
+  removed → 4/5 tests time out at the deadline).
+- **A background command piped through `tail -N` in the same invocation
+  permanently discards everything but the last N lines**, even though the
+  harness's own background-task capture would otherwise have kept the full
+  output. If the command later gets moved to background (long-running), the
+  tail filter you wrote for a quick foreground peek becomes the *only*
+  record — redirect to a file (`> out.log 2>&1`) instead when the run might
+  outlast the foreground timeout.
+- **Playwright clears its own `outputDir` (`test-results/` by default) at
+  the start of a run.** A shell redirect target living inside that directory
+  gets deleted out from under the write, silently truncating the log to
+  nothing. Redirect diagnostic output outside `test-results/` (repo root is
+  fine — `*.log` is gitignored).
+- **Headless e2e batch-download can silently prove nothing about real
+  extraction.** Two runs against a real 6-video playlist got 0/6 real
+  subtitles in headless where a manual browser got 4/6 the same day
+  (`403 Forbidden` / `net::ERR_CONNECTION_CLOSED` on caption fetches) — yet
+  both e2e runs reported "1 passed", because the spec only asserts every
+  video is accounted for (subtitle or `_errors.txt`), by design. Logged as
+  `docs/ISSUES.md` #1 (open) rather than only here, since it's a standing
+  gap in what "green" proves, not a one-off run fluke.
+- **Real positive-control data on Tier 1.7 tracklist-confirm timing**
+  (`content.js`'s `arm+Nms` instrumentation, added this session): across 4
+  captioned videos in one (network-degraded) run, arm→confirmed-tracklist
+  ranged 953ms–9646ms, with zero false-zero reads before the real tracklist
+  appeared; both known-captionless videos confirmed 0 tracks consistently at
+  ~1.0–1.3s. This derisks a future wait-level fast-abort on the existing
+  settled-zero signal (skip only the remaining wait, never Auth) — the
+  abort window needs to clear ~10s, not the guessed few seconds. Not yet
+  implemented; see `NEXT.md`.
