@@ -529,6 +529,9 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   wired into `e2e/fixtures.mjs` by default. If this keeps recurring, wiring
   it in permanently (behind an env var, so default runs stay quiet) would be
   worth doing instead of re-adding and reverting it each time.
+  ✅ enforced by `e2e/fixtures.mjs` (`attachConsoleRelay`, `E2E_CONSOLE=1`),
+  documented in `e2e/README.md` — wired 2026-09-27 after the third
+  occurrence; no more temp listeners in specs.
 
 ## 2026-09-27 (headless-vs-headed root cause isolated)
 

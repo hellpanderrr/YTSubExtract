@@ -112,6 +112,7 @@ async function launchBrowser() {
     let context;
     try {
       context = await chromium.launchPersistentContext(PROFILE_DIR, LAUNCH_OPTIONS);
+      if (process.env.E2E_CONSOLE === '1') attachConsoleRelay(context);
       const keepalive = await waitForBrowserReady(context);
       // The crash can land a few ms after launch, so prove the browser is still
       // serving requests before accepting it.
@@ -126,6 +127,27 @@ async function launchBrowser() {
     }
   }
   throw lastError;
+}
+
+/**
+ * Relay service-worker and page console output to the test stdout, prefixed
+ * `[e2e:SW]` / `[e2e:PAGE]`.
+ *
+ * Playwright surfaces none of it by default, so per-tier batch logs
+ * (Fast-abort firings, Tier order, arm+Nms timings) are invisible during a
+ * run — a gap previously papered over by pasting temp listeners into specs
+ * three times across 2026-09-26/27 (docs/LESSONS.md). Opt-in via
+ * `E2E_CONSOLE=1` so default runs stay quiet.
+ *
+ * Attached inside launchBrowser (before waitForBrowserReady) so listeners are
+ * on before the extension's service worker registers; both already-registered
+ * workers and future ones/pages are covered.
+ */
+function attachConsoleRelay(context) {
+  const relay = (tag) => (msg) => console.log(`[e2e:${tag}] ${msg.text()}`);
+  for (const sw of context.serviceWorkers()) sw.on('console', relay('SW'));
+  context.on('serviceworker', (sw) => sw.on('console', relay('SW')));
+  context.on('page', (page) => page.on('console', relay('PAGE')));
 }
 
 const COMPONENT_PDF_VIEWER = 'mhjfbmdgcfjbbpaeojofohoefgiehjai';

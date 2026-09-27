@@ -22,7 +22,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `{ok,status,text}` and raw-Response variants), `stable-read`
   (Tier 0.5 hydration stabilization), `seedWatchPage`'s ready-streak
   early-return (`test/watch-seed.test.mjs`), and Tier 1.7's wait-level
-  fast-abort window math (`test/fast-abort.test.mjs`) — all pure node. Background modules are
+  fast-abort window math (`test/fast-abort.test.mjs`), and the playlist
+  tier-chain order (`test/tier3-order.test.mjs` — needs
+  `--experimental-test-module-mocks`, supplied by `npm test`) — all pure node. Background modules are
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
@@ -120,12 +122,12 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.5/1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. Wait-level fast-abort (`src/utils/fast-abort.js`): if that report is 0, the outer wait now aborts at arm+10s instead of the full 23s, always falling through to 2C/Auth. |
 | 2 | youtube-transcript | — | Yes | Uses `@playzone/youtube-transcript` library via content script |
 | 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via the shared `_pageLegLock` (mutually exclusive with 1.7). Fast-abort: settled-0-tracks confirmed via a MAIN-world `chrome.scripting` probe (`_probeSettledNoTracks` — the ISOLATED-side read is dead) aborts the 30s wait in ~10s. |
-| 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker |
+| 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker. Runs *after* Tier 1 since 2026-09-27 (demoted — 0/12 successes in every available real run). |
 | 3 Native | | — | Yes | Content script fetch + background fetch with retry |
 | 4 | Page Context | — | Yes | Injects into page to get player response, multiple format fallbacks |
 | 0.5 Auth | Credentialed Fetch | Yes | Yes | Content script fetches watch page HTML with cookies, extracts ytInitialPlayerResponse captions |
 
-**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 3 (youtubei.js) → Tier 1 (InnerTube chain) → Tier 1.5 (embed page) → Tier 1.7 (player coercion) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch). youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly (`'iOS'`, not `'IOS'`).
+**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 1 (InnerTube chain) → Tier 3 (youtubei.js) → Tier 1.5 (embed page) → Tier 1.7 (player coercion) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch). Tier 3 runs *after* Tier 1 since 2026-09-27 (demoted: 0/12 successes across every available real run — order pinned by `test/tier3-order.test.mjs`). youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly (`'iOS'`, not `'IOS'`).
 
 ### Key Architectural Decisions
 

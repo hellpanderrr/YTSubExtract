@@ -61,6 +61,7 @@ when its variable is unset.
 | `E2E_BATCH_EXPECT_SUCCESS` | batch-download | Set to `1` to require every video to succeed |
 | `E2E_LL_EXPECT_SUCCESS` | private-playlist | Set to `0` to accept an accounted-for LL failure (default: require a real subtitle) |
 | `E2E_HEADED` | all | Set to `1` for a visible browser |
+| `E2E_CONSOLE` | all | Set to `1` to relay service-worker/page console output to test stdout, prefixed `[e2e:SW]` / `[e2e:PAGE]` (tier-log diagnosis; off by default) |
 
 Example:
 
