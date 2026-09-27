@@ -3,42 +3,48 @@
 _Updated 2026-09-27 — branch playlist-download_
 
 ## State
-WatchSeed ready-streak fix + null-probe reset + injectable `sleepMs`
-(`translation-manager.mjs`), Tier 1.7 `arm+Nms` timing instrumentation
-(`content.js`), new `test/watch-seed.test.mjs` — all **uncommitted**. Unit
-**50/50**, build 3 bundles, both mutation-killed. A gated e2e run against
-the real playlist from the original log confirmed both changes fire
-correctly (streak proceeds after 2 ready probes; captioned tracklist
-confirms in 953ms–9646ms with zero false-zero reads, captionless confirms
-~1.0–1.3s) — but that same run surfaced `docs/ISSUES.md` **#1**: headless
-got 0/6 real subtitles where a manual browser got 4/6 the same day.
+Both remaining items from the 2026-09-26 3-part plan are done. (1) Tier 1.7
+wait-level fast-abort: `src/utils/fast-abort.js` + `content.js` wiring,
+validated live (fired exactly on the 2 known-captionless videos, zero false
+fires). (2) Tier 3 demoted behind Tier 1 in `translation-manager.mjs`
+(historic-green check: 0/12 real successes across every available run) +
+internal log noise quieted in `tier3-worker.mjs`. Both changes are
+unit-tested and mutation-killed (`test/fast-abort.test.mjs`,
+`test/tier3-order.test.mjs` — the latter needed
+`--experimental-test-module-mocks`, now in the `test` npm script). Unit
+**55/55**, build clean. Everything below is **uncommitted**.
 
 ## Open threads
-- Commit the uncommitted work when asked (paths above + `CLAUDE.md`,
-  `docs/LESSONS.md`, `docs/ISSUES.md`, this file).
-- Implement the Tier 1.7 wait-level fast-abort using the new positive
-  control: skip only the remaining wait on a confirmed-zero tracklist,
-  window must clear ~10s (not a guess), Auth stays mandatory, log every
-  firing. Data and reasoning in `docs/LESSONS.md` 2026-09-26/27.
-- Tier 3 (youtubei.js) log suppression + historic-green check — never
-  started (3rd item of the original 3-part plan).
-- `docs/ISSUES.md` #1 — try `E2E_HEADED=1` against the same playlist to
-  isolate automation-flag detection from proxy/cookie causes.
+- Commit when asked (10 changed/new files — `git status --short` has the
+  full list; nothing untracked from before this session was touched).
+- `docs/ISSUES.md` #1 (headless-vs-headed) — root cause narrowed to
+  headless-mode detection, but the actual signal is unconfirmed, and headed
+  isn't reliably immune either (this session's runs alone: 4/6, 0/6, 4/6 on
+  the same playlist/profile/proxy). No fix attempted.
+- Consider wiring `sw.on('console',...)`/`page.on('console',...)` into
+  `e2e/fixtures.mjs` permanently (behind an env var) — added and reverted as
+  a one-off diagnostic three times now across 2026-09-26/27.
+- If youtubei.js is ever upgraded past 16.0.1 (latest is 18.0.0), re-check
+  whether Tier 3 can be promoted back — the demotion was about it never
+  succeeding, not about it being architecturally wrong.
 
 ## Running / unfinished
-Nothing running. `dist/` is rebuilt against the current **uncommitted**
-source — reload the unpacked extension before any manual run.
+Nothing running. `dist/` is rebuilt against current **uncommitted** source —
+reload the unpacked extension before any manual run.
 
 ## Don't redo
-- WatchSeed's contract is a *usable player*, not an attested tracklist — the
-  2-consecutive-`ready` streak returning early is correct, mirrors
-  `readUntilStable`'s two-agreeing-reads shape.
-- Falsy/nullish confusion is now a standing `CLAUDE.md` rule ("Coding
-  gotchas") — recurred twice (`stable-read.js`, `watch-seed.test.mjs`).
-- Playwright clears `test-results/` at run start — never redirect
-  diagnostic output there; use the repo root (`*.log` is gitignored).
-- Piping a possibly-long command through `tail -N` in the same invocation
-  discards everything but the tail if it gets backgrounded — redirect to a
-  file instead.
-- `batch-download` e2e green ≠ real extraction (see `docs/ISSUES.md` #1) —
-  don't treat a green run as proof subtitles actually downloaded.
+- Tier 1.7's fast-abort window is a floor from arm (t0), NOT from when the
+  zero report arrives — mirrors 2C's existing `_probeSettledNoTracks` ~10s
+  design. Data behind the 10s choice: captioned arm→tracklist up to 9646ms
+  observed; see `docs/LESSONS.md` 2026-09-26/27.
+- A batch's overall subtitle success rate is NOT a proxy for whether the
+  Tier 1.7 timing logic or the Tier 3 reorder is correct — both are pinned
+  by their own unit tests; check those, not a live run's success count,
+  which swings 0/6 to 4/6 on the same config from network conditions alone.
+- `batch-download` e2e green ≠ real extraction, headed OR headless (see
+  `docs/ISSUES.md` #1) — don't treat any single run's success count as the
+  reliable baseline.
+- Falsy/nullish confusion is a standing `CLAUDE.md` rule ("Coding gotchas").
+- Tier 3's per-video failure tax is modest (~1-1.2s, timed from the original
+  log) — it was demoted for running before the tier that works on every
+  video with zero payoff, not because it was expensive by itself.

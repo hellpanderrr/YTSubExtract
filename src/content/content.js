@@ -1,5 +1,6 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
 import { readUntilStable } from '../utils/stable-read.js';
+import { runFastAbort } from '../utils/fast-abort.js';
 
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
@@ -2005,6 +2006,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // arm→first-capture latencies so a future wait-level fast-abort can be
       // tuned from captioned positive controls instead of guessed. Log-only.
       const t0 = performance.now();
+      // Fast-abort window (2026-09-27): floor measured from arm (t0), not
+      // from when the zero report arrives -- clears the observed 9646ms
+      // captioned-video arm-to-tracklist max with margin. See
+      // src/utils/fast-abort.js and docs/LESSONS.md 2026-09-26/27.
+      const FAST_ABORT_WINDOW_MS = 10000;
       let tracklistAt = null, tracklistCount = null, captureAt = null;
       const noteTracklist = (tracks) => {
         if (tracklistAt === null) {
@@ -2067,6 +2073,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const result = await new Promise((resolve, reject) => {
           const requestId = `coerce_${videoId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
           let finished = false;
+          let fastAbortArmed = false;
 
           const finish = (segments, note) => {
             if (finished) return;
@@ -2076,12 +2083,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             resolve(segments);
           };
 
+          // Arm once, on the first confirmed-zero tracklist report (a
+          // non-zero report needs no fast-abort -- capture will finish
+          // normally). The check itself waits out FAST_ABORT_WINDOW_MS from
+          // arm (t0), not from now, so it never fires before the window a
+          // slow captioned video is known to need.
+          const armFastAbortIfZero = (tracks) => {
+            if (fastAbortArmed || tracks.length !== 0) return;
+            fastAbortArmed = true;
+            runFastAbort({
+              armedAt: t0,
+              windowMs: FAST_ABORT_WINDOW_MS,
+              getTracklistCount: () => tracklistCount,
+            }).then((result) => {
+              if (finished || !result.fire) return;
+              const hit = drainCache();
+              if (hit) {
+                if (captureAt === null) captureAt = performance.now();
+                finish(hit.segments, `Late capture from cache (fast-abort check): ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+              } else {
+                finish(null, `Fast-abort: confirmed 0 tracks, still 0 at arm+${result.elapsedMs}ms`);
+              }
+            });
+          };
+
           const messageHandler = (event) => {
             if (finished) return;
             if (event.data?.type === 'COERCE_TRACKLIST') {
               if (event.data?.requestId !== requestId) return;
               const tracks = event.data?.tracks || [];
               noteTracklist(tracks);
+              armFastAbortIfZero(tracks);
               log(`Player reports ${tracks.length} tracks for ${event.data?.videoId || '?'}: ` +
                 tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
                 ` (arm+${Math.round(tracklistAt - t0)}ms)`);
@@ -2108,6 +2140,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (statusEvent.data?.type === 'COERCE_TRACKLIST') {
               const tracks = statusEvent.data?.tracks || [];
               noteTracklist(tracks);
+              armFastAbortIfZero(tracks);
               log(`Player reports ${tracks.length} tracks: ` +
                 tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
                 ` (arm+${Math.round(tracklistAt - t0)}ms)`);

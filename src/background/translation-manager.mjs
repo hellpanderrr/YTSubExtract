@@ -2083,8 +2083,15 @@ export class TranslationManager {
 
   // ─────────────────────────────────────────────────────────────
   // API-Only Tiers for Playlist Processing
-  // Optimized: Start with Tier 3 (youtubei.js) as primary - it's the only reliable method
-  // Tier 0.5/1/1.5 are deprecated as they all fail with PoToken requirements
+  // Tier 1 (InnerTube client chain) runs before Tier 3 (youtubei.js) as of
+  // 2026-09-27: the "Tier 3 primary, Tier 1/1.5 deprecated" claim this
+  // comment used to make was wrong — the user's own manual run got 4/6 real
+  // subtitles via Tier 1 IOS the same day Tier 3 went 0/6, and every batch
+  // run since (this session's two live diagnostic runs, plus the original
+  // console log) has Tier 3 at 0 successes. Demoted rather than removed
+  // (still tried, just after the tier that actually works) since a future
+  // youtubei.js upgrade could make it useful again — see docs/LESSONS.md
+  // 2026-09-27 for the full historic-green check.
   // ─────────────────────────────────────────────────────────────
   async getTranscriptForPlaylist(videoId, options = {}) {
     const { 
@@ -2099,7 +2106,7 @@ export class TranslationManager {
       logs.push(`[Playlist] ${msg}`);
     };
 
-    log(`Processing ${videoId} (optimized - Tier 3 primary)...`);
+    log(`Processing ${videoId} (Tier 1 primary, Tier 3 fallback)...`);
     log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
 
     const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${translate ? targetLang : ''}`;
@@ -2189,49 +2196,12 @@ export class TranslationManager {
     }
 
     throwIfStopped();
-    // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
+    // === TIER 1 (Primary): InnerTube client chain (IOS -> MWEB -> WEB_EMBEDDED) ===
+    // Promoted ahead of Tier 3 (2026-09-27) — this is the tier that actually
+    // succeeds for most videos.
     try {
-      log('[Tier 3] Attempting Innertube (primary)...');
-      
-      const tier3Options = {
-        lang: sourceLang,
-        translate: translate,
-        targetLang: targetLang
-      };
-      
-      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
-      
-      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
-        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
-        
-        const normalized = tier3Result.segments.map(s => ({
-          start: s.start,
-          duration: s.end - s.start,
-          text: s.text
-        }));
-        
-        const response = {
-          source: 'tier3-playlist',
-          result: normalized,
-          translated: translate,
-          sourceLang: tier3Result.language || sourceLang,
-          targetLang,
-          logs
-        };
-        this._setCache(cacheKey, response);
-        return response;
-      }
-    } catch (err) {
-      errors.push({ tier: 3, error: err.message });
-      log(`[Tier 3] Failed: ${err.message}`);
-    }
+      log('[Tier 1] Attempting InnerTube client chain...');
 
-    throwIfStopped();
-    // === FALLBACK: Try Tier 1 (updated client chain: IOS -> MWEB -> WEB_EMBEDDED) ===
-    // Only used if Tier 3 fails, for edge cases
-    try {
-      log('[Tier 1 Fallback] Attempting updated client chain...');
-      
       const result = await getSubtitles({
         videoID: videoId,
         // Pass 'auto' through: getSubtitles resolves it to the first available
@@ -2247,7 +2217,7 @@ export class TranslationManager {
           duration: s.duration,
           text: s.text
         }));
-        
+
         log(`[Tier 1] Success! ${normalized.length} segments`);
         const response = {
           source: 'tier1-playlist',
@@ -2263,6 +2233,50 @@ export class TranslationManager {
     } catch (err) {
       errors.push({ tier: 1, error: err.message });
       log(`[Tier 1] Failed: ${err.message}`);
+    }
+
+    throwIfStopped();
+    // === TIER 3 (Fallback): youtubei.js ===
+    // Demoted behind Tier 1 (2026-09-27): historic-green check found 0
+    // successes across every available real batch run (this session's two
+    // live diagnostic runs + the original console log that started this
+    // investigation) since the 2026-09-21 'iOS' client-name fix — see
+    // docs/LESSONS.md 2026-09-27. Kept as a fallback attempt, not removed,
+    // in case a youtubei.js upgrade changes that.
+    try {
+      log('[Tier 3] Attempting Innertube (fallback)...');
+
+      const tier3Options = {
+        lang: sourceLang,
+        translate: translate,
+        targetLang: targetLang
+      };
+
+      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
+
+      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
+        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
+
+        const normalized = tier3Result.segments.map(s => ({
+          start: s.start,
+          duration: s.end - s.start,
+          text: s.text
+        }));
+
+        const response = {
+          source: 'tier3-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang: tier3Result.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 3, error: err.message });
+      log(`[Tier 3] Failed: ${err.message}`);
     }
 
     // === LAST RESORT: Embed Page ===

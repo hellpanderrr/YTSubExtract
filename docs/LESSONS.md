@@ -491,3 +491,95 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   settled-zero signal (skip only the remaining wait, never Auth) — the
   abort window needs to clear ~10s, not the guessed few seconds. Not yet
   implemented; see `NEXT.md`.
+
+## 2026-09-27 (Tier 1.7 wait-level fast-abort shipped + validated)
+
+- **Tier 1.7 now has its own wait-level fast-abort, mirroring 2C's.** The
+  arm-level settled-zero signal existed since 2026-09-21 (sniffer.js) but the
+  outer 23s `content.js` wait ignored it and always burned the full timeout.
+  Extracted the decision into `src/utils/fast-abort.js` (`runFastAbort`,
+  injectable clock, same pattern as `stable-read.js`/`fetch-timeout.js`) since
+  content.js itself has zero unit coverage — 2 mutants killed
+  (invert-the-zero-check, ignore-armedAt-in-the-window-math). Window floor is
+  10s from arm (`t0`), not from when the zero report arrives, so a slow
+  captioned video keeps the full margin the 2026-09-26 positive-control data
+  showed it needs (max observed 9646ms).
+  ✅ enforced by `test/fast-abort.test.mjs`.
+- **Validated live, headed, against the same real playlist**
+  (`PLQXk9_XDN67L2N_-aBQwDiNnITHWPJ9b4`): fast-abort fired exactly twice
+  (`arm+10005ms`, `arm+10000ms`) — the 2 known-captionless videos, zero false
+  fires. `4wCNFskBpR8` (real `ru/asr` track, confirmed at arm+873ms) correctly
+  did NOT fast-abort and ran its full 23s timeout instead — the tracklist
+  being non-zero is exactly what should suppress it. Both fast-aborted videos
+  still fell through to Tier 2C immediately after, confirming Auth/2C are
+  untouched by this change.
+- **A headed run can still land the exact same `docs/ISSUES.md` #1 failure
+  mode.** This same validation run got 0/6 overall (matching headless), with
+  `4wCNFskBpR8`'s real tracklist confirmed but its caption body fetch still
+  failing — 74 occurrences of the `403`/`ERR_CONNECTION_CLOSED`/"Failed to
+  fetch" signature throughout. So headed is not immune to the underlying
+  issue; the earlier same-day headed 4/6 run was the better day, not the
+  reliable case. Confirms the fast-abort work and the #1 investigation are
+  cleanly separable — a batch's overall success rate is a poor proxy for
+  whether the Tier 1.7 timing logic itself is correct; check the per-tier
+  `arm+Nms`/`Fast-abort` lines directly.
+- Diagnosing this needed the temporary `sw.on('console',...)`/
+  `page.on('console',...)` listener in `batch-download.spec.mjs` again
+  (reverted after use, same as 2026-09-26) — SW/content console still isn't
+  wired into `e2e/fixtures.mjs` by default. If this keeps recurring, wiring
+  it in permanently (behind an env var, so default runs stay quiet) would be
+  worth doing instead of re-adding and reverting it each time.
+
+## 2026-09-27 (headless-vs-headed root cause isolated)
+
+- **Headless e2e isolated as the actual variable, not proxy/cookies.** Ran the
+  `docs/ISSUES.md` #1 suggested `E2E_HEADED=1` comparison against the same
+  playlist, same golden profile, same proxy as the failing headless runs:
+  headed got 4/6 real subtitles, the exact same 4 video IDs the manual browser
+  and headless both agreed on/disagreed on respectively. Since environment and
+  credentials were held identical and only headlessness changed, this rules out
+  proxy/IP and cookie staleness as the cause — it's headless-mode detection
+  itself. The specific detection signal (`navigator.webdriver`? Chromium's
+  `--headless` fingerprint surface? something else?) is still unconfirmed —
+  only that headlessness, not environment, flips the outcome. See
+  `docs/ISSUES.md` #1 for the full evidence; still open, no fix attempted.
+
+## 2026-09-27 (Tier 3 demoted behind Tier 1, historic-green check closed)
+
+- **Historic-green check: Tier 3 (youtubei.js) has 0 successes in every
+  available real batch run.** Checked the original console log that opened
+  this investigation (0/6, all `getInfo (IOS)` "Cannot read properties of
+  null (reading 'as')" → WEB fallback HTTP 400) plus this session's own two
+  live diagnostic runs (0/6 each) — 12/12 failures, spanning both playlists
+  and both headed/headless. `git log -S"youtubei"` shows the last real Tier 3
+  work was the 2026-09-21 `'iOS'` client-name fix (`70e8205`); nothing since
+  has logged a Tier 3 success. Per-video tax when it fails: ~1.0-1.2s (timed
+  from the original log's own timestamps), not the double-digit seconds a
+  timeout-bound tier would cost — modest, but it ran *before* Tier 1 (the
+  tier that actually succeeds) on every video, so every batch paid it even
+  on the happy path.
+- **Demoted Tier 3 behind Tier 1** in `getTranscriptForPlaylist`
+  (`translation-manager.mjs`) — pure reordering, no change to either tier's
+  internals. Two comments elsewhere in the codebase flatly asserted "Tier
+  0.5/1/1.5 are deprecated as they all fail with PoToken requirements" —
+  false per the user's own manual run (4/6 via Tier 1 IOS the same day); both
+  corrected in place.
+  ✅ enforced by `test/tier3-order.test.mjs`, using `node:test`'s
+  `mock.module` (needs `--experimental-test-module-mocks`, now in the `test`
+  npm script) to mock `getSubtitles`/`fetchTier3Transcript` and assert call
+  order — the first test in this repo to exercise
+  `getTranscriptForPlaylist`'s real tier-chain body rather than stubbing the
+  whole method. Mutation-killed (order swapped back → assertion fails on
+  `result.source`).
+- **Quieted `tier3-worker.mjs`'s internal noise**: it printed 2-3 lines of
+  raw `Error` object dumps (`console.warn`/`console.error`) for every
+  failure, on top of `translation-manager.mjs`'s own clean
+  `[Tier 3] Failed: <message>` line at the call site. Consolidated to single
+  `.message`-only lines; also dropped 3 unconditional per-call debug dumps in
+  `getVideoMetadata` (`[Tier 3 Debug] info keys/captions/basic_info`) that
+  printed on every call, success or failure, with no gate.
+- **Live headed re-run after the demotion**: 4/6 real subtitles in 1.3
+  minutes — faster than this session's earlier runs that hit network
+  blocking (~4.7-4.8min) and consistent with the removed per-video Tier 3
+  tax, though the default e2e fixture's lack of SW-console capture means
+  this is corroborating, not proof of ordering (the unit test is the proof).

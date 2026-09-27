@@ -20,8 +20,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   empty-transcript rejection), popup URL detection
   (`test/video-url.test.mjs`), the fetch-timeout helper (both the
   `{ok,status,text}` and raw-Response variants), `stable-read`
-  (Tier 0.5 hydration stabilization), and `seedWatchPage`'s ready-streak
-  early-return (`test/watch-seed.test.mjs`) — all pure node. Background modules are
+  (Tier 0.5 hydration stabilization), `seedWatchPage`'s ready-streak
+  early-return (`test/watch-seed.test.mjs`), and Tier 1.7's wait-level
+  fast-abort window math (`test/fast-abort.test.mjs`) — all pure node. Background modules are
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
@@ -116,7 +117,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 0.1 (batch) | /next Transcript | Yes | No | `/youtubei/v1/next` engagement panel transcript (blocked for PoToken videos) |
 | 1 | InnerTube API | Yes | No | Direct API fetch with multiple client profiles (IOS, MWEB, WEB..., LOGIN_REQUIRED) |
 | 1.5 | Embed Page | Yes | No | Scrapes `/embed/{videoId}` for caption data (age-restricted, may be EMBEDDER_IDENTITY_DENIED) |
-| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.5/1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. |
+| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.5/1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. Wait-level fast-abort (`src/utils/fast-abort.js`): if that report is 0, the outer wait now aborts at arm+10s instead of the full 23s, always falling through to 2C/Auth. |
 | 2 | youtube-transcript | — | Yes | Uses `@playzone/youtube-transcript` library via content script |
 | 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via the shared `_pageLegLock` (mutually exclusive with 1.7). Fast-abort: settled-0-tracks confirmed via a MAIN-world `chrome.scripting` probe (`_probeSettledNoTracks` — the ISOLATED-side read is dead) aborts the 30s wait in ~10s. |
 | 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker |

@@ -47,3 +47,21 @@ re-discover it from a green CI run.
 headless fails, the automation flag (`navigator.webdriver` or Chromium's
 `--headless` detection surface) is the likely cause, not the proxy or
 cookies (both are shared with headless runs already).
+
+**2026-09-27 — root cause isolated:** ran the suggested `E2E_HEADED=1` comparison
+against the same playlist (`PLQXk9_XDN67L2N_-aBQwDiNnITHWPJ9b4`, `E2E_BATCH_LIMIT=6`,
+same `.e2e-profile-golden/`, same proxy). Result: **4/6**, the *exact same* 4 video
+IDs (`4wCNFskBpR8`, `pQHTEyUlPsQ`, `VMGcREb1f8A`, `lIVL0TVzrko`) that succeeded in
+both the manual browser run and are absent from every headless run. Since proxy and
+cookies were identical between the headed and headless runs and only headed passed,
+this rules out proxy/IP and cookie staleness — the differentiator is headless mode
+itself (`navigator.webdriver` / Chromium's `--headless` detection surface, per the
+suggested-next-step hypothesis above). Root cause of *why* YouTube's servers respond
+with 403/connection-close specifically to headless Chromium is still unconfirmed
+(not yet root-caused to a specific detection signal) — only that headless-ness
+itself, not environment/credentials, is the variable that flips the outcome.
+
+**Still not fixed** — no code change from this. A durable fix (if wanted) would need
+either running the suite non-headless routinely (slower, defeats CI-style use) or
+finding and neutralizing the specific automation-flag signal Chromium exposes in
+headless mode. Left open for a future session to decide which.

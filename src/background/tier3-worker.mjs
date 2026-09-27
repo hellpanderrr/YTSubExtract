@@ -41,9 +41,9 @@ async function createFreshSession(client = 'iOS') {
     // passthrough, which is now wrapped in fetchResponseWithTimeout — same
     // 10s deadline as the six raw-fetch sites, but returning the raw
     // Response because youtubei.js reads the body itself (.json()/.text()).
-    // Without it a stalled socket pinned Tier 3 (the batch's primary tier)
-    // behind a fresh-looking `running` heartbeat; now it aborts and the
-    // tier falls through like any other failed attempt.
+    // Without it a stalled socket pinned Tier 3 (a batch tier, demoted
+    // behind Tier 1 2026-09-27) behind a fresh-looking `running` heartbeat;
+    // now it aborts and the tier falls through like any other failed attempt.
     fetch: (input, init) => fetchResponseWithTimeout(input, init),
   });
 }
@@ -117,12 +117,14 @@ export async function fetchTier3Transcript(videoId, options = {}) {
     try {
         info = await yt.getInfo(videoId);
     } catch (e) {
-        console.warn('Tier 3: getInfo (IOS) failed, trying WEB', e.message);
         try {
             const yt2 = await createFreshSession('WEB');
             info = await yt2.getInfo(videoId);
         } catch (e2) {
-            console.warn('Tier 3: getInfo (WEB) also failed', e2.message);
+            // Both clients failed getInfo outright -- log once, one line, no
+            // stack dump. translation-manager.mjs's own [Tier 3] Failed line
+            // (fed by this throw) is the signal that matters downstream.
+            console.log(`[Tier 3] getInfo failed on both IOS (${e.message}) and WEB (${e2.message})`);
             throw e2;
         }
     }
@@ -288,7 +290,8 @@ export async function fetchTier3Transcript(videoId, options = {}) {
     }
 
   } catch (error) {
-    console.error('Tier 3: fetchTier3Transcript failed', error);
+    // One line, no full-object dump -- see the getInfo catch above for why.
+    console.log(`[Tier 3] fetchTier3Transcript failed: ${error.message}`);
     throw error;
   }
 }
@@ -300,14 +303,9 @@ export async function getVideoMetadata(videoId) {
     try {
       info = await yt.getInfo(videoId);
     } catch (e) {
-      console.warn('Tier 3 Metadata: getInfo (IOS) failed, trying WEB', e.message);
       const yt2 = await createFreshSession('WEB');
       info = await yt2.getInfo(videoId);
     }
-
-    console.log('[Tier 3 Debug] info keys:', Object.keys(info || {}).join(', '));
-    console.log('[Tier 3 Debug] info.captions:', info.captions ? '(present)' : 'undefined');
-    console.log('[Tier 3 Debug] info.basic_info:', JSON.stringify(info.basic_info, null, 2));
 
     let languages = [];
     let captionTracks = info.captions?.caption_tracks;
@@ -366,7 +364,7 @@ export async function getVideoMetadata(videoId) {
       languages
     };
   } catch (error) {
-    console.error('Tier 3 Metadata Error:', error);
+    console.log(`[Tier 3 Metadata] Failed: ${error.message}`);
     throw error;
   }
 }

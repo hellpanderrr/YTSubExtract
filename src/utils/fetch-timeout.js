@@ -39,8 +39,8 @@ export async function fetchTextWithTimeout(
 // body themselves (youtubei.js calls .json()/.text() on it and checks .ok —
 // the {ok,status,text} shape above would break it). Used by the Innertube
 // fetch passthrough in tier3-worker.mjs (#12 residual): a stalled socket here
-// pins Tier 3 — the batch's primary tier — behind a fresh-looking `running`
-// heartbeat.
+// pins Tier 3 — a batch tier, demoted behind Tier 1 2026-09-27 — behind a
+// fresh-looking `running` heartbeat.
 //
 // The timer is deliberately NOT cleared when headers arrive: the body read
 // happens after this function returns, and it must stay covered by the same
