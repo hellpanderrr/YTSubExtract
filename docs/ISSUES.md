@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 1 open, 0 fixed.
+Total: 14 open, 1 fixed.
 
 ---
 
@@ -48,20 +48,150 @@ headless fails, the automation flag (`navigator.webdriver` or Chromium's
 `--headless` detection surface) is the likely cause, not the proxy or
 cookies (both are shared with headless runs already).
 
-**2026-09-27 — root cause isolated:** ran the suggested `E2E_HEADED=1` comparison
-against the same playlist (`PLQXk9_XDN67L2N_-aBQwDiNnITHWPJ9b4`, `E2E_BATCH_LIMIT=6`,
-same `.e2e-profile-golden/`, same proxy). Result: **4/6**, the *exact same* 4 video
-IDs (`4wCNFskBpR8`, `pQHTEyUlPsQ`, `VMGcREb1f8A`, `lIVL0TVzrko`) that succeeded in
-both the manual browser run and are absent from every headless run. Since proxy and
-cookies were identical between the headed and headless runs and only headed passed,
-this rules out proxy/IP and cookie staleness — the differentiator is headless mode
-itself (`navigator.webdriver` / Chromium's `--headless` detection surface, per the
-suggested-next-step hypothesis above). Root cause of *why* YouTube's servers respond
-with 403/connection-close specifically to headless Chromium is still unconfirmed
-(not yet root-caused to a specific detection signal) — only that headless-ness
-itself, not environment/credentials, is the variable that flips the outcome.
+**2026-09-27 — narrowed, NOT isolated (downgraded same day):** ran the suggested
+`E2E_HEADED=1` comparison against the same playlist
+(`PLQXk9_XDN67L2N_-aBQwDiNnITHWPJ9b4`, `E2E_BATCH_LIMIT=6`, same
+`.e2e-profile-golden/`, same proxy). First headed run: **4/6**, the *exact same*
+4 video IDs (`4wCNFskBpR8`, `pQHTEyUlPsQ`, `VMGcREb1f8A`, `lIVL0TVzrko`) that the
+manual browser got and headless never got. That initially read as headless-mode
+detection isolated as the variable.
 
-**Still not fixed** — no code change from this. A durable fix (if wanted) would need
-either running the suite non-headless routinely (slower, defeats CI-style use) or
-finding and neutralizing the specific automation-flag signal Chromium exposes in
-headless mode. Left open for a future session to decide which.
+**Downgraded later the same day** (second-opinion review): two further headed runs
+against the identical config landed **0/6 and 4/6** (see `docs/LESSONS.md`
+2026-09-27, fast-abort section) — headed is NOT a reliable positive control, so
+the first 4/6 may have been network luck rather than proof that "only headlessness
+flips the outcome." Standing tally: headless 0/2, headed 2/3 — a correlation, not
+an isolation. Proxy/cookies are likewise not fully ruled out (a headed run failed
+with them present). Still-open candidate signals, none tested in isolation:
+1. **Automation flags** — `e2e/fixtures.mjs` strips neither `--enable-automation`
+   nor adds `--disable-blink-features=AutomationControlled` (unlike
+   `e2e/login.mjs`), so every test run carries `navigator.webdriver`; but headed
+   runs carry the same flags and sometimes pass, so flags alone cannot explain
+   the headless/headed split either way.
+2. **The server-visible `HeadlessChrome/...` UA token** headless Chromium still
+   sends — a stronger fit for the `403`/`ERR_CONNECTION_CLOSED` signature than a
+   client-side JS flag, never tested.
+3. **Transient network variance** — the same signature appears in runs that
+   later succeed (this day's own runs), so it may be partly luck-shaped.
+
+**What would diagnose it**: N≥3 runs per variant with variables separated (flags
+/ UA / both), plus an in-page assertion recorded each run that the manipulation
+actually took effect (`navigator.webdriver` value, UA string). Any single-run
+flip proves nothing at the observed variance — and any fixtures change must be
+env-gated, since the current un-gated config is the one producing the 4/6s.
+
+**Still not fixed** — no code change from this.
+
+---
+
+### #2 — dead embed-iframe tier weakened YouTube's framing protection and muted third-party embeds
+
+**Status: FIXED** (2026-09-29)
+
+**Found:** 2026-09-29, architecture review. `_fetchTranscriptViaEmbedFrame` had zero callers, yet: DNR rules 4/5 stripped `X-Frame-Options`/CSP from every youtube.com and youtube-nocookie.com sub_frame for ALL tabs (clickjacking exposure); the manifest injected the MAIN-world sniffer with `all_frames:true`, whose iframe block muted, kept muting, and force-captioned every YouTube embed on any website; and the iframe relay posted signed timedtext URLs (`pot`/`sig`) to `window.parent` with target `'*'`.
+
+**Fix evidence:** method, `INJECT_EMBED_FRAME` handler, rules 4/5, sniffer iframe block + relay deleted; `all_frames` removed. Pinned by `test/manifest-hygiene.test.mjs` (mutation-killed both ways: all_frames restored -> fails; lowercase `x-frame-options` rule re-added -> fails).
+
+---
+
+### #3 — Tier 1.7 / 2C ignore `translate` but results are labelled translated
+
+**Status: OPEN** · medium · verified
+
+`getTranscriptForPlaylist` passes only `lang` to `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` yet sets `translated: translate`; `main.mjs` names files with `targetLang` when `translate` is on. A "translate to ru" batch can ship untranslated source-language cues under `_ru` filenames with no error. Fix: pass translation through, or fail/label honestly when a tier cannot translate.
+
+---
+
+### #4 — single-video Tier 3 Legacy returns `{start,end}`; download rebuilds end = start + duration
+
+**Status: OPEN** · medium · verified, dormant (Tier 3 has no recorded success)
+
+Tier 3 Legacy in `translation-manager.mjs` normalizes to `{start,end,text}`; `handleGetTranscript` (main.mjs) recomputes `end = start + (duration||dur||0)`, so every cue is zero-length. Root cause is inconsistent tier return shapes (`{start,duration}` vs `{start,end}`); fix by normalizing once, at one boundary, with a test.
+
+---
+
+### #5 — some caption fetches have no timeout (same class as closed #12)
+
+**Status: OPEN** · medium · verified
+
+`_extractFromEmbed` (bare `fetch(fetchUrl)`, reached from the batch chain) and five single-video sites use `fetch()` with no AbortSignal. A stalled socket pins a semaphore slot while the 15s heartbeat keeps the popup on "running". Fix: `fetchTextWithTimeout` at those sites.
+
+---
+
+### #6 — ZIP can be lost while status says completed
+
+**Status: OPEN** · medium · swallowed-error half verified, storage-quota half plausible
+
+`main.mjs` falls back to writing the whole ZIP as base64 into `chrome.storage.local` if `downloads.download` throws; the manifest has no `unlimitedStorage`, and a failure there is only `console.error`'d before status is set to completed. Results live only in service-worker memory. Fix: surface an error status; consider `unlimitedStorage` or a retry.
+
+---
+
+### #7 — Tier 0.5 Auth bypasses the page-leg lock and pinned tab
+
+**Status: OPEN** · low-medium · verified read, impact plausible
+
+`_fetchTranscriptAuth` picks `tabs.find(active) || tabs[0]` and is not serialized; a concurrent Tier 2C navigation can close its port -> false failure of the last-resort tier. Fix: route through `_resolvePageLegTab` + `_enqueuePageLeg`.
+
+---
+
+### #8 — output layer is untested and triplicated; timedtext parser copied ~8x
+
+**Status: OPEN** · medium
+
+Zero tests for `subtitle-formats.js`, the separate SRT/VTT/TXT copies in `main.mjs`, `zip-generator.js` filename helpers, or playlist/caption response parsing. Three formatter implementations (popup, background, dead zip-generator). The XML/JSON3 timedtext parse is copy-pasted ~8 times (content.js x5, translation-manager, youtube-caption-extractor, tier3-worker) with double entity-decoding, undecoded numeric entities, and multi-line cues silently dropped (`.` without the `s` flag). Fix: one pure `parseTimedText` + one formatter module in `src/utils`, unit-tested; delete the copies.
+
+---
+
+### #9 — CI never runs the tests
+
+**Status: OPEN** · medium · verified
+
+All four `.github/workflows` only build/publish, on Node 18; `npm test` needs Node >= 22.3 (`--experimental-test-module-mocks`). `package.json` has no `engines`, no coverage tool, no lint. Fix: a test workflow on Node >= 22.3 + `engines`.
+
+---
+
+### #10 — page-forgeable messages into the pipeline (hardening)
+
+**Status: OPEN** · low-medium · needs attacker JS inside a youtube.com frame
+
+`YTSUB_CAPTURED_URL`/`YTSUB_CAPTURED_TRANSCRIPT` carry no nonce and the URL is not host-checked before the service worker fetches it; the COERCE status handler accepts the constant `requestId==='scripting'`; sniffer `REQUEST_MAIN_WORLD_FETCH` fetches any URL with credentials (blind). Since #2 removed iframe relays, `content.js` can now safely require `event.source === window`. Fix: source filter + host/path allowlist (`*.youtube.com/api/timedtext`) + per-call ids.
+
+---
+
+### #11 — dead code and small leaks
+
+**Status: OPEN** · low · grepped
+
+No callers: `metadata-tier1.mjs`, `zip-generator.js`, `GET_PLAYLIST_TRANSCRIPT`/`handleGetPlaylistTranscript`, content handlers `GET_CAPTION_TRACKS` and `GET_CAPTURED_TRANSCRIPT`, `getPageVariable`, `_getLanguagesTier1`, `createZipInBackground`, several extractor functions. Leaks: sniffer `capturedResponses` is written for every capture and never read; `__ytsub_captured_transcripts` grows for the tab's life.
+
+---
+
+### #12 — test-harness fidelity gaps hide bugs
+
+**Status: OPEN** · medium · verified
+
+`test/helpers/chrome-mock.mjs`: `storage.local` keeps references (no structured clone); `runtime.lastError` is only set by `tabs.get`, so the real "Receiving end does not exist" branches in translation-manager are never exercised; callbacks fire synchronously. Also: `fast-abort.test.mjs` never varies `getTracklistCount` over time (a read-before-sleep mutant survives); `video-url.test.mjs` never tests 12-char IDs (a `{11,}` mutant survives); `batch-download.spec` never asserts subtitles + errors == selected; the smoke login test asserts only `typeof === 'boolean'`.
+
+---
+
+### #13 — Tier 1.7 double-drive and duplicated drive function
+
+**Status: OPEN** · low-medium · plausible, not traced
+
+content.js fires the scripting fallback (`DRIVE_PLAYER_MAIN`) after 6s if not finished, even when the sniffer drive is merely slow -> two drivers with independent timers on one player, uncancellable. `MAIN_DRIVE_FUNC` (main.mjs) duplicates `drivePlayerCoercion` (sniffer.js) and will drift.
+
+---
+
+### #14 — stale `_cachedTitle` and cross-tier track-selection drift
+
+**Status: OPEN** · low-medium · verified
+
+`_cachedTitle` is instance-level and never cleared: Tier 2 for video A, then a title-less result for B, caches A's title as B's. With `sourceLang='auto'` the winning tier decides the language (Android/1.5/Tier 3 prefer en, Tier 1 takes track[0], 1.7/2C take what the player arms).
+
+---
+
+### #15 — service worker death mid-batch loses all results (no resume)
+
+**Status: OPEN** · low (architectural)
+
+Results, cache, pin and `_originalTabUrl` are memory-only. The 60s staleness guard recovers the UI but not the data or the tab restore.

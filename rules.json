@@ -31,37 +31,5 @@
       "urlFilter": "youtube.com/watch",
       "resourceTypes": ["xmlhttprequest", "other"]
     }
-  },
-  {
-    "id": 4,
-    "priority": 1,
-    "action": {
-      "type": "modifyHeaders",
-      "responseHeaders": [
-        { "header": "X-Frame-Options", "operation": "remove" },
-        { "header": "Content-Security-Policy", "operation": "remove" },
-        { "header": "Content-Security-Policy-Report-Only", "operation": "remove" }
-      ]
-    },
-    "condition": {
-      "urlFilter": "||youtube.com/",
-      "resourceTypes": ["sub_frame"]
-    }
-  },
-  {
-    "id": 5,
-    "priority": 1,
-    "action": {
-      "type": "modifyHeaders",
-      "responseHeaders": [
-        { "header": "X-Frame-Options", "operation": "remove" },
-        { "header": "Content-Security-Policy", "operation": "remove" },
-        { "header": "Content-Security-Policy-Report-Only", "operation": "remove" }
-      ]
-    },
-    "condition": {
-      "urlFilter": "||youtube-nocookie.com/",
-      "resourceTypes": ["sub_frame"]
-    }
   }
 ]

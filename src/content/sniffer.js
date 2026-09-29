@@ -1,8 +1,9 @@
 // === NETWORK SNIFFER ===
 // Injected into MAIN world to intercept fetch/XHR
 // Captures URLs with timedtext (subtitles)
-// Also captures full timedtext response bodies when in embed iframes
-// Runs in YouTube page context (including embed iframes via all_frames)
+// Also captures full timedtext response bodies (window.__ytsub_captured_transcripts)
+// Runs in the top-level YouTube frame only (manifest all_frames:false) — it
+// must never run in third-party embeds: see docs/LESSONS.md 2026-09-29.
 
 (function() {
     'use strict';
@@ -19,9 +20,6 @@
     function isTimedTextUrl(url) {
         return typeof url === 'string' && url.includes('timedtext');
     }
-
-    // Check if we're in an iframe
-    const isInIframe = window !== window.top;
 
     // Extract videoId, lang, pot token from timedtext URL
     function parseTimedTextUrl(url) {
@@ -119,12 +117,7 @@
             timestamp: Date.now()
         };
 
-        // If in iframe, relay to parent frame
-        if (isInIframe) {
-            window.parent.postMessage(message, '*');
-        } else {
-            window.postMessage(message, '*');
-        }
+        window.postMessage(message, '*');
 
         console.log(`[YTSub Sniffer] Captured transcript: video=${videoId}, lang=${lang || 'unknown'}, ${text.length} bytes`);
     }
@@ -426,31 +419,5 @@
         }
     });
 
-    console.log(`[YTSub Sniffer] Initialized in MAIN world (iframe=${isInIframe})`);
-
-    // If in an iframe, mute everything, wait for the player, toggle captions
-    if (isInIframe) {
-        // Mute any existing video/audio elements immediately
-        document.querySelectorAll('video, audio').forEach(el => { el.muted = true; el.volume = 0; });
-        // Watch for dynamically created media elements and mute them
-        const muteObserver = new MutationObserver(() => {
-            document.querySelectorAll('video, audio').forEach(el => { el.muted = true; el.volume = 0; });
-        });
-        muteObserver.observe(document.documentElement, { childList: true, subtree: true });
-
-        // Wait for player then toggle captions to trigger timedtext request
-        let attempts = 0;
-        const tryToggleCaptions = setInterval(() => {
-            attempts++;
-            const player = document.getElementById('movie_player');
-            if (player && typeof player.toggleSubtitles === 'function') {
-                clearInterval(tryToggleCaptions);
-                player.toggleSubtitles(true);
-                console.log('[YTSub Sniffer] Toggled captions ON in iframe');
-            } else if (attempts >= 50) {
-                clearInterval(tryToggleCaptions);
-                console.log('[YTSub Sniffer] Could not find player after 10s');
-            }
-        }, 200);
-    }
+    console.log('[YTSub Sniffer] Initialized in MAIN world');
 })();

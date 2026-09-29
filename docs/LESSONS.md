@@ -533,6 +533,67 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   documented in `e2e/README.md` — wired 2026-09-27 after the third
   occurrence; no more temp listeners in specs.
 
+## 2026-09-27 (second-opinion corrections)
+
+- **NEXT.md commit-status adjectives self-invalidate the moment the commit
+  lands — twice now.** Both this session and the previous one wrote State
+  sections saying "all uncommitted" *inside the very commit that landed
+  them*. Standing rule: never write `uncommitted`/`dist is stale`-style
+  status into NEXT.md; either write the baton after the commit or phrase
+  State purely in feature terms ("shipped/validated/documented") with no
+  working-tree claims at all.
+- **`docs/ISSUES.md` #1 was overstated as "root cause isolated" and was
+  corrected down to "narrowed, not isolated" the same day** — two further
+  headed runs (0/6, 4/6) showed headed is not a reliable positive control,
+  so headless-vs-headed is a correlation (0/2 vs 2/3), not a proven
+  differentiator; automation flags AND the `HeadlessChrome` UA token AND
+  transient network variance all remain untested candidates. Lesson: an
+  "isolated cause" claim needs the control condition to be reliable, not
+  just better-than the failing one — and N=1 flips prove nothing at this
+  run-to-run variance.
+
+## 2026-09-29 (architecture + test-suite review; dead tier removed)
+
+- **A dead feature's side effects outlive its callers — and the worst ones
+  are global, not local.** The hidden-embed-iframe tier (Tier 1.6) was
+  disabled 2026-09-20 and its method had zero callers by 2026-09-25 (we even
+  logged that), but its DNR rules (strip `X-Frame-Options`/CSP from
+  youtube.com sub_frames for EVERY tab), its `all_frames:true` sniffer (mute
+  + force-captions every YouTube embed on any website) and its
+  `window.parent.postMessage(..., '*')` relay (signed timedtext URLs) stayed
+  live for nine days. "Disabled" is not "removed": when a tier goes dead,
+  grep for everything that only existed to serve it — manifest entries,
+  DNR rules, `all_frames`, content-script branches — and delete those with
+  it. Found by review, not by any test or user report.
+  ✅ enforced by `test/manifest-hygiene.test.mjs` (no CSP/XFO-stripping DNR
+  rule; no `all_frames:true` content script). See `docs/ISSUES.md` #2.
+- **Reviewer agents overstate; verify the load-bearing claims by running
+  code.** Of the review's claims, one was flatly wrong in practice ("popup
+  SRT crashes on NaN" — `toSRT` does throw on `{start,duration}`, but
+  `handleGetTranscript` normalizes first; the real bug was the narrower
+  Tier 3 zero-length-cue shape, ISSUES #4) and one was unverifiable from
+  source alone (the ISOLATED→MAIN `postMessage` claim, which contradicts the
+  2026-09-20 wall entry and remains UNCONFIRMED — do not edit that entry
+  from a reviewer's say-so). Executing `toSRT` on the edge inputs took one
+  command and settled it.
+- **`e2e/fixtures.mjs:312` can throw `EPERM` in cleanup and fail a whole
+  test attempt.** `verifyCookiesSurvived` removes its throwaway
+  `.e2e-profile-cookieprobe` dir in a `finally` immediately after
+  `context.close()`; on Windows Chromium hasn't released the profile yet, so
+  the unguarded `fs.rmSync` throws and the attempt dies before any test code
+  runs (seen 2026-09-29 as the "flaky" first attempt; `retries:1` masked it).
+  Same root as the 2026-09-18 SingletonLock entry. Fix when next in there:
+  retry the rm with `maxRetries`/`retryDelay` or swallow it.
+- **A log-watching monitor must key on the runner's own summary line, not on
+  generic words.** I armed one on `Error:`, which page/SW logs print
+  constantly, so it fired minutes early and I briefly misread a still-running
+  batch as finished. Use `^\s+[0-9]+ (passed|failed)`.
+- **Test-suite shape: strong on state machines, empty on the product's
+  output.** 55 tests covered Stop/lock/cache logic thoroughly while the SRT/
+  VTT/TXT formatters, ZIP filenames and all response parsing had none and CI
+  ran no tests at all (ISSUES #8, #9, #12). A green suite here says nothing
+  about whether the downloaded file is right.
+
 ## 2026-09-27 (headless-vs-headed root cause isolated)
 
 - **Headless e2e isolated as the actual variable, not proxy/cookies.** Ran the

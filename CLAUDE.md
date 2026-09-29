@@ -22,7 +22,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `{ok,status,text}` and raw-Response variants), `stable-read`
   (Tier 0.5 hydration stabilization), `seedWatchPage`'s ready-streak
   early-return (`test/watch-seed.test.mjs`), and Tier 1.7's wait-level
-  fast-abort window math (`test/fast-abort.test.mjs`), and the playlist
+  fast-abort window math (`test/fast-abort.test.mjs`), manifest/DNR hygiene
+  (`test/manifest-hygiene.test.mjs`), and the playlist
   tier-chain order (`test/tier3-order.test.mjs` — needs
   `--experimental-test-module-mocks`, supplied by `npm test`) — all pure node. Background modules are
   imported for real with a `chrome.*` mock
@@ -119,7 +120,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 0.1 (batch) | /next Transcript | Yes | No | `/youtubei/v1/next` engagement panel transcript (blocked for PoToken videos) |
 | 1 | InnerTube API | Yes | No | Direct API fetch with multiple client profiles (IOS, MWEB, WEB..., LOGIN_REQUIRED) |
 | 1.5 | Embed Page | Yes | No | Scrapes `/embed/{videoId}` for caption data (age-restricted, may be EMBEDDER_IDENTITY_DENIED) |
-| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.5/1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. Wait-level fast-abort (`src/utils/fast-abort.js`): if that report is 0, the outer wait now aborts at arm+10s instead of the full 23s, always falling through to 2C/Auth. |
+| 1.7 | Player Coercion | Yes | Yes | Seed tab once per batch, then `loadVideoById` in-page per video; MAIN-world sniffer captures timedtext. Serialized via the shared `_pageLegLock` (one lock for 1.7/2C — one tab, one mutex). Settled-fast: confirmed-this-video 0-tracks on 2 polls reports immediately. Wait-level fast-abort (`src/utils/fast-abort.js`): if that report is 0, the outer wait now aborts at arm+10s instead of the full 23s, always falling through to 2C/Auth. |
 | 2 | youtube-transcript | — | Yes | Uses `@playzone/youtube-transcript` library via content script |
 | 2C | Tab Navigation | Yes | Yes | **Navigates tab to watch page** — the real player solves BotGuard, sniffer captures timedtext. Serialized via the shared `_pageLegLock` (mutually exclusive with 1.7). Fast-abort: settled-0-tracks confirmed via a MAIN-world `chrome.scripting` probe (`_probeSettledNoTracks` — the ISOLATED-side read is dead) aborts the 30s wait in ~10s. |
 | 3 | youtubei.js | Yes | No | Innertube SDK getTranscript. Falls back to Legacy InnerTube worker. Runs *after* Tier 1 since 2026-09-27 (demoted — 0/12 successes in every available real run). |
@@ -133,14 +134,12 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 
 - **PoToken / BotGuard**: YouTube's JS VM generates runtime client attestation tokens. Timedtext requests without a valid PoToken return HTTP 200 with 0-byte body. The only reliable bypass is navigating a real YouTube tab to the watch page where the native player solves BotGuard.
 - **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. `content.js` (document_idle, ISOLATED world) injects a bootstrap script that reads this global and relays it via `postMessage` to the ISOLATED-world `capturedTranscripts` Map. This solves the timing gap where the content script's message listener doesn't exist when the sniffer fires at document_start.
-- **event.source filtering**: `content.js` **must not** use `if (event.source !== window) return;` for `YTSUB_CAPTURED_TRANSCRIPT` messages — iframes send `window.parent.postMessage()` where `event.source` is the iframe window, not the top window.
-- **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7/embed so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
-- **DNR rules** (`rules.json` — 4 rules, ids 1/3/4/5; verified 2026-09-25):
-  - id 4: Remove `X-Frame-Options`/`Content-Security-Policy`/`CSP-Report-Only` from `youtube.com` sub_frame responses (enables watch page in iframe)
-  - id 5: Same for `youtube-nocookie.com` sub_frames
+- **event.source filtering**: `content.js` currently does not filter `YTSUB_CAPTURED_TRANSCRIPT` by `event.source`. The old reason (the embed-iframe tier relayed via `window.parent.postMessage()`) is gone — that tier and the sniffer's iframe relay were deleted 2026-09-29 and the sniffer is top-frame-only — so adding `event.source === window` is now a safe hardening against child-iframe forgery (`docs/ISSUES.md`), not yet done.
+- **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7 so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
+- **DNR rules** (`rules.json` — 2 rules, ids 1/3; ids 4/5 deleted 2026-09-29):
   - id 1: Set `Origin`/`Referer` on `youtubei/v1` requests, remove `Sec-Ch-Ua*` request headers
   - id 3: Set `Origin`/`Referer` on `youtube.com/watch` API requests
-  (There is no timedtext iOS-UA-spoof rule — the old "Rule 4" claim never existed in the file.)
+  (There is no timedtext iOS-UA-spoof rule. Never add rules that strip `X-Frame-Options`/CSP from YouTube responses: the deleted ids 4/5 did that for every tab — clickjacking exposure — to serve a tier with no callers. Pinned by `test/manifest-hygiene.test.mjs`, which also forbids `all_frames:true` content scripts, so the MAIN-world sniffer never runs in third-party YouTube embeds.)
 - **fflate** (sync) used for ZIP creation since Web Workers don't work in Service Workers
 - **Batch processing** uses a semaphore (concurrency: 3, 300ms delay with jitter) to rate-limit playlist downloads
 - **Progress polling**: background writes to `chrome.storage.local`, popup polls every 500ms

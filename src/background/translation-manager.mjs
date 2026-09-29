@@ -318,66 +318,6 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // EMBED FRAME TRANSCRIPT SNIFFER
-  // Injects a hidden embed iframe into an active YouTube tab where
-  // the real YouTube player solves BotGuard and makes PoToken-authenticated
-  // timedtext requests. Our sniffer (MAIN world, all_frames:true) captures
-  // response bodies and relays them back via window.postMessage.
-  // ─────────────────────────────────────────────────────────────
-  async _fetchTranscriptViaEmbedFrame(videoId, options = {}) {
-    const { lang = 'auto', timeout = 10000 } = options;
-    return new Promise((resolve) => {
-      // Embed-frame shares the page with Tier 1.7's coercion, so concurrent
-      // batch workers would inject/remove the same fixed iframe id. Serialize
-      // on the coercion lock — it is the same shared surface.
-      this._enqueuePageLeg(() => new Promise((innerResolve) => {
-        const passThrough = (result) => {
-          resolve(result);
-          innerResolve(result);
-        };
-        this._resolvePageLegTab().then((tab) => {
-          if (this._batchCancelled) {
-            console.log('[EmbedFrame] Batch stopped, skipping');
-            return passThrough(null);
-          }
-          if (!tab) {
-            console.log('[EmbedFrame] No YouTube tab found');
-            return passThrough(null);
-          }
-          const timer = setTimeout(() => {
-            console.log('[EmbedFrame] Timeout');
-            passThrough(null);
-          }, timeout);
-          chrome.tabs.sendMessage(tab.id, {
-            type: 'INJECT_EMBED_FRAME',
-            videoId,
-            lang: lang !== 'auto' ? lang : null,
-            timeout: timeout - 2000
-          }, (response) => {
-            clearTimeout(timer);
-            if (chrome.runtime.lastError) {
-              console.warn('[EmbedFrame] Runtime error:', chrome.runtime.lastError.message);
-              return passThrough(null);
-            }
-            if (!response?.success) {
-              console.log('[EmbedFrame] Failed:', response?.error || 'Unknown error');
-              if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
-              return passThrough(null);
-            }
-            if (response?.result && response.result.length > 0) {
-              console.log(`[EmbedFrame] Success: ${response.result.length} segments`);
-              passThrough(response.result);
-            } else {
-              console.log('[EmbedFrame] Empty result');
-              passThrough(null);
-            }
-          });
-        });
-      }));
-    });
-  }
-
-  // ─────────────────────────────────────────────────────────────
   // PLAYER COERCION (Pathway 1): Use native YT player
   // Calls player.loadVideoById() + loadModule("captions") to force
   // the real YouTube player to solve BotGuard and request timedtext.
@@ -625,7 +565,7 @@ export class TranslationManager {
       return false;
     }
 
-    // Pin THIS tab for the whole batch — later 1.5/1.7/2C/restore calls must
+    // Pin THIS tab for the whole batch — later 1.7/2C/restore calls must
     // keep driving it even if the user switches to another YouTube tab.
     this._batchTabId = tab.id;
 
@@ -2303,14 +2243,8 @@ export class TranslationManager {
       log(`[Tier 1.5] Failed: ${err.message}`);
     }
 
-    // === TIER 1.6 (Embed Frame): DISABLED in batch ===
-    // Probes showed the nocookie iframe never fires a caption request for
-    // ASR-gated videos — it burned 10-25s per video for zero captures and
-    // shared the coercion lock (serialized dead wait). _fetchTranscriptViaEmbedFrame
-    // and the INJECT_EMBED_FRAME content handler remain but currently have
-    // NO callers anywhere (verified 2026-09-25 — not even single-video);
-    // batch
-    // goes straight from cold tiers to 1.7 player coercion. (2026-09-20)
+    // (Tier 1.6, the hidden nocookie embed iframe, was deleted 2026-09-29 —
+    // see docs/LESSONS.md. Cold tiers go straight to 1.7 player coercion.)
 
     // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
     // Switches videos in-page via player.loadVideoById() — no navigation, no
