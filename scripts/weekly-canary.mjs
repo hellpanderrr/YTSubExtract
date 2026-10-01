@@ -165,7 +165,8 @@ function applyAction(decision, openIssue, body, dryRun) {
       gh(['issue', 'comment', String(openIssue), '--body-file', bodyFile], dryRun);
     } else if (decision.action === 'close-issue') {
       fs.writeFileSync(bodyFile, `Canary passing again.\n\n${body}`);
-      gh(['issue', 'close', String(openIssue), '--comment', 'Canary passing again; closing.'], dryRun);
+      gh(['issue', 'comment', String(openIssue), '--body-file', bodyFile], dryRun);
+      gh(['issue', 'close', String(openIssue)], dryRun);
     }
   } finally {
     fs.rmSync(bodyFile, { force: true });
@@ -229,13 +230,22 @@ async function main() {
   console.log(body);
   if (env.GITHUB_STEP_SUMMARY) fs.appendFileSync(env.GITHUB_STEP_SUMMARY, body + '\n');
 
-  applyAction(decision, openIssue, body, dryRun);
+  // Persist the streak BEFORE touching GitHub: a failing gh call (network,
+  // expired token) must not lose the failure count.
   if (!dryRun) {
     fs.writeFileSync(STATE_FILE, JSON.stringify({ consecutiveFailures: decision.consecutiveFailures }));
   } else {
     console.log(`[canary] DRY-RUN not writing ${path.basename(STATE_FILE)}`);
   }
-  process.exitCode = passed ? 0 : 1;
+  let actionFailed = false;
+  try {
+    applyAction(decision, openIssue, body, dryRun);
+  } catch (e) {
+    actionFailed = true;
+    console.error(`[canary] gh action "${decision.action}" failed: ${e.message.split('\n')[0]}`);
+  }
+  // A failed issue update makes the job red even when the run itself passed.
+  process.exitCode = passed && !actionFailed ? 0 : 1;
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

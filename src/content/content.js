@@ -1,6 +1,7 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
 import { readUntilStable } from '../utils/stable-read.js';
 import { runFastAbort } from '../utils/fast-abort.js';
+import { pruneOldest } from '../utils/prune-map.js';
 
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
@@ -16,12 +17,14 @@ const capturedUrls = new Map();
 // Storage for full transcript bodies captured by sniffer (MAIN world)
 // videoId -> Map<lang, {text, timestamp}>
 const capturedTranscripts = new Map();
+// One full caption body per (videoId, lang) lives here for the life of the tab,
+// so cap how many videos are kept (oldest-inserted evicted first).
+const MAX_CAPTURED_VIDEOS = 40;
 
 // Bridge: read MAIN-world captured transcripts from the document_start
-// sniffer. The sniffer (MAIN world, all_frames) stores bodies in
+// sniffer. The sniffer (MAIN world, top frame only) stores bodies in
 // window.__ytsub_captured_transcripts AND postMessages every capture live;
-// the live YTSUB_CAPTURED_TRANSCRIPT listener below (source-unfiltered, so
-// iframe relays arrive) is the primary feed. This bridge is a best-effort
+// the live YTSUB_CAPTURED_TRANSCRIPT listener below is the primary feed. This bridge is a best-effort
 // backfill for captures that fired before this script loaded: it asks the
 // sniffer for a re-broadcast instead of injecting a script element (script
 // injection from ISOLATED world does not execute on youtube.com — proven
@@ -42,6 +45,7 @@ const capturedTranscripts = new Map();
         }
       }
     }
+    pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
     window.removeEventListener('message', listener);
   };
   window.addEventListener('message', listener);
@@ -53,15 +57,22 @@ const capturedTranscripts = new Map();
 // Lock for player tracks requests to prevent concurrent duplicate operations
 const playerTracksLocks = new Map(); // videoId -> Promise
 
-// Listen for messages from sniffer.js (MAIN world) and embed iframes
+// Listen for messages from sniffer.js (MAIN world).
 window.addEventListener('message', (event) => {
-    // IMPORTANT: Do NOT filter by event.source here.
-    // When the sniffer inside the embed iframe relays data via
-    // window.parent.postMessage(), event.source is the iframe window,
-    // not the top window. We trust data checks instead.
+    // No event.source filter today. The original reason (an embed-iframe tier
+    // relayed captures via window.parent.postMessage) is gone: that tier and
+    // the sniffer's iframe relay were deleted 2026-09-29. A source check would
+    // now harden this against forged messages from child iframes
+    // (docs/ISSUES.md #10), but how event.source behaves across the
+    // ISOLATED/MAIN worlds is documented inconsistently (docs/LESSONS.md
+    // 2026-09-20 vs the sniffer's probe round-trip) — verify in a real
+    // browser before adding one.
 
     if (event.data?.type === 'YTSUB_CAPTURED_URL') {
         const { videoId, lang, url, timestamp } = event.data;
+        // A malformed message must not throw below (url.match) and abort the
+        // rest of this listener, including the transcript branch.
+        if (!videoId || typeof url !== 'string') return;
 
         if (!capturedUrls.has(videoId)) {
             capturedUrls.set(videoId, new Map());
@@ -87,6 +98,7 @@ window.addEventListener('message', (event) => {
             capturedTranscripts.set(videoId, new Map());
         }
         capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp });
+        pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
 
         if (DEBUG) {
             console.log(`[Content] Stored transcript for video=${videoId}, lang=${lang || 'unknown'}, ${text.length} bytes`);

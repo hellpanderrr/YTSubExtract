@@ -179,7 +179,7 @@ function extractPlaylistTitle(data) {
 /**
  * Parse videos from browse response
  */
-function parsePlaylistVideos(data) {
+export function parsePlaylistVideos(data) {
   const videos = [];
 
   try {
@@ -336,19 +336,18 @@ function parsePlaylistVideos(data) {
         debug(`Extracted ${videos.length} videos from sidebar`);
       }
     } else {
-      debug('No tabs found in either twoColumn or singleColumn');
-
-      // Check for continuation items (continuation responses don't have tabs)
-      const continuationItems = extractContinuationVideos(data);
-      if (continuationItems.length > 0) {
-        debug(`Found ${continuationItems.length} videos in continuation response`);
-        videos.push(...continuationItems);
-      }
+      debug('No playlist sidebar in this response');
     }
 
-    // Also check for continuation items
+    // Continuation pages (page 2+) carry their videos in
+    // onResponseReceivedActions and have no sidebar. This is the ONLY place
+    // they are collected: an earlier copy of this push inside the else-branch
+    // above returned every continuation video twice.
     const continuationItems = extractContinuationVideos(data);
-    videos.push(...continuationItems);
+    if (continuationItems.length > 0) {
+      debug(`Found ${continuationItems.length} videos in continuation response`);
+      videos.push(...continuationItems);
+    }
 
   } catch (err) {
     debug('Error parsing videos:', err);

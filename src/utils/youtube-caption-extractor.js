@@ -704,7 +704,11 @@ export async function getTranscriptViaAndroid(videoId, lang = 'auto', options = 
   let params = track?.getTranscriptEndpoint?.params;
   if (!params) params = track?.params;
 
-  if (params) {
+  // /get_transcript has no translation parameter: it returns the track's own
+  // language. When a translation was requested, skip it so the timedtext
+  // fallback below (which appends &tlang=) is used instead — otherwise the
+  // caller would receive untranslated text labelled as translated.
+  if (params && !translate) {
     // Call /get_transcript with params from player response
     debug(`[AndroidBypass] Using getTranscriptEndpoint.params`);
     const transcriptSession = await generateSessionData('ANDROID');

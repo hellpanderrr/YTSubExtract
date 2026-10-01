@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 15 open, 1 fixed.
+Total: 16 open, 2 fixed.
 
 ---
 
@@ -102,6 +102,8 @@ env-gated, since the current un-gated config is the one producing the 4/6s.
 
 `getTranscriptForPlaylist` passes only `lang` to `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` yet sets `translated: translate`; `main.mjs` names files with `targetLang` when `translate` is on. A "translate to ru" batch can ship untranslated source-language cues under `_ru` filenames with no error. Fix: pass translation through, or fail/label honestly when a tier cannot translate.
 
+**2026-10-01 — Tier 0 and Tier 0.1 parts FIXED** (found by CodeRabbit on PR #2, verified): Tier 0's `/get_transcript` path and Tier 0.1 never translated but ran before Tier 1. Now a translated request skips `/get_transcript` (uses timedtext `&tlang=`) and skips Tier 0.1. Pinned by `test/android-translate.test.mjs` and `test/tier01-translate.test.mjs`. The Tier 1.7 / 2C part above is still OPEN.
+
 ---
 
 ### #4 — single-video Tier 3 Legacy returns `{start,end}`; download rebuilds end = start + duration
@@ -125,6 +127,8 @@ Tier 3 Legacy in `translation-manager.mjs` normalizes to `{start,end,text}`; `ha
 **Status: OPEN** · medium · swallowed-error half verified, storage-quota half plausible
 
 `main.mjs` falls back to writing the whole ZIP as base64 into `chrome.storage.local` if `downloads.download` throws; the manifest has no `unlimitedStorage`, and a failure there is only `console.error`'d before status is set to completed. Results live only in service-worker memory. Fix: surface an error status; consider `unlimitedStorage` or a retry.
+
+**2026-10-01 (Pullfrog, PR #2):** `chrome.downloads.download` resolves when the download STARTS, so `swDownloaded = true` also claims success for a transfer that later interrupts, and nothing watches `downloads.onChanged`. Its specific scenario (a cancelled Save-As chooser reported as success) is probably wrong, since Chrome rejects that case, but this is untested headless.
 
 ---
 
@@ -160,6 +164,8 @@ All four `.github/workflows` only build/publish, on Node 18; `npm test` needs No
 
 `YTSUB_CAPTURED_URL`/`YTSUB_CAPTURED_TRANSCRIPT` carry no nonce and the URL is not host-checked before the service worker fetches it; the COERCE status handler accepts the constant `requestId==='scripting'`; sniffer `REQUEST_MAIN_WORLD_FETCH` fetches any URL with credentials (blind). Since #2 removed iframe relays, `content.js` can now safely require `event.source === window`. Fix: source filter + host/path allowlist (`*.youtube.com/api/timedtext`) + per-call ids.
 
+**2026-10-01:** how `event.source` behaves across the ISOLATED/MAIN worlds is documented inconsistently — `docs/LESSONS.md` 2026-09-20 says ISOLATED->MAIN `postMessage` does not cross worlds, while the sniffer's own probe round-trip proves messages do arrive, and two independent reviewers (one a bot) assert `event.source === window` holds. Needs a short real-browser probe before adding the filter. Comments in `content.js`/`sniffer.js` now say this instead of asserting either side.
+
 ---
 
 ### #11 — dead code and small leaks
@@ -167,6 +173,8 @@ All four `.github/workflows` only build/publish, on Node 18; `npm test` needs No
 **Status: OPEN** · low · grepped
 
 No callers: `metadata-tier1.mjs`, `zip-generator.js`, `GET_PLAYLIST_TRANSCRIPT`/`handleGetPlaylistTranscript`, content handlers `GET_CAPTION_TRACKS` and `GET_CAPTURED_TRANSCRIPT`, `getPageVariable`, `_getLanguagesTier1`, `createZipInBackground`, several extractor functions. Leaks: sniffer `capturedResponses` is written for every capture and never read; `__ytsub_captured_transcripts` grows for the tab's life.
+
+**2026-10-01:** the content-script half is FIXED — `capturedTranscripts` is capped at 40 videos via `pruneOldest` (`test/prune-map.test.mjs`). The sniffer's own `capturedResponses` (never read) and `__ytsub_captured_transcripts` still grow.
 
 ---
 
@@ -207,3 +215,29 @@ Results, cache, pin and `_originalTabUrl` are memory-only. The 60s staleness gua
 **Status: OPEN** · medium · verified by local runs 2026-10-01
 
 `scripts/weekly-canary.mjs` fails a run when fewer than `CANARY_MIN_OK` subtitles are produced. On this machine that happened in 5 of 6 headed runs in one day, every time with the service worker's Tier 1 receiving "Sign in to confirm you’re not a bot" (curly apostrophe). A canary that mostly measures the runner IP's bot-check state will open issues for non-bugs and train people to ignore it. Fix: capture the SW console (`E2E_CONSOLE=1`, piped rather than inherited), classify a below-threshold run with bot-check hits as INCONCLUSIVE, keep inconclusive runs out of the consecutive-failure streak, and open a separate 'blocked for N weeks' issue. Needs unit tests for the new state machine branch.
+
+---
+
+### #17 — PR #2 review-bot findings (Pullfrog + CodeRabbit), verified and fixed
+
+**Status: FIXED** (2026-10-01)
+
+Each finding was checked against the code before fixing; two bot claims were wrong or half-wrong (see `docs/LESSONS.md` 2026-10-01). Fixed, with tests where behavior changed:
+- Playlist continuation pages returned every video twice (`parsePlaylistVideos`; reproduced 3 videos -> 6 entries). Latent: no caller asks for >100 videos. `test/playlist-extractor.test.mjs`.
+- Tier 0 / Tier 0.1 ignored `translate` (see #3 note). `test/android-translate.test.mjs`, `test/tier01-translate.test.mjs`.
+- `capturedTranscripts` never pruned (see #11 note). `test/prune-map.test.mjs`.
+- `weekly-canary.yml` never installed Playwright's browser, so a clean runner could not start the spec; checkout now `persist-credentials: false`.
+- `weekly-canary.mjs`: failure streak is saved BEFORE the `gh` call (verified with a deliberately invalid token), a failing `gh` call is reported and turns the job red instead of crashing, and the close-issue branch posts the report it wrote.
+- Unused `puppeteer` dependency (only two untracked, documented-stale scripts used it) and their dead npm scripts (`login`, `test-batch`) removed.
+- `YTSUB_CAPTURED_URL` handler now ignores messages without a string `url` instead of throwing.
+- Batch e2e spec now requires every selected video to have a subtitle when there is no `_errors.txt`.
+- False/stale comments corrected: `content.js` and `sniffer.js` described the deleted iframe relay; the `_enqueuePageLeg` comment claimed the failed caller times out; `fixtures.mjs` header claimed test-scoped while the code is worker-scoped (the README was right).
+- `.env.e2e.example` trailing newline.
+
+---
+
+### #18 — a page-leg executor that throws early leaves its caller hanging
+
+**Status: OPEN** · low · verified by `test/tab-pin.test.mjs` ("this caller is lost")
+
+If the executor inside `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` throws before its timer is created, the lock chain recovers but that call's promise never settles, so one batch worker waits forever. Tier code is not expected to throw there, so only the misleading comment was corrected. Fix: wrap the executor body so any throw calls `passThrough(null)`.

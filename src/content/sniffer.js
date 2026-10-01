@@ -351,19 +351,16 @@
 
     // === MAIN WORLD FETCHER ===
     // Handler for fetch requests from content script.
-    // NOTE: the content script (ISOLATED world) and this sniffer (MAIN world)
-    // have SEPARATE window objects — window.postMessage from one world never
-    // reaches the other's listener. So these three handlers also accept
-    // same-type messages arriving via the page's own event flow: the content
-    // script's postMessage lands in MAIN world (shared DOM event bus per
-    // frame), where this listener runs. Verified 2026-09-20: YTSUB_PROBE_PLAYER
-    // round-trips (WatchSeed logs real playerState), while direct
-    // ISOLATED→MAIN data reads do not.
+    // Observed 2026-09-20: a content-script postMessage reaches this MAIN-world
+    // listener (YTSUB_PROBE_PLAYER round-trips; WatchSeed logs the real
+    // playerState). What does NOT work from the ISOLATED world is script
+    // injection and direct reads of page variables.
     window.addEventListener('message', async (event) => {
-        // Do NOT filter by event.source: ISOLATED-world posts arrive with a
-        // different source than MAIN-world self-posts, and filtering would
-        // drop exactly the messages this bridge exists for. Type + requestId
-        // matching is the trust boundary (same as the capture listener).
+        // No event.source filter, deliberately NOT added until verified: how
+        // event.source appears across the ISOLATED/MAIN worlds is documented
+        // inconsistently (docs/LESSONS.md 2026-09-20 vs the round-trip above),
+        // and a wrong filter would silently drop the very messages this bridge
+        // exists for. Type + requestId matching is the trust boundary.
         const { type, url, requestId } = event.data || {};
 
         if (type === 'YTSUB_REQUEST_BACKFILL') {

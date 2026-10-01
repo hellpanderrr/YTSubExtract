@@ -24,8 +24,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   early-return (`test/watch-seed.test.mjs`), and Tier 1.7's wait-level
   fast-abort window math (`test/fast-abort.test.mjs`), manifest/DNR hygiene
   (`test/manifest-hygiene.test.mjs`), and the playlist
-  tier-chain order (`test/tier3-order.test.mjs` — needs
-  `--experimental-test-module-mocks`, supplied by `npm test`) — all pure node. Background modules are
+  tier-chain order (`test/tier3-order.test.mjs`) and translate gating (`test/tier01-translate.test.mjs`) — both need
+  `--experimental-test-module-mocks`, supplied by `npm test`; also `playlist-extractor`, `android-translate`, `prune-map`, `weekly-canary` — all pure node. Background modules are
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.

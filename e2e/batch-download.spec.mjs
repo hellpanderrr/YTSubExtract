@@ -116,6 +116,11 @@ test.describe('batch ZIP download', () => {
     // test playlist's videos happen to have accessible captions.
     expect(subtitleEntries.length + (errorReport ? 1 : 0)).toBeGreaterThan(0);
     expect(subtitleEntries.length).toBeLessThanOrEqual(selected);
+    // With no error report, nothing may be silently dropped: every selected
+    // video must have produced a subtitle file.
+    if (!errorReport) {
+      expect(subtitleEntries.length).toBe(selected);
+    }
 
     if (subtitleEntries.length === 0 && errorReport) {
       // All videos failed — surface why, so a genuine regression is not hidden

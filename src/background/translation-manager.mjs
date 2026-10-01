@@ -43,8 +43,10 @@ export class TranslationManager {
    * The trailing .catch is load-bearing: without it, a single executor that
    * throws before passThrough would leave _pageLegLock permanently rejected
    * and EVERY future page-leg would silently stall for the rest of the
-   * service worker's life (round-3 review finding). The failed leg's own
-   * caller still times out via its timer; the chain survives.
+   * service worker's life (round-3 review finding). The chain survives. The
+   * failed leg's own caller does NOT recover: if the executor throws before
+   * its timer is created, that caller's promise never settles (asserted in
+   * test/tab-pin.test.mjs). Tier code is not expected to throw there.
    */
   _enqueuePageLeg(fn) {
     this._pageLegLock = this._pageLegLock
@@ -2109,7 +2111,12 @@ export class TranslationManager {
     // Calls /youtubei/v1/next instead of /player to get engagement
     // panels, then extracts transcript via continuation token.
     // Different endpoint path may have different PoToken enforcement.
-    try {
+    // The panel transcript has no translation path (getTranscriptViaNext never
+    // reads its options), so a translated request skips it rather than
+    // returning source-language text labelled as translated.
+    if (translate) {
+      log('[Tier 0.1] Skipped: the /next panel transcript cannot be translated');
+    } else try {
       log('[Tier 0.1] Attempting /next engagement panel transcript...');
       const nextResult = await getTranscriptViaNext(videoId, sourceLang, {
         translate,

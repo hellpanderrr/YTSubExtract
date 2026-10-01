@@ -19,11 +19,12 @@
  *
  * Two design choices follow directly from the facts above (see docs/LESSONS.md):
  *
- *  1. The browser is launched TEST-scoped, once per test. Measured on this
- *     machine, launches issued from inside a running test were stable, while
- *     launches from worker-fixture setup crashed often. A test-scoped launch
- *     also makes `retries` work: Playwright does not recreate worker-scoped
- *     fixtures on retry, so a worker-scoped browser would stay dead.
+ *  1. The browser is launched WORKER-scoped, once per worker (see `_browser`
+ *     below), with a retry loop around the native startup crash. An earlier
+ *     design launched per test; `context.close()` does not synchronously
+ *     release the profile's SingletonLock on Windows, so each per-test launch
+ *     landed on a half-released profile (docs/LESSONS.md 2026-09-18). The
+ *     cost: Playwright does not recreate worker-scoped fixtures on retry.
  *
  *  2. Each run works on a FRESH COPY of a golden profile (`.e2e-profile-golden`,
  *     created by `npm run e2e:login`). Reusing one profile in place made a warm

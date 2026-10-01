@@ -46,8 +46,12 @@ jobs:
       CANARY_LIMIT: ${{ vars.CANARY_LIMIT }}
       CANARY_ATTEMPTS: ${{ vars.CANARY_ATTEMPTS }}
     steps:
+      # persist-credentials: false keeps the job token out of .git/config on a
+      # long-lived self-hosted machine; the canary needs no authenticated git.
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -56,6 +60,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # e2e/fixtures.mjs launches channel:'chromium'; npm ci does not install
+      # Playwright's browsers, so a clean runner could not start the spec at
+      # all (every run would read as FAILING). No-op when already installed.
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
 
       - name: Build extension
         run: npm run build
