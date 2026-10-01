@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 14 open, 1 fixed.
+Total: 15 open, 1 fixed.
 
 ---
 
@@ -82,6 +82,8 @@ env-gated, since the current un-gated config is the one producing the 4/6s.
 
 **Still not fixed** — no code change from this.
 
+**2026-10-01 — the driver looks like YouTube's bot-check state, not headless-ness:** headed runs on this machine today went 0/6, 0/6, 0/6, 4/6, 0/6, 0/6 (pre- and post-`5016f65` builds alike). The failing runs' service-worker logs show Tier 1 getting `LOGIN_REQUIRED` "Sign in to confirm you’re not a bot" on every client, 0 Tier 1 successes. That overshadows the headless-vs-headed correlation above (which was 0/2 vs 2/3 on a day the bot-check was apparently off). Still open; the useful next step is measuring how often the bot-check is on, not flag/UA experiments.
+
 ---
 
 ### #2 — dead embed-iframe tier weakened YouTube's framing protection and muted third-party embeds
@@ -148,6 +150,8 @@ Zero tests for `subtitle-formats.js`, the separate SRT/VTT/TXT copies in `main.m
 
 All four `.github/workflows` only build/publish, on Node 18; `npm test` needs Node >= 22.3 (`--experimental-test-module-mocks`). `package.json` has no `engines`, no coverage tool, no lint. Fix: a test workflow on Node >= 22.3 + `engines`.
 
+**2026-09-30:** `.github/workflows/test.yml` (Node 22, `npm ci`, `npm test`, `npm run build`) and `engines: >=22.3.0` added; the suite verified 59/59 on Node 22.3.0 locally and the YAML/`npm ci` validated. Stays OPEN until a first green run is observed on GitHub. Still open under this ID: no coverage tool, no lint, release workflows still on Node 18 without tests.
+
 ---
 
 ### #10 — page-forgeable messages into the pipeline (hardening)
@@ -195,3 +199,11 @@ content.js fires the scripting fallback (`DRIVE_PLAYER_MAIN`) after 6s if not fi
 **Status: OPEN** · low (architectural)
 
 Results, cache, pin and `_originalTabUrl` are memory-only. The 60s staleness guard recovers the UI but not the data or the tab restore.
+
+---
+
+### #16 — weekly canary conflates YouTube bot-check state with extraction failure
+
+**Status: OPEN** · medium · verified by local runs 2026-10-01
+
+`scripts/weekly-canary.mjs` fails a run when fewer than `CANARY_MIN_OK` subtitles are produced. On this machine that happened in 5 of 6 headed runs in one day, every time with the service worker's Tier 1 receiving "Sign in to confirm you’re not a bot" (curly apostrophe). A canary that mostly measures the runner IP's bot-check state will open issues for non-bugs and train people to ignore it. Fix: capture the SW console (`E2E_CONSOLE=1`, piped rather than inherited), classify a below-threshold run with bot-check hits as INCONCLUSIVE, keep inconclusive runs out of the consecutive-failure streak, and open a separate 'blocked for N weeks' issue. Needs unit tests for the new state machine branch.

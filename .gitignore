@@ -18,3 +18,7 @@ playwright-report/
 # local secrets / session artifacts (oauth client_secret, live PoToken probes)
 *oauth*.json
 YOUTUBE_POTOKEN_TRIALS.md
+
+# weekly canary scratch (scripts/weekly-canary.mjs)
+.canary-*.json
+.canary-body.md

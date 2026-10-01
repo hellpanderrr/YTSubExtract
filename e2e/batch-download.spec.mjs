@@ -129,6 +129,15 @@ test.describe('batch ZIP download', () => {
       });
     }
 
+    // Machine-readable outcome for scripts/weekly-canary.mjs, written BEFORE
+    // any strict assertion so a failing run still reports its counts.
+    if (process.env.E2E_RESULT_FILE) {
+      fs.writeFileSync(
+        process.env.E2E_RESULT_FILE,
+        JSON.stringify({ selected, subtitles: subtitleEntries.length, errorReport })
+      );
+    }
+
     // Opt-in stricter check for a known-good playlist.
     if (process.env.E2E_BATCH_EXPECT_SUCCESS === '1') {
       expect(subtitleEntries.length).toBe(selected);

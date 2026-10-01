@@ -3,6 +3,9 @@
   "version": "1.1.4",
   "description": "YouTube Subtitle Downloader with 3-tier fallback",
   "type": "module",
+  "engines": {
+    "node": ">=22.3.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build && vite build -c vite.config.content.js && vite build -c vite.config.sniffer.js",

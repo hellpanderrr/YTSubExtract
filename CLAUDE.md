@@ -29,6 +29,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
+  Needs **Node >= 22.3** (`engines`; `mock.module` — floor verified on
+  22.3.0). `.github/workflows/test.yml` runs `npm test` + `npm run build`
+  on every push/PR; the four release workflows still build on Node 18 and
+  do not run tests.
 
 ### E2E tests (Playwright, headless)
 
@@ -49,6 +53,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   passing silently.
 - `npm run e2e:smoke` — harness self-test only (no YouTube content needed)
 - `npm run e2e:headed` — run with a visible browser
+- `E2E_GOLDEN_DIR` relocates the golden login profile outside the checkout — required on any CI runner, because `actions/checkout` runs `git clean -ffdx` and deletes ignored in-workspace files. `scripts/weekly-canary.mjs` + `.github/workflows/weekly-canary.yml` are the self-hosted weekly batch canary; its result is dominated by YouTube's bot-check state until `docs/ISSUES.md` #16 is built (`docs/LESSONS.md` 2026-10-01).
 
 The test browser reaches YouTube through the system proxy — if that proxy is
 down, youtube.com fails with `net::ERR_CONNECTION_CLOSED` (which looks like a

@@ -40,8 +40,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const ROOT = path.resolve(__dirname, '..');
 export const EXTENSION_DIR = path.resolve(ROOT, 'dist');
-/** Signed-in profile created by `npm run e2e:login`. Never mutated by tests. */
-export const GOLDEN_PROFILE_DIR = path.resolve(ROOT, '.e2e-profile-golden');
+/**
+ * Signed-in profile created by `npm run e2e:login`. Never mutated by tests.
+ * E2E_GOLDEN_DIR relocates it outside the checkout: a CI runner's
+ * actions/checkout runs `git clean -ffdx` and would delete an ignored
+ * in-workspace profile (and the login with it) on every run.
+ */
+export const GOLDEN_PROFILE_DIR = process.env.E2E_GOLDEN_DIR
+  ? path.resolve(process.env.E2E_GOLDEN_DIR)
+  : path.resolve(ROOT, '.e2e-profile-golden');
 /** Throwaway working copy each run starts from. */
 export const PROFILE_DIR = path.resolve(ROOT, '.e2e-profile');
 export const DOWNLOAD_DIR = path.resolve(ROOT, '.e2e-downloads');

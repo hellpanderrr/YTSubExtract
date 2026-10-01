@@ -1,0 +1,72 @@
+name: Weekly playlist canary
+
+# Runs the REAL e2e batch download (real extension, real signed-in Chromium)
+# against a playlist where every video has captions, and opens ONE issue if it
+# keeps failing. Needs a SELF-HOSTED runner: GitHub-hosted runners have no
+# signed-in profile, and cookie-less requests get "Sign in to confirm you're
+# not a bot" (docs/LESSONS.md 2026-09-30).
+#
+# One-time setup on the runner machine:
+#   1. Register a runner with the labels used below (Settings > Actions > Runners).
+#      Run it INTERACTIVELY (run.cmd in a logged-in desktop session), not as a
+#      Windows service: the canary runs headed Chromium, and a service in
+#      session 0 has no desktop.
+#   2. Put a signed-in golden profile OUTSIDE the checkout and point at it:
+#      set E2E_GOLDEN_DIR=C:\ytsub-canary\golden (machine env var), then run
+#      `npm run e2e:login` once. It must be outside the workspace because
+#      actions/checkout runs `git clean -ffdx` and would delete it every week.
+#   3. Set repo variable CANARY_PLAYLIST_URL (and optionally CANARY_MIN_OK,
+#      CANARY_LIMIT, CANARY_ATTEMPTS).
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print gh issue commands instead of running them'
+        type: boolean
+        default: true
+
+concurrency:
+  group: weekly-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: [self-hosted, windows, ytsub-canary]
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANARY_PLAYLIST_URL: ${{ vars.CANARY_PLAYLIST_URL }}
+      CANARY_MIN_OK: ${{ vars.CANARY_MIN_OK }}
+      CANARY_LIMIT: ${{ vars.CANARY_LIMIT }}
+      CANARY_ATTEMPTS: ${{ vars.CANARY_ATTEMPTS }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build extension
+        run: npm run build
+
+      # Scheduled runs are real; a manual dispatch defaults to dry-run so
+      # trying the workflow out cannot open an issue.
+      - name: Run canary
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            node scripts/weekly-canary.mjs --dry-run
+          else
+            node scripts/weekly-canary.mjs
+          fi

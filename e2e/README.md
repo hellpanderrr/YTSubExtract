@@ -62,6 +62,8 @@ when its variable is unset.
 | `E2E_LL_EXPECT_SUCCESS` | private-playlist | Set to `0` to accept an accounted-for LL failure (default: require a real subtitle) |
 | `E2E_HEADED` | all | Set to `1` for a visible browser |
 | `E2E_CONSOLE` | all | Set to `1` to relay service-worker/page console output to test stdout, prefixed `[e2e:SW]` / `[e2e:PAGE]` (tier-log diagnosis; off by default) |
+| `E2E_GOLDEN_DIR` | all | Absolute path of the golden profile (default `.e2e-profile-golden/` in the repo). Set it outside the checkout on CI |
+| `E2E_RESULT_FILE` | batch-download | If set, the spec writes `{selected, subtitles, errorReport}` JSON there (used by `scripts/weekly-canary.mjs`) |
 
 Example:
 

@@ -584,6 +584,29 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   runs (seen 2026-09-29 as the "flaky" first attempt; `retries:1` masked it).
   Same root as the 2026-09-18 SingletonLock entry. Fix when next in there:
   retry the rm with `maxRetries`/`retryDelay` or swallow it.
+- **A cookie-less API canary is dead on arrival — YouTube bot-checks cold
+  InnerTube calls (2026-09-30).** Ran the Tier 1 `getSubtitles` path from
+  plain Node (no browser, no session) against 8 public videos, including
+  ordinary TED talks with manual captions: 7/8 returned `LOGIN_REQUIRED`
+  from IOS, MWEB and WEB alike, `reason: "Sign in to confirm you're not a
+  bot"`, from a normal home connection. Only `dQw4w9WgXcQ` succeeded (32
+  cues, 208s) and it is not a trustworthy control. So the earlier belief
+  that the ru/asr videos were "ASR-gated" (2026-09-20) was too narrow: cold
+  access is bot-checked broadly, and the extension works where cold Node
+  does not — plausibly because its requests carry the browser's cookies and
+  Chrome's network fingerprint (Node/undici's TLS+HTTP fingerprint differs);
+  cookies vs fingerprint was NOT separated. Consequences: (1) a weekly
+  COOKIE-LESS API canary on a GitHub-hosted runner cannot work — a
+  residential IP already fails (datacenter IPs untested); (2) hosted + a real
+  browser with an INJECTED session (Playwright storageState from a secret) is
+  UNTESTED, not disproven — the DPAPI dead end only covers copying a Windows
+  profile. Its risks are live cookies in CI, session expiry, and Google
+  flagging a home session used from a datacenter IP; a self-hosted runner
+  on the machine holding the golden profile avoids all three. NB the probe
+  was designed for hosted-runner convenience, not fidelity — it tested cold
+  requests the extension never makes; (3) any
+  future probe must print `playabilityStatus.reason`, not just `.status`, or
+  a bot-check and a real ASR/unplayable state look identical.
 - **A log-watching monitor must key on the runner's own summary line, not on
   generic words.** I armed one on `Error:`, which page/SW logs print
   constantly, so it fired minutes early and I briefly misread a still-running
@@ -647,3 +670,11 @@ append `✅ enforced by <path>` to that entry rather than removing it.
   blocking (~4.7-4.8min) and consistent with the removed per-video Tier 3
   tax, though the default e2e fixture's lack of SW-console capture means
   this is corroborating, not proof of ordering (the unit test is the proof).
+
+## 2026-10-01 (weekly canary built and run locally)
+
+- **`actions/checkout` would have deleted the e2e login every week.** The golden profile lives in the workspace (`.e2e-profile-golden/`, gitignored) and checkout defaults to `git clean -ffdx`, which removes ignored files. Fixed with an `E2E_GOLDEN_DIR` override honored by both `e2e/fixtures.mjs` and `e2e/login.mjs`, so the profile can live outside the checkout. Verified by pointing it at a nonexistent path and reading the fixture's own warning.
+- **The canary job works mechanically** (`scripts/weekly-canary.mjs`, run locally with `--dry-run`): retries, pass-if-any-attempt-clears-the-threshold, one issue only after two consecutive failing runs, comment-not-duplicate while open, close on pass. Decision logic is pure and mutation-tested (5/5 killed). A full job run is long: ~6 min per attempt, ~17 min for three.
+- **A subtitle-count threshold measures YouTube's bot-check state, not the extension.** Today on this machine (headed, real signed-in profile, same playlist) 1 of 6 runs reached 3+ subtitles. Every failing run's service-worker console shows Tier 1 getting `LOGIN_REQUIRED` with reason "Sign in to confirm you’re not a bot" (21 hits in one run, 0 Tier 1 successes) — note the CURLY apostrophe if you match that string. So a weekly canary on this IP would fail most weeks for reasons unrelated to the code. It needs an INCONCLUSIVE outcome (bot-check seen in the SW log -> kept out of the failure streak) plus a separate 'blocked for N weeks' signal. Not built; see `docs/ISSUES.md` #16.
+- **I nearly blamed my own commit on one lucky run.** Three failing `HEAD` runs, then the pre-change build passing 4/6, looked like a regression from `5016f65`. Bisecting (restored DNR rules: still 0/6) and then re-running the old build (0/6, same bot-check signature) showed the 4/6 was a flip, not a signal. What settled it was reading the failing run's own failure reason, not counting runs. Rule: when a flaky end-to-end result seems to implicate a change, repeat the BASELINE before bisecting, and read why the failing runs failed before reasoning from pass counts.
+- **Method that worked for the A/B:** swap only the runtime-affecting files (`manifest.json`, `rules.json`, `sniffer.js`) from the earlier commit with `git show <sha>:<path> > <path>`, rebuild, run the same harness, then `git checkout HEAD -- <those paths>` (safe only because they had no uncommitted edits). Never do this with files holding uncommitted work.

@@ -21,7 +21,10 @@ import readline from 'readline';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const PROFILE_DIR = path.resolve(ROOT, '.e2e-profile-golden');
+// Keep in sync with GOLDEN_PROFILE_DIR in fixtures.mjs (E2E_GOLDEN_DIR override).
+const PROFILE_DIR = process.env.E2E_GOLDEN_DIR
+  ? path.resolve(process.env.E2E_GOLDEN_DIR)
+  : path.resolve(ROOT, '.e2e-profile-golden');
 const EXTENSION_DIR = path.resolve(ROOT, 'dist');
 
 const AUTH_COOKIES = ['__Secure-1PSID', 'SAPISID', 'SID', '__Secure-3PSID'];
