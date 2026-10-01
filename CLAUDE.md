@@ -62,6 +62,40 @@ harness crash) while other sites load fine. Check the proxy before a run.
 Specs live in `e2e/`; see `e2e/README.md` for env vars and per-spec coverage.
 Harness gotchas and dead ends are logged in `docs/LESSONS.md`.
 
+## Code navigation: use graft first
+
+This repo is indexed by [graft](https://github.com/trailhq/Graft)
+(`@nanonets/graft`; a global `graft` is on PATH). Before grepping or reading
+whole files to find, understand, or scope a change in `src/`, `test/` or
+`e2e/`, ask the graph — it returns exact `file:line` and only the relevant
+code:
+
+- `graft ask "<question>" --source` — where does X live / how does Y flow
+  (narrow with `--in src/background/`)
+- `graft grep "<symbol>"` — every reference to a name you already know
+- `graft callers <symbol> --depth 2` — what depends on it; run this before
+  renaming, deleting, or changing a signature (`--depth all` for refactors)
+- `graft map` — orientation in an unfamiliar area
+
+Every graft command refreshes the graph itself, so no rebuild is needed after
+edits. `graft build` only (re)creates the local cache on a fresh clone —
+`/graft/` is gitignored; the wiring in `.claude/` and `.mcp.json` is what gets
+shared.
+
+Fall back to Grep/Read for non-code files (`docs/`, `manifest.json`,
+`rules.json`) and when `graft ask` reports only lexical matches
+("structural index: no entries for …") — use `graft grep` then.
+
+- **Never run `graft init` without `--agents claude --no-global --no-statusline`**
+  (and `DO_NOT_TRACK=1`). The defaults also write user-level hooks and MCP
+  entries and a project `statusLine`, which would hide the user's own
+  statusline. Its `--dry-run` listing ignores these flags and over-reports;
+  the real run was verified 2026-10-02 to leave `~/.claude/settings.json`
+  byte-identical. Telemetry is disabled in `~/.graft/telemetry.json`.
+- **Never run `npx graft`** — unscoped `graft` is an unrelated npm package
+  ("Full-Stack JavaScript Through Microservices"). Use `graft` or
+  `npx -y @nanonets/graft`.
+
 ## Coding gotchas (standing rules — recurred twice, see `docs/LESSONS.md`)
 
 - **Never use bare truthiness/`??`/`||` to mean "is this empty/absent?" on a
