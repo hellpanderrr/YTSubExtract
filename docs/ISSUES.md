@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 16 open, 3 fixed.
+Total: 17 open, 3 fixed.
 
 ---
 
@@ -251,3 +251,11 @@ If the executor inside `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` t
 **Status: OPEN** · medium · half-verified
 
 Raised by Pullfrog, round 3 on PR #2. **Verified in the code:** every `&tlang=` append in the batch paths is unconditional on `translate` — Tier 0.5 Auth's six strategies (`content.js` ~1689-1723), Tier 1 (`youtube-caption-extractor.js:611`) and the Tier 0 timedtext fallback (`:733`). `isTranslatable` is consulted only in the single-video path (`content.js:2352`). **Not verified** (rests on the bot's yt-dlp references): that YouTube returns the source or a damaged track when the target equals the track's own language or the track is not translatable, and that an 'auto' request picks the English track. Suspected effect: a 'translate to English' batch on an English track sends `lang=en&tlang=en` and may return source text labelled translated — the #3 mislabel, relocated. Fix: one shared guard (skip `tlang` when the track is not translatable or the target equals the track language, and label the result `translated: false` truthfully), with a test. Confirm YouTube's actual behaviour with one real request first.
+
+---
+
+### #20 — graft wiring: unpinned MCP package, baked local path, hook latency
+
+**Status: OPEN** · low-medium · verified 2026-10-02 (decision pending)
+
+Raised by Pullfrog on PR #2 and checked: (1) `.mcp.json` runs `npx -y @nanonets/graft mcp` unpinned, so anyone opening the repo in Claude Code executes whatever the package publishes — a remote-code path. It cannot simply be pinned to the version exercised here: the user's global `graft` is an unreleased local build (0.17.0, symlinked to `...\tools\graft-src`), `npm view @nanonets/graft@0.17.0` is a 404, and the registry has 0.16.0 and 0.18.0-0.21.1 (0.21.1 never run here). Options: use `graft mcp` (the global build, same as the hooks; no remote exec, a clone without graft just cannot start the server), pin 0.21.1 after a sandbox check, or leave it. (2) `.claude/helpers/graft-hooks.cjs` bakes `C:\Users\hellpanderrr\tools\graft-src\dist\claude` as its first candidate: a personal path in a public repo, and the hooks use the local build while the MCP server may use a different one. Removing it doubled hook latency (478 -> 1003 ms per call, measured), so it was left. Hooks fire on every prompt and many tool calls.

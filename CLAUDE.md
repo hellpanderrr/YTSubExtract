@@ -167,7 +167,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 | 4 | Page Context | — | Yes | Injects into page to get player response, multiple format fallbacks |
 | 0.5 Auth | Credentialed Fetch | Yes | Yes | Content script fetches watch page HTML with cookies, extracts ytInitialPlayerResponse captions |
 
-**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 1 (InnerTube chain) → Tier 3 (youtubei.js) → Tier 1.5 (embed page) → Tier 1.7 (player coercion) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch). Tier 3 runs *after* Tier 1 since 2026-09-27 (demoted: 0/12 successes across every available real run — order pinned by `test/tier3-order.test.mjs`). youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly (`'iOS'`, not `'IOS'`).
+**Playlist batch fallback order**: Tier 0 (Android bypass) → Tier 0.1 (/next panel) → Tier 1 (InnerTube chain) → Tier 3 (youtubei.js) → Tier 1.5 (embed page) → Tier 1.7 (player coercion) → **Tier 2C (Tab Navigation)** → Tier 0.5 Auth (credentialed fetch). Tier 3 runs *after* Tier 1 since 2026-09-27 (demoted: 0/12 successes across every available real run — order pinned by `test/tier3-order.test.mjs`). **Translated requests** (`translate: true`) skip Tiers 0.1, 1.7 and 2C (none can translate; Tier 0 takes its timedtext `&tlang=` path instead) and skip the watch-page seed, so they fall through to the translation-aware Tier 0.5 Auth (`test/tier01-translate.test.mjs`, `test/seed-translate.test.mjs`; open follow-up `docs/ISSUES.md` #19). youtubei.js `client_type` must match `CLIENTS[*].NAME` exactly (`'iOS'`, not `'IOS'`).
 
 ### Key Architectural Decisions
 
