@@ -1,9 +1,11 @@
 import { toSRT, toVTT, toTXT } from '../utils/subtitle-formats.js';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import { isPlaylistUrl, extractPlaylistId, fetchPlaylistVideos } from '../utils/playlist-extractor.js';
+import { extractVideoId, isYouTubeHost } from '../utils/video-url.js';
 
 const statusEl = document.getElementById('status');
 const statusIcon = document.getElementById('status-icon');
+const btnDiscardParked = document.getElementById('discard-parked-zip');
 const btnReset = document.getElementById('reset-btn');
 const langSelect = document.getElementById('lang-select');
 const btnSrt = document.getElementById('btn-srt');
@@ -35,6 +37,7 @@ const btnDownloadZip = document.getElementById('btn-download-zip');
 const playlistProgressEl = document.getElementById('playlist-progress');
 const progressFillEl = document.getElementById('progress-fill');
 const progressTextEl = document.getElementById('progress-text');
+const btnStopDownload = document.getElementById('btn-stop-download');
 const controlsEl = document.querySelector('.controls');
 
 // Playlist language controls
@@ -48,12 +51,13 @@ function setStatus(msg, type = 'info', loading = false) {
   statusEl.textContent = msg;
   statusEl.title = msg; // Tooltip for long text
   statusEl.style.color = type === 'error' ? '#d32f2f' : (type === 'success' ? '#2e7d32' : '#666');
-  
-  if (loading) {
-    statusIcon.classList.remove('hidden');
-  } else {
-    statusIcon.classList.add('hidden');
-  }
+
+  // CSS keys visibility off `.spinner.active` (`.spinner` itself is
+  // display:none); `hidden` is belt-and-braces. Toggling only `hidden` — as
+  // this did until 2026-09-25 — left the spinner invisible in EVERY loading
+  // state (playlist load, "Fetching languages…", batch start/progress).
+  statusIcon.classList.toggle('active', loading);
+  statusIcon.classList.toggle('hidden', !loading);
 }
 
 function showLogs(logs) {
@@ -108,6 +112,36 @@ function updateTranslationState() {
   }
 }
 
+/**
+ * Last-resort video-ID detection for YouTube URLs that carry no ID in the URL
+ * itself (e.g. /@channel/live). Reads the player from the MAIN world — the
+ * ISOLATED popup cannot touch page-JS expandos like getPlayerResponse.
+ * Returns null on any failure (no player, non-injectable tab, etc).
+ */
+async function probePageVideoId(tabId) {
+  if (tabId == null || !chrome.scripting) return null;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        try {
+          const p = document.getElementById('movie_player');
+          const r = (p && typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+          const id = r?.videoDetails?.videoId;
+          if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) return id;
+        } catch (e) { /* fall through */ }
+        const m = location.pathname.match(/^\/(?:live|shorts|embed|v)\/([A-Za-z0-9_-]{11})/);
+        return m ? m[1] : null;
+      },
+    });
+    return res?.result || null;
+  } catch (e) {
+    console.log('[Popup] probePageVideoId failed:', e.message);
+    return null;
+  }
+}
+
 async function init() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -134,38 +168,44 @@ async function init() {
       if (controlsEl) controlsEl.classList.add('hidden');
       playlistModeEl.classList.remove('hidden');
 
-      await loadPlaylistVideos(currentPlaylistId);
-
-      // Check if there's an active download for this playlist
-      await checkAndRestoreProgress();
-
-      // Enable download button only after confirming no active download
-      const selected = currentPlaylistVideos.filter(v => v.selected).length;
-      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
+      const videos = await loadPlaylistVideos(currentPlaylistId);
+      if (videos) {
+        await finalizePlaylistLoad(videos);
+      }
       return;
     }
-    
-    // Single video mode
-    if (url.hostname.includes('youtube.com') && url.searchParams.has('v')) {
-      currentVideoId = url.searchParams.get('v');
-      isPlaylistMode = false;
-      
-      // Don't trust tab.title immediately as it might be stale from previous video
-      currentVideoTitle = 'Loading title...';
 
-      // Show reset button
-      btnReset.style.display = 'flex';
-      setStatus(`Video found: ${currentVideoId}`);
-      
-      // Show single video controls, hide playlist UI
-      if (controlsEl) controlsEl.classList.remove('hidden');
-      playlistModeEl.classList.add('hidden');
-      
-      fetchLanguages(currentVideoId);
-    } else {
-      btnReset.style.display = 'none';
-      setStatus('Not a YouTube video or playlist page', 'error');
+    // Single video mode — accepts /watch?v=, /live/ID, /shorts/ID, /embed/ID
+    // and youtu.be/ID. If the URL carries no ID (e.g. /@channel/live), fall
+    // back to a MAIN-world probe of the player before giving up.
+    if (isYouTubeHost(url.hostname)) {
+      let videoId = extractVideoId(tab.url);
+      if (!videoId) {
+        videoId = await probePageVideoId(tab.id);
+      }
+
+      if (videoId) {
+        currentVideoId = videoId;
+        isPlaylistMode = false;
+
+        // Don't trust tab.title immediately as it might be stale from previous video
+        currentVideoTitle = 'Loading title...';
+
+        // Show reset button
+        btnReset.style.display = 'flex';
+        setStatus(`Video found: ${currentVideoId}`);
+
+        // Show single video controls, hide playlist UI
+        if (controlsEl) controlsEl.classList.remove('hidden');
+        playlistModeEl.classList.add('hidden');
+
+        fetchLanguages(currentVideoId);
+        return;
+      }
     }
+
+    btnReset.style.display = 'none';
+    setStatus('Not a YouTube video or playlist page', 'error');
   } catch (e) {
     setStatus('Error: ' + e.message, 'error');
   }
@@ -174,6 +214,9 @@ async function init() {
 async function loadPlaylistVideos(playlistId) {
   setStatus('Loading playlist videos...', 'info', true);
   btnDownloadZip.disabled = true;
+  playlistCountEl.textContent = 'Loading…';
+  playlistVideosEl.innerHTML =
+    '<div style="padding: 20px; text-align: center; color: #666;">Loading videos…</div>';
 
   try {
     console.log('[Popup] Fetching playlist:', playlistId);
@@ -184,29 +227,64 @@ async function loadPlaylistVideos(playlistId) {
     currentPlaylistTitle = result.title || '';
     currentPlaylistVideos = videos.map((v) => ({ ...v, selected: true }));
 
-    setStatus(`Loaded ${videos.length} videos${currentPlaylistTitle ? ' from "' + currentPlaylistTitle + '"' : ''}`, 'success');
     playlistCountEl.textContent = `${videos.length} videos`;
 
     renderPlaylistVideos();
     updateSelectedCount();
-    // Keep button disabled initially - will enable after checkAndRestoreProgress confirms no active download
+    // Keep button disabled until finalizePlaylistLoad confirms no active download
     btnDownloadZip.disabled = true;
 
-    // Fetch languages from first video to populate playlist language dropdown
-    if (videos.length > 0) {
-      await fetchPlaylistLanguages(videos[0].videoId);
-    }
-
-    // Populate target language dropdown for translation
-    populatePlaylistTargetLanguageSelect();
-
-    // Restore saved settings now that dropdowns are populated
-    loadPlaylistSettings();
-
+    return videos;
   } catch (e) {
     console.error('[Popup] Failed to load playlist:', e);
     setStatus('Failed to load playlist: ' + e.message, 'error');
     playlistCountEl.textContent = 'Error';
+    playlistVideosEl.innerHTML =
+      '<div style="padding: 20px; text-align: center; color: #d32f2f;">Failed to load playlist</div>';
+    return null;
+  }
+}
+
+/**
+ * Phase 2 of playlist init: language/settings fetch + progress restore, then
+ * enable the ZIP button and stamp the final status.
+ *
+ * These two awaits used to run SEQUENTIALLY behind a status that already said
+ * "Loaded N videos" — the reported grey-button-with-no-feedback window
+ * (2026-09-25). They are independent, so they now run in parallel and the
+ * status says what is actually happening ("Fetching languages…", spinner on).
+ *
+ * @param {Array} videos - videos returned by loadPlaylistVideos (non-null).
+ * @param {{reloaded?: boolean}} [opts]
+ */
+async function finalizePlaylistLoad(videos, { reloaded = false } = {}) {
+  const langReady = (async () => {
+    setStatus('Fetching languages…', 'info', true);
+    // Fetch languages from first video to populate playlist language dropdown
+    if (videos.length > 0) {
+      await fetchPlaylistLanguages(videos[0].videoId);
+    }
+    // Populate target language dropdown for translation
+    populatePlaylistTargetLanguageSelect();
+    // Restore saved settings now that dropdowns are populated
+    loadPlaylistSettings();
+  })();
+
+  // Restore may claim the status line (running/stopped/zip-delivery states);
+  // if so, never overwrite it with a generic "Loaded".
+  const statusOwned = await checkAndRestoreProgress();
+  await langReady;
+
+  const selected = currentPlaylistVideos.filter(v => v.selected).length;
+  btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
+
+  if (!statusOwned && currentDownloadId === null) {
+    const verb = reloaded ? 'Reloaded' : 'Loaded';
+    setStatus(
+      `${verb} ${videos.length} videos` +
+        (currentPlaylistTitle ? ' from "' + currentPlaylistTitle + '"' : ''),
+      'success'
+    );
   }
 }
 
@@ -219,13 +297,17 @@ async function fetchPlaylistLanguages(videoId) {
 
     if (response && response.success) {
       const { languages } = response.data;
-      populatePlaylistLanguageSelect(languages);
+      if (languages && languages.length > 0) {
+        populatePlaylistLanguageSelect(languages);
+        return;
+      }
     }
   } catch (e) {
     console.log('[Popup] Could not fetch languages for playlist:', e);
-    // Fallback to SUPPORTED_LANGUAGES
-    populatePlaylistLanguageSelect(SUPPORTED_LANGUAGES.map(l => ({ code: l.code, name: l.name })));
   }
+  // Fallback: always populate with full language list so the dropdown isn't empty
+  console.log('[Popup] Metadata failed, using full language list as fallback');
+  populatePlaylistLanguageSelect(SUPPORTED_LANGUAGES.map(l => ({ code: l.code, name: l.name })));
 }
 
 function populatePlaylistLanguageSelect(languages, selectedValue = 'auto') {
@@ -349,6 +431,11 @@ function resetDownloadState() {
   // Reset download tracking
   currentDownloadId = null;
   releaseZipDownloadLock();
+  // Reset stop button for the next batch
+  if (btnStopDownload) {
+    btnStopDownload.disabled = false;
+    btnStopDownload.textContent = 'Stop';
+  }
 }
 
 /**
@@ -371,6 +458,107 @@ function tryAcquireZipDownloadLock() {
 function releaseZipDownloadLock() {
   isDownloadingZip = false;
 }
+
+/**
+ * Staleness guard: a non-terminal progress record whose writer has been
+ * silent longer than STALE_PROGRESS_MS means the service worker died
+ * mid-batch (or a stop was lost) — nothing will ever update it again.
+ * Treat it as 'stopped' so the UI (Download button, polling) recovers
+ * instead of soft-locking on this playlist forever.
+ */
+const STALE_PROGRESS_MS = 60000;
+function effectiveProgress(p) {
+  if (!p || !p.status) return p;
+  const terminal = p.status === 'completed' || p.status === 'error' || p.status === 'stopped';
+  if (terminal) return p;
+  // Records with NO updatedAt are pre-upgrade (orphaned by a version that
+  // predates the stamp) — treat them as stale too, else a stuck 'running'
+  // from before the upgrade survives forever, which is the exact soft-lock
+  // this guard exists to break.
+  if (!p.updatedAt || Date.now() - p.updatedAt > STALE_PROGRESS_MS) {
+    return { ...p, status: 'stopped', stale: true };
+  }
+  return p;
+}
+
+/**
+ * Stopped-state ZIP recovery: when chrome.downloads.download failed during a
+ * stop, the partial ZIP is parked in storage under downloadId. Deliver it
+ * (downloadCompletedZip also schedules the storage-key cleanup) before the
+ * progress record is cleared, otherwise the key is orphaned forever.
+ * Pre-checks storage so the 0-success stop (no ZIP at all) doesn't flash
+ * downloadCompletedZip's "Failed to download ZIP" error.
+ * Returns tri-state:
+ *   'none'      — nothing parked (safe to clear the progress record)
+ *   'delivered' — parked ZIP handed to the browser (safe to clear)
+ *   'failed'    — parked ZIP exists but delivery failed: DO NOT clear the
+ *                 record, or the only pointer to the ZIP is lost forever.
+ */
+async function recoverStoppedZip(progress) {
+  if (progress.swDownloaded || progress.stoppedSaved || !progress.downloadId) return 'none';
+  try {
+    const result = await chrome.storage.local.get(progress.downloadId);
+    if (!result[progress.downloadId]) return 'none';
+  } catch (e) {
+    console.log('[Popup] Storage check for stopped ZIP failed:', e.message);
+    return 'none';
+  }
+  if (!tryAcquireZipDownloadLock()) {
+    // Contention: another delivery is in progress — that is NOT "nothing
+    // parked". Report 'failed' so the caller keeps the record until the
+    // in-flight delivery decides (success clears, failure keeps).
+    return 'failed';
+  }
+  try {
+    // Swallows its own errors internally and returns whether it delivered.
+    const delivered = await downloadCompletedZip(progress.downloadId);
+    if (!delivered) {
+      appendPlaylistLog('Stored partial ZIP existed but delivery FAILED — progress kept for retry');
+    }
+    return delivered ? 'delivered' : 'failed';
+  } finally {
+    releaseZipDownloadLock();
+  }
+}
+
+// ── #14: dismiss affordance for a permanently undeliverable parked ZIP ──
+// Failed-delivery paths keep the progress record forever (it is the only
+// pointer to the parked ZIP — retry runs on every popup open). Correct for
+// transient failures, but a missing/corrupt key would retry-and-fail forever
+// with no way out. This button is the explicit intent to abandon: drop the
+// parked key AND the record.
+let parkedZipDownloadId = null;
+
+function showParkedZipDiscard(downloadId) {
+  if (!downloadId) return; // no parked key possible without a downloadId
+  parkedZipDownloadId = downloadId;
+  btnDiscardParked?.classList.remove('hidden');
+}
+
+function hideParkedZipDiscard() {
+  parkedZipDownloadId = null;
+  btnDiscardParked?.classList.add('hidden');
+}
+
+btnDiscardParked?.addEventListener('click', async () => {
+  const downloadId = parkedZipDownloadId;
+  if (!downloadId) return;
+  btnDiscardParked.disabled = true;
+  try {
+    // The 5-minute key cleanup only ever runs on successful delivery, so an
+    // abandoned key must be removed explicitly before clearing the record.
+    await chrome.storage.local.remove(downloadId);
+    await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+    hideParkedZipDiscard();
+    setStatus('Stored ZIP discarded', 'success');
+    appendPlaylistLog('Stored ZIP discarded — record cleared');
+  } catch (err) {
+    console.error('[Popup] Discard failed:', err);
+    setStatus('Discard failed: ' + err.message, 'error');
+  } finally {
+    btnDiscardParked.disabled = false;
+  }
+});
 
 async function downloadPlaylistSubtitles() {
   // Prevent concurrent downloads
@@ -408,6 +596,17 @@ async function downloadPlaylistSubtitles() {
   btnDownloadZip.disabled = true;
   playlistProgressEl.classList.remove('hidden');
 
+  // Capture the tab the user is on RIGHT NOW: the background pins this as
+  // the batch's driver tab. Resolving "active tab" later (after a cold
+  // service-worker wake) could pick a tab the user switched to meanwhile.
+  let clickTabId = null;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    clickTabId = tab?.id ?? null;
+  } catch (e) {
+    console.warn('[Popup] Could not capture click-time tab:', e.message);
+  }
+
   try {
     // Start batch download in background
     console.log('[Popup] Sending BATCH_DOWNLOAD_PLAYLIST message...');
@@ -416,6 +615,7 @@ async function downloadPlaylistSubtitles() {
       videos: selectedVideos,
       playlistId: currentPlaylistId,
       playlistTitle: currentPlaylistTitle,
+      tabId: clickTabId,
       options: {
         format,
         sourceLang,
@@ -452,21 +652,30 @@ async function downloadPlaylistSubtitles() {
   }
 }
 
+/**
+ * Restore any persisted batch state into the UI.
+ * @returns {Promise<boolean>} statusOwned — true when this function claimed the
+ * status line (any running/stopping/stopped/completed/error branch, plus the
+ * zip-lock-skip path, where polling owns the line). Callers must NOT stamp a
+ * generic "Loaded…" over an owned status.
+ */
 async function checkAndRestoreProgress() {
+  let statusOwned = false;
   try {
     const response = await chrome.runtime.sendMessage({
       type: 'GET_DOWNLOAD_PROGRESS'
     });
 
-    if (!response || !response.success) return;
+    if (!response || !response.success) return false;
 
-    const progress = response.data;
-    if (!progress || progress.playlistId !== currentPlaylistId) return;
+    const progress = effectiveProgress(response.data);
+    if (!progress || progress.playlistId !== currentPlaylistId) return false;
     // Also verify downloadId to avoid restoring stale batches
-    if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return;
+    if (progress.downloadId && currentDownloadId && progress.downloadId !== currentDownloadId) return false;
 
     // If there's an active or completed download, restore UI
-    if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error') {
+    if (progress.status === 'running' || progress.status === 'completed' || progress.status === 'error' ||
+        progress.status === 'stopping' || progress.status === 'stopped') {
       console.log('[Popup] Restoring progress:', progress);
 
       // Show progress UI
@@ -490,38 +699,89 @@ async function checkAndRestoreProgress() {
         }
         startProgressPolling(progress.total);
         setStatus(`Downloading... ${progress.completed}/${progress.total}`, 'info', true);
+        statusOwned = true;
+      } else if (progress.status === 'stopping') {
+        if (progress.downloadId) {
+          currentDownloadId = progress.downloadId;
+        }
+        btnStopDownload.disabled = true;
+        btnStopDownload.textContent = 'Stopping…';
+        startProgressPolling(progress.total);
+        setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
+        statusOwned = true;
+      } else if (progress.status === 'stopped') {
+        const recovery = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recovery === 'delivered';
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${saved ? ' (partial ZIP saved)' : ''}`, 'info');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+        try {
+          // Never clear when a parked ZIP failed to deliver — the record is
+          // the only pointer to it (retry happens on next popup open).
+          if (recovery !== 'failed') {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
+          }
+        } finally {
+          resetDownloadState();
+        }
+        return true;
       } else if (progress.status === 'completed' && progress.downloadId) {
-        // Completed — download ZIP (auto-download flow not implemented)
+        if (progress.swDownloaded) {
+          // SW already downloaded the file
+          console.log('[Popup] Restoring completed state (SW downloaded)');
+          setStatus(`Saved! ${progress.completed - (progress.failed || 0)}/${progress.total} subtitles`, 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          resetDownloadState();
+          return true;
+        }
         // Atomic guard: acquire lock or skip
         if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress from polling, skipping');
-          return;
+          // Polling owns the status line here (it will report the delivery).
+          return true;
         }
 
         try {
-          await downloadCompletedZip(progress.downloadId);
-          // Only clear if download initiated successfully
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          const delivered = await downloadCompletedZip(progress.downloadId);
+          if (delivered) {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            // Keep the record — it is the only pointer to the parked ZIP.
+            setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
+          }
         } catch (err) {
           console.error('[Popup] Failed to handle completed ZIP:', err);
         } finally {
           resetDownloadState();
         }
+        // downloadCompletedZip always stamps a status (delivered or failed).
+        statusOwned = true;
       } else if (progress.status === 'error') {
         // Error occurred
         setStatus(`Download failed: ${progress.error || 'Unknown error'}`, 'error');
         btnDownloadZip.disabled = false;
         playlistProgressEl.classList.add('hidden');
-        
+
         try {
           await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
         } finally {
           resetDownloadState();
         }
+        statusOwned = true;
       }
+      // `completed` WITHOUT downloadId falls through every branch and sets no
+      // status — statusOwned stays false so the caller may stamp its own.
     }
+    return statusOwned;
   } catch (err) {
     console.error('[Popup] Failed to restore progress:', err);
+    return statusOwned;
   }
 }
 
@@ -555,7 +815,7 @@ function startProgressPolling(totalVideos) {
         return;
       }
 
-      const progress = response.data;
+      const progress = effectiveProgress(response.data);
       console.log('[Popup] Got progress:', progress);
 
       if (!progress) {
@@ -594,6 +854,12 @@ function startProgressPolling(totalVideos) {
           }
           setStatus(`Downloading... ${progress.completed}/${progress.total} (${progress.failed || 0} failed)`, 'info', true);
         }
+
+        if (progress.status === 'stopping') {
+          btnStopDownload.disabled = true;
+          btnStopDownload.textContent = 'Stopping…';
+          setStatus(`Stopping… ${progress.completed}/${progress.total}`, 'info', true);
+        }
       } else {
         console.log('[Popup] Total is 0, cannot calculate progress');
       }
@@ -609,6 +875,17 @@ function startProgressPolling(totalVideos) {
           appendPlaylistLog(`Failed: ${progress.failed}`);
         }
 
+        if (progress.swDownloaded) {
+          // SW already triggered the download via chrome.downloads.download
+          appendPlaylistLog('ZIP saved via browser download');
+          setStatus(`Saved! ${progress.completed - (progress.failed || 0)}/${progress.total} subtitles`, 'success');
+          btnDownloadZip.disabled = false;
+          playlistProgressEl.classList.add('hidden');
+          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          resetDownloadState();
+          return;
+        }
+
         // Atomic guard: acquire lock or skip
         if (!tryAcquireZipDownloadLock()) {
           console.log('[Popup] ZIP download already in progress, skipping');
@@ -618,16 +895,60 @@ function startProgressPolling(totalVideos) {
 
         try {
           appendPlaylistLog('Downloading ZIP file...');
-          await downloadCompletedZip(progress.downloadId);
-          appendPlaylistLog('ZIP download completed');
-          // Only clear if download initiated successfully
-          await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          const delivered = await downloadCompletedZip(progress.downloadId);
+          if (delivered) {
+            appendPlaylistLog('ZIP download completed');
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            appendPlaylistLog('ZIP delivery FAILED — progress kept for retry on next popup open');
+            setStatus('ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
+          }
         } catch (err) {
           console.error('[Popup] Polling completion error:', err);
           appendPlaylistLog(`Error downloading ZIP: ${err.message}`);
         } finally {
           resetDownloadState();
         }
+      }
+
+      // Check if stopped by the user
+      if (progress.status === 'stopped') {
+        clearInterval(progressCheckInterval);
+        progressCheckInterval = null;
+
+        const recovery = await recoverStoppedZip(progress);
+        const saved = progress.swDownloaded || progress.stoppedSaved || recovery === 'delivered';
+
+        appendPlaylistLog(`=== Download Stopped ===`);
+        if (progress.stale) {
+          appendPlaylistLog('Progress record was stale (service worker went quiet) — recovered as stopped');
+        }
+        appendPlaylistLog(`Progress: ${progress.completed}/${progress.total}`);
+        if (progress.failed > 0) {
+          appendPlaylistLog(`Failed before stop: ${progress.failed}`);
+        }
+        if (saved) {
+          appendPlaylistLog('Partial ZIP saved to Downloads');
+        }
+
+        setStatus(`Stopped — ${progress.completed}/${progress.total} done${saved ? ' (partial ZIP saved)' : ''}`, 'info');
+        btnDownloadZip.disabled = false;
+        playlistProgressEl.classList.add('hidden');
+
+        try {
+          // Never clear when a parked ZIP failed to deliver — the record is
+          // the only pointer to it (retry happens on next popup open).
+          if (recovery !== 'failed') {
+            await chrome.runtime.sendMessage({ type: 'CLEAR_DOWNLOAD_PROGRESS' });
+          } else {
+            setStatus('Stopped — ZIP could not be delivered; reopen the popup to retry', 'error');
+            showParkedZipDiscard(progress.downloadId);
+          }
+        } finally {
+          resetDownloadState();
+        }
+        return;
       }
 
       // Check if error occurred
@@ -692,8 +1013,10 @@ async function downloadCompletedZip(downloadId) {
       `Downloaded successfully!`,
       'success'
     );
+    // A previously shown discard affordance is moot now (#14).
+    hideParkedZipDiscard();
 
-    // DEFERRED CLEANUP: Wait 5 minutes before removing from storage 
+    // DEFERRED CLEANUP: Wait 5 minutes before removing from storage
     // to ensure user had time to save it even if OS was slow.
     setTimeout(async () => {
       try {
@@ -704,8 +1027,10 @@ async function downloadCompletedZip(downloadId) {
       }
     }, 300000);
 
+    return true;
   } catch (err) {
     setStatus('Failed to download ZIP: ' + err.message, 'error');
+    return false;
   } finally {
     btnDownloadZip.disabled = false;
     playlistProgressEl.classList.add('hidden');
@@ -726,6 +1051,26 @@ selectAllCheck?.addEventListener('change', (e) => {
 });
 
 btnDownloadZip?.addEventListener('click', downloadPlaylistSubtitles);
+
+// Stop an in-progress batch download (cooperative — background cancels at
+// its next checkpoint and reports status 'stopping' → 'stopped').
+btnStopDownload?.addEventListener('click', async () => {
+  btnStopDownload.disabled = true;
+  btnStopDownload.textContent = 'Stopping…';
+  appendPlaylistLog('Stop requested — cancelling remaining videos...');
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'STOP_BATCH_DOWNLOAD' });
+    if (!resp?.success) {
+      appendPlaylistLog(`Stop failed: ${resp?.error || 'no response'}`);
+      btnStopDownload.disabled = false;
+      btnStopDownload.textContent = 'Stop';
+    }
+  } catch (err) {
+    appendPlaylistLog(`Stop error: ${err.message}`);
+    btnStopDownload.disabled = false;
+    btnStopDownload.textContent = 'Stop';
+  }
+});
 
 // Playlist translation toggle
 function updatePlaylistTranslationState() {
@@ -808,7 +1153,9 @@ playlistTranslateLang?.addEventListener('change', savePlaylistSettings);
 playlistLangSelect?.addEventListener('change', savePlaylistSettings);
 playlistFormatSelect?.addEventListener('change', savePlaylistSettings);
 
-// Note: loadPlaylistSettings is now called after dropdowns are populated in loadPlaylistVideos
+// Note: loadPlaylistSettings is called from finalizePlaylistLoad, after the
+// language dropdowns are populated (restoring a source language needs the
+// options to exist).
 
 async function fetchLanguages(videoId) {
   setStatus('Fetching languages...', 'info', true);
@@ -1050,15 +1397,12 @@ btnReset.addEventListener('click', async () => {
       currentPlaylistVideos = [];
       resetDownloadState();
 
-      // Re-fetch playlist
-      await loadPlaylistVideos(currentPlaylistId);
-      await checkAndRestoreProgress();
-
-      // Enable download button if appropriate
-      const selected = currentPlaylistVideos.filter(v => v.selected).length;
-      btnDownloadZip.disabled = (selected === 0) || (currentDownloadId !== null);
-
-      setStatus(`Reloaded ${currentPlaylistVideos.length} videos`, 'success');
+      // Re-fetch playlist; on failure loadPlaylistVideos has already stamped
+      // the error status — do NOT clobber it with "Reloaded 0 videos".
+      const videos = await loadPlaylistVideos(currentPlaylistId);
+      if (videos) {
+        await finalizePlaylistLoad(videos, { reloaded: true });
+      }
     } catch (e) {
       setStatus('Reload failed: ' + e.message, 'error');
       console.error(e);

@@ -2,7 +2,7 @@
 // === UNIVERSAL TRANSLATION MANAGER ===
 // Handles all 3 libraries + YouTube Native API
 
-import { getSubtitles, getLanguages, getVideoInfo } from '../utils/youtube-caption-extractor.js';
+import { getSubtitles, getLanguages, getVideoInfo, getTranscriptViaAndroid, getTranscriptViaNext } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
 import he from 'he';
@@ -16,6 +16,88 @@ export class TranslationManager {
     // Deduplication maps to prevent concurrent duplicate requests
     this.pendingMetadataRequests = new Map(); // key: videoId -> Promise
     this.pendingTranscriptRequests = new Map(); // key: videoId:lang:translate:targetLang -> Promise
+
+    // Page-leg lock: ONE lock for every operation that drives the batch's
+    // pinned tab (Tier 1.5 embed inject, Tier 1.7 player coercion, Tier 2C
+    // tab navigation). The previous pair (_coerceLock / _tabNavLock) let a
+    // 1.7 loadVideoById race a 2C navigation on the same tab under
+    // concurrency 3 — one shared tab gets one shared mutex.
+    this._pageLegLock = Promise.resolve();
+
+    // Original tab URL before tab navigation (used to restore after batch)
+    this._originalTabUrl = null;
+
+    // Batch-pinned driver tab: seedWatchPage records the tab the user was on
+    // when they clicked Download, and every mutating page-leg (1.5 inject,
+    // 1.7 coercion, 2C navigation, restore) drives THAT tab — never whichever
+    // YouTube tab happens to be active when the call runs. Null outside batch.
+    this._batchTabId = null;
+
+    // Cooperative batch cancellation (Stop button). Checked before starting
+    // page-leg tiers and while waiting on their locks/polls.
+    this._batchCancelled = false;
+  }
+
+  /**
+   * Queue one page-leg operation on the shared lock chain.
+   * The trailing .catch is load-bearing: without it, a single executor that
+   * throws before passThrough would leave _pageLegLock permanently rejected
+   * and EVERY future page-leg would silently stall for the rest of the
+   * service worker's life (round-3 review finding). The chain survives. The
+   * failed leg's own caller does NOT recover: if the executor throws before
+   * its timer is created, that caller's promise never settles (asserted in
+   * test/tab-pin.test.mjs). Tier code is not expected to throw there.
+   */
+  _enqueuePageLeg(fn) {
+    this._pageLegLock = this._pageLegLock
+      .then(fn)
+      .catch((e) => {
+        console.error('[PageLeg] page-leg threw — lock chain recovered:', e);
+      });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Resolve the tab for a MUTATING page-leg call.
+  // Prefers the batch-pinned tab; falls back to active-or-first only when
+  // no pin is set (single video) or the pinned tab was CLOSED mid-batch.
+  // The pin is validated as a YouTube tab when it is set (batch start);
+  // after that a URL mismatch is NOT released — the batch's own navigations
+  // and transient url states (mid-nav, nocookie) must not drop the pin,
+  // which would revert the whole batch to follow-the-focus behavior.
+  // ─────────────────────────────────────────────────────────────
+  _resolvePageLegTab() {
+    return new Promise((resolve) => {
+      // rePin: set only when we got here via PIN DEATH mid-batch — the
+      // replacement must become the new pin, otherwise every later leg and
+      // the final restore re-follow the user's focus (the original bug).
+      const pickFallback = (tabs, rePin) => {
+        const pick = tabs.length ? (tabs.find((t) => t.active) || tabs[0]) : null;
+        if (pick && rePin) {
+          this._batchTabId = pick.id;
+          // Restore must return THIS tab to ITS OWN page — not dead tab's
+          // URL (round-3 review: re-pin without re-capture navigates the
+          // replacement tab to a playlist the user never had there).
+          if (pick.url) this._originalTabUrl = pick.url;
+          console.log(`[PageLeg] Re-pinned driver tab to ${pick.id} after pin death (restore target: ${this._originalTabUrl})`);
+        }
+        resolve(pick);
+      };
+
+      if (this._batchTabId == null) {
+        chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => pickFallback(tabs, false));
+        return;
+      }
+      const pinnedId = this._batchTabId;
+      chrome.tabs.get(pinnedId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          console.log(`[PageLeg] Pinned tab ${pinnedId} gone (${chrome.runtime.lastError?.message || 'closed'}), re-resolving`);
+          this._batchTabId = null;
+          chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => pickFallback(tabs, true));
+          return;
+        }
+        resolve(tab);
+      });
+    });
   }
 
   /**
@@ -48,10 +130,14 @@ export class TranslationManager {
     if (videoId) {
       // Clear metadata
       this.cache.delete(`metadata:${videoId}`);
-      
-      // Clear transcripts for this video
+
+      // Clear transcripts for this video — and its batch entries
+      // (playlist:<id>:<lang>:...): playlist-mode Reset sends no CLEAR_CACHE
+      // at all, so this loop is the ONLY per-video clear path a batch cache
+      // ever gets. The colon delimiter keeps the prefix match exact.
       for (const key of this.cache.keys()) {
-        if (key.startsWith(`transcript:${videoId}`)) {
+        if (key.startsWith(`transcript:${videoId}`) ||
+            key.startsWith(`playlist:${videoId}:`)) {
           this.cache.delete(key);
         }
       }
@@ -133,7 +219,475 @@ export class TranslationManager {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // TIER 0: Network Sniffer (captured URLs)
+  // TIER 0.5 Auth: Credentialed Playlist Page Fetch
+  // Used as final fallback for private playlists (e.g. LL) where
+  // all unauthenticated API clients return "does not exist".
+  // Requires an active YouTube tab so the content script can fetch
+  // the playlist page with session cookies.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchPlaylistPageAuth(playlistId) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Auth] No YouTube tab found');
+          return resolve(null);
+        }
+
+        // Prefer active tab, fall back to any YouTube tab
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timeout = setTimeout(() => {
+          console.log('[Tier 0.5 Auth] Timeout');
+          resolve(null);
+        }, 10000);
+
+        chrome.tabs.sendMessage(tab.id, { type: 'FETCH_PLAYLIST_PAGE', playlistId }, (response) => {
+          clearTimeout(timeout);
+
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Auth] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            console.log('[Tier 0.5 Auth] Failed:', response?.error || 'Unknown error');
+            return resolve(null);
+          }
+
+          console.log(`[Tier 0.5 Auth] Success: ${response.videos?.length || 0} videos, title: ${response.title}`);
+          resolve({
+            videos: response.videos || [],
+            title: response.title || ''
+          });
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // TIER 0.5 Auth: Credentialed Transcript Fetch
+  // Used as final fallback for batch playlist downloads when
+  // API-only tiers fail with LOGIN_REQUIRED. Requires an active
+  // YouTube tab so the content script can fetch the watch page
+  // with session cookies and extract caption tracks.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchTranscriptAuth(videoId, options = {}) {
+    const { lang = 'auto', translate = false, translateLang = 'en' } = options;
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: '*://*.youtube.com/*' }, (tabs) => {
+        if (tabs.length === 0) {
+          console.log('[Tier 0.5 Auth Transcript] No YouTube tab found');
+          return resolve(null);
+        }
+
+        const tab = tabs.find(t => t.active) || tabs[0];
+        const timeout = setTimeout(() => {
+          console.log('[Tier 0.5 Auth Transcript] Timeout');
+          resolve(null);
+        }, 20000);
+
+        chrome.tabs.sendMessage(tab.id, {
+          type: 'FETCH_TRANSCRIPT_AUTH',
+          videoId,
+          lang,
+          translate,
+          translateLang
+        }, (response) => {
+          clearTimeout(timeout);
+
+          if (chrome.runtime.lastError) {
+            console.warn('[Tier 0.5 Auth Transcript] Runtime error:', chrome.runtime.lastError.message);
+            return resolve(null);
+          }
+
+          if (!response?.success) {
+            console.log('[Tier 0.5 Auth Transcript] Failed:', response?.error || 'Unknown error');
+            if (response?.logs) {
+              response.logs.forEach(l => console.log('[Content]', l));
+            }
+            return resolve(null);
+          }
+
+          if (response?.result && response.result.length > 0) {
+            console.log(`[Tier 0.5 Auth Transcript] Success: ${response.result.length} segments from ${response.source || 'unknown'}`);
+            resolve(response.result);
+          } else {
+            console.log('[Tier 0.5 Auth Transcript] Empty result');
+            resolve(null);
+          }
+        });
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // PLAYER COERCION (Pathway 1): Use native YT player
+  // Calls player.loadVideoById() + loadModule("captions") to force
+  // the real YouTube player to solve BotGuard and request timedtext.
+  // Requires an active YouTube tab with a initialized player.
+  // ─────────────────────────────────────────────────────────────
+  async _coercePlayerTranscript(videoId, options = {}) {
+    const { lang = 'auto', timeout = 25000 } = options;
+    // Serialize: every caller drives the same movie_player via loadVideoById.
+    return new Promise((resolve) => {
+      this._enqueuePageLeg(() => new Promise((innerResolve) => {
+        const passThrough = (result) => {
+          resolve(result);
+          innerResolve(result);
+        };
+        if (this._batchCancelled) {
+          console.log('[CoercePlayer] Batch stopped, skipping');
+          return passThrough(null);
+        }
+        this._resolvePageLegTab().then((tab) => {
+          if (!tab) {
+            console.log('[CoercePlayer] No YouTube tab found');
+            return passThrough(null);
+          }
+          const timer = setTimeout(() => {
+            console.log('[CoercePlayer] Timeout');
+            passThrough(null);
+          }, timeout);
+          chrome.tabs.sendMessage(tab.id, {
+            type: 'COERCE_PLAYER_TRANSCRIPT',
+            videoId,
+            lang: lang !== 'auto' ? lang : null,
+            desiredLang: lang !== 'auto' ? lang : null,
+            timeout: timeout - 2000
+          }, (response) => {
+            clearTimeout(timer);
+            if (chrome.runtime.lastError) {
+              console.warn('[CoercePlayer] Runtime error:', chrome.runtime.lastError.message);
+              return passThrough(null);
+            }
+            if (!response?.success) {
+              console.log('[CoercePlayer] Failed:', response?.error || 'Unknown error');
+              if (response?.logs) response.logs.forEach(l => console.log('[Content]', l));
+              return passThrough(null);
+            }
+            if (response?.result && response.result.length > 0) {
+              console.log(`[CoercePlayer] Success: ${response.result.length} segments`);
+              passThrough(response.result);
+            } else {
+              console.log('[CoercePlayer] Empty result');
+              passThrough(null);
+            }
+          });
+        });
+      }));
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // TAB NAVIGATION: Navigate tab to watch page, capture via sniffer
+  // Navigates an active YouTube tab to the video's watch page.
+  // The REAL YouTube player initializes, solves BotGuard, and requests
+  // timedtext with a valid PoToken. The sniffer captures the response.
+  // After extraction, navigates back to the original URL.
+  // ─────────────────────────────────────────────────────────────
+  async _fetchTranscriptViaTabNav(videoId, options = {}) {
+    const { timeout = 30000 } = options;
+    // Serialize via lock to prevent concurrent tab navigations
+    return new Promise((resolve) => {
+      this._enqueuePageLeg(() => new Promise((innerResolve) => {
+        const passThrough = (result) => {
+          resolve(result);
+          innerResolve(result);
+        };
+        if (this._batchCancelled) {
+          console.log('[TabNav] Batch stopped, skipping navigation');
+          return passThrough(null);
+        }
+        this._resolvePageLegTab().then((tab) => {
+        if (!tab) {
+          console.log('[TabNav] No YouTube tab found');
+          return passThrough(null);
+        }
+
+        const originalUrl = tab.url;
+
+        // Preserve playlist context by extracting list param from original URL
+        let watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        try {
+          const origUrlObj = new URL(originalUrl);
+          const listParam = origUrlObj.searchParams.get('list');
+          if (listParam) {
+            watchUrl += `&list=${listParam}`;
+          }
+        } catch (e) {
+          // Invalid URL, just use bare watch URL
+        }
+
+        // Save original URL on first navigation so we can restore it after batch
+        if (!this._originalTabUrl) {
+          this._originalTabUrl = originalUrl;
+        }
+
+        console.log(`[TabNav] Navigating tab ${tab.id} from ${originalUrl} to ${watchUrl}`);
+
+        let resolved = false;
+        let pollTimer = null;
+        let timeoutTimer = null;
+        let startTimer = null;
+
+        const cleanup = () => {
+          resolved = true;
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
+          if (startTimer) { clearTimeout(startTimer); startTimer = null; }
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+        };
+
+        timeoutTimer = setTimeout(() => {
+          if (resolved) { cleanup(); return; }
+          resolved = true;
+          console.log('[TabNav] Timeout');
+          cleanup();
+          passThrough(null);
+        }, timeout);
+
+        // Fast-abort: after navigation, check the player tracklist once
+        // settled. A confirmed-this-video response with 0 tracks means the
+        // page has nothing to capture — abort in ~10s instead of the full
+        // timeout. A videoId mismatch (mid-navigation response) is NOT
+        // settled and keeps polling. 0.5 Auth still runs afterwards (0.7s,
+        // independent path) so this aborts only the tab wait, not the video.
+        let settledZeroStreak = 0;
+        let probeInFlight = false;
+        const startPolling = () => {
+          // #7: a second `complete` (consent/redirect chains load the
+          // document twice) used to schedule another startPolling, and a
+          // second setInterval overwrote pollTimer — cleanup then cleared
+          // only the latest and the first kept POLLING forever, resetting
+          // the MV3 SW idle timer on every tick. Idempotent by construction:
+          // resolved → the leg is done; pollTimer → already polling.
+          if (resolved || pollTimer) return;
+          pollTimer = setInterval(() => {
+            if (this._batchCancelled && !resolved) {
+              console.log('[TabNav] Batch stopped, aborting wait');
+              resolved = true;
+              cleanup();
+              return passThrough(null);
+            }
+            chrome.tabs.sendMessage(tab.id, {
+              type: 'POLL_TRANSCRIPT',
+              videoId
+            }, (response) => {
+              if (chrome.runtime.lastError) return;
+              if (response?.success && response?.result?.length > 0) {
+                console.log(`[TabNav] Got ${response.result.length} segments`);
+                resolved = true;
+                cleanup();
+                passThrough(response.result);
+                return;
+              }
+              // Settled-with-0-tracks: the ISOLATED-side answer is always
+              // false (dead read), so confirm via the MAIN-world probe.
+              // Async — skip this tick if a probe is already in flight.
+              if (probeInFlight) return;
+              probeInFlight = true;
+              const checkSettled = response?.settledNoTracks === true
+                ? Promise.resolve(true)
+                : this._probeSettledNoTracks(tab.id, videoId)
+                    .then((r) => r.settled && r.trackCount === 0);
+              checkSettled.then((settledZero) => {
+                probeInFlight = false;
+                if (resolved) return;
+                if (settledZero) {
+                  settledZeroStreak++;
+                  if (settledZeroStreak >= 2) {
+                    console.log('[TabNav] Settled with 0 tracks, aborting wait (~10s, Auth still runs)');
+                    resolved = true;
+                    cleanup();
+                    passThrough(null);
+                  }
+                } else {
+                  settledZeroStreak = 0;
+                }
+              });
+            });
+          }, 800);
+        };
+
+        const onUpdated = (tabId, changeInfo) => {
+          if (tabId === tab.id && changeInfo.status === 'complete') {
+            // Replace any pending settle timer so only the LATEST load's
+            // 3s window survives; cleanup clears whatever is pending.
+            if (startTimer) clearTimeout(startTimer);
+            startTimer = setTimeout(() => {
+              startPolling();
+            }, 3000);
+          }
+        };
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        chrome.tabs.update(tab.id, { url: watchUrl });
+      });   // chrome.tabs.query
+    }));    // inner promise + _pageLegLock.then()
+  });       // outer promise
+}
+
+  /**
+   * MAIN-world probe: is the player settled on this video with 0 caption
+   * tracks? The ISOLATED-world POLL_TRANSCRIPT answer for this is dead code
+   * (content scripts cannot see page-JS expandos — proven 2026-09-20 and
+   * documented in content.js), so 2C's fast-abort reads the player here via
+   * chrome.scripting world:'MAIN' instead. Any failure = "not settled"
+   * (keeps polling; never a false abort).
+   */
+  async _probeSettledNoTracks(tabId, videoId) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: (vid) => {
+          const p = document.getElementById('movie_player');
+          const r = (p && typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+          if (!r || r.videoDetails?.videoId !== vid) return { settled: false };
+          const tracks = r.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+          return { settled: true, trackCount: tracks.length };
+        },
+        args: [videoId]
+      });
+      return res?.result || { settled: false };
+    } catch (e) {
+      return { settled: false };
+    }
+  }
+
+  /**
+   * Seed the active YouTube tab to a /watch page ONCE per batch so Tier 1.7
+   * player coercion has a real movie_player to drive via loadVideoById.
+   * No-op when the tab is already on /watch. Saves the pre-batch URL for
+   * restoreOriginalTab. Resolves true when a usable player is present.
+   */
+  async seedWatchPage(videoId, playlistId = null, timeout = 45000, sleepMs = 1000) {
+    const tab = await this._resolvePageLegTab();
+    if (!tab) {
+      console.log('[WatchSeed] No YouTube tab found');
+      return false;
+    }
+
+    // Pin THIS tab for the whole batch — later 1.7/2C/restore calls must
+    // keep driving it even if the user switches to another YouTube tab.
+    this._batchTabId = tab.id;
+
+    if (!this._originalTabUrl) this._originalTabUrl = tab.url;
+
+    // Pin this batch's video in the URL (autoplay=0 keeps YT from wandering
+    // to "up next" mid-batch — observed 2026-09-20: seed returned "ready"
+    // for jGg_1h0qzaM while coercing u-CLv5-hbqk). Re-navigate when the tab
+    // is not on our video, even if it is already a /watch page.
+    const wantUrl = (vid) => {
+      let url = `https://www.youtube.com/watch?v=${vid}&autoplay=0`;
+      if (playlistId) url += `&list=${playlistId}`;
+      return url;
+    };
+    const tabVid = (() => { try { return new URL(tab.url || '').searchParams.get('v'); } catch (e) { return null; } })();
+    if (tabVid !== videoId) {
+      const url = wantUrl(videoId);
+      console.log(`[WatchSeed] Navigating tab ${tab.id} once to ${url}`);
+      await chrome.tabs.update(tab.id, { url });
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(onUpdated);
+          resolve();
+        }, 30000);
+        const onUpdated = (tabId, changeInfo) => {
+          if (tabId === tab.id && changeInfo.status === 'complete') {
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(onUpdated);
+      });
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+
+    const probe = () => new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, { type: 'CHECK_PLAYER_READY' }, (resp) => {
+        if (chrome.runtime.lastError) {
+          return resolve({ __err: chrome.runtime.lastError.message });
+        }
+        resolve(resp || null);
+      });
+    });
+    const deadline = Date.now() + Math.max(timeout - 33000, 15000);
+    let lastErr = null;
+    // The seed's contract is a *usable* player (loadVideoById present), not
+    // an attested tracklist — the return is boolean, nothing consumes the
+    // track count. A seed video with no captions would otherwise burn the
+    // whole loop waiting for a tracklist that never arrives, so sustained
+    // API-ready returns early (same two-consecutive-agree shape as
+    // readUntilStable).
+    let readyStreak = 0;
+    while (Date.now() < deadline) {
+      const state = await probe();
+      if (state?.__err) {
+        readyStreak = 0;
+        // No listener on this tab (navigating / wrong target) — log verbatim
+        // so "messaging the wrong tab" is distinguishable from withheld tracks.
+        if (state.__err !== lastErr) {
+          console.log(`[WatchSeed] tab ${tab.id} probe error: ${state.__err}`);
+          lastErr = state.__err;
+        }
+      } else if (state?.ready === true && state?.hasCaptions === true) {
+        console.log(`[WatchSeed] Player ready with attested tracklist (${state.trackCount}: ${state.tracks.join(', ')})`);
+        return true;
+      } else if (state?.ready === true) {
+        readyStreak++;
+        console.log(`[WatchSeed] tab ${tab.id} API ready, no tracklist yet (state=${state.playerState}, page=${state.url})`);
+        if (readyStreak >= 2) {
+          console.log(`[WatchSeed] Player API ready, tracklist unconfirmed — proceeding (state=${state.playerState}, page=${state.url})`);
+          return true;
+        }
+      } else {
+        // Not-ready AND dropped (null) probes both break the streak: a gap
+        // is not evidence the player stayed ready across it.
+        readyStreak = 0;
+        if (state) console.log(`[WatchSeed] tab ${tab.id} hasPlayer=${state.hasPlayer} (page=${state.url})`);
+      }
+      await new Promise((r) => setTimeout(r, sleepMs));
+    }
+    // Best effort: the API may still serve even if the tracklist probe missed.
+    const last = await probe();
+    if (last?.__err) {
+      console.log(`[WatchSeed] Player never became ready (tab ${tab.id} probe error: ${last.__err})`);
+      return false;
+    }
+    console.log(last?.ready === true
+      ? `[WatchSeed] Player API ready, tracklist unconfirmed (state=${last.playerState}, tracks=${last.trackCount}, page=${last.url})`
+      : `[WatchSeed] Player never became ready (tab ${tab.id}, hasPlayer=${last?.hasPlayer}, page=${last?.url})`);
+    return last?.ready === true;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // RESTORE ORIGINAL TAB (after batch navigation is done)
+  // ─────────────────────────────────────────────────────────────
+  async restoreOriginalTab() {
+    const originalUrl = this._originalTabUrl;
+    this._originalTabUrl = null;
+    const pinnedId = this._batchTabId;
+    this._batchTabId = null;
+    this._batchCancelled = false;
+    if (!originalUrl) return;
+
+    try {
+      // Restore the tab the batch actually drove (the pin), not whichever
+      // YouTube tab happens to be active now.
+      const tab = (pinnedId != null)
+        ? await chrome.tabs.get(pinnedId).catch(() => null)
+        : await this._resolvePageLegTab();
+      if (!tab) return;
+      if (tab.url && tab.url.includes('/watch')) {
+        console.log(`[TabNav] Restoring tab ${tab.id} to original URL: ${originalUrl}`);
+        await chrome.tabs.update(tab.id, { url: originalUrl });
+      }
+    } catch (e) {
+      console.warn('[TabNav] Failed to restore tab:', e.message);
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────
   async _getCapturedUrl(videoId, lang) {
     return new Promise((resolve) => {
@@ -1026,7 +1580,10 @@ export class TranslationManager {
         
         const result = await getSubtitles({
           videoID: videoId,
-          lang: sourceLang !== 'auto' ? sourceLang : 'en',
+          // Pass 'auto' through: getSubtitles already resolves it to the first
+          // available track. Substituting 'en' here made videos whose only
+          // captions are in another language fail with "Language en not found".
+          lang: sourceLang,
           translate: translate,
           translateLang: translate ? targetLang : undefined
         });
@@ -1215,7 +1772,16 @@ export class TranslationManager {
           }
       }
 
-      const response = { 
+      // #5: never cache or return an empty transcript as success — every other
+      // tier length-checks before caching. JSON3 can parse with `events`
+      // present but no usable segs (brand-new video, cue-less ASR); returning
+      // [] here returned "Done!" + an empty .srt and poisoned the cache until
+      // Reset. Throwing lands in the catch below → next tier, nothing cached.
+      if (!result || result.length === 0) {
+        throw new Error('No usable segments in caption response');
+      }
+
+      const response = {
         source: 'tier3-native-bg', 
         result, 
         translated: translate, 
@@ -1459,8 +2025,15 @@ export class TranslationManager {
 
   // ─────────────────────────────────────────────────────────────
   // API-Only Tiers for Playlist Processing
-  // Optimized: Start with Tier 3 (youtubei.js) as primary - it's the only reliable method
-  // Tier 0.5/1/1.5 are deprecated as they all fail with PoToken requirements
+  // Tier 1 (InnerTube client chain) runs before Tier 3 (youtubei.js) as of
+  // 2026-09-27: the "Tier 3 primary, Tier 1/1.5 deprecated" claim this
+  // comment used to make was wrong — the user's own manual run got 4/6 real
+  // subtitles via Tier 1 IOS the same day Tier 3 went 0/6, and every batch
+  // run since (this session's two live diagnostic runs, plus the original
+  // console log) has Tier 3 at 0 successes. Demoted rather than removed
+  // (still tried, just after the tier that actually works) since a future
+  // youtubei.js upgrade could make it useful again — see docs/LESSONS.md
+  // 2026-09-27 for the full historic-green check.
   // ─────────────────────────────────────────────────────────────
   async getTranscriptForPlaylist(videoId, options = {}) {
     const { 
@@ -1475,7 +2048,7 @@ export class TranslationManager {
       logs.push(`[Playlist] ${msg}`);
     };
 
-    log(`Processing ${videoId} (optimized - Tier 3 primary)...`);
+    log(`Processing ${videoId} (Tier 1 primary, Tier 3 fallback)...`);
     log(`Source: ${sourceLang}, Translate: ${translate}, Target: ${targetLang}`);
 
     const cacheKey = `playlist:${videoId}:${sourceLang}:${translate}:${translate ? targetLang : ''}`;
@@ -1488,32 +2061,40 @@ export class TranslationManager {
 
     const errors = [];
 
-    // === TIER 3 (Primary): youtubei.js - the only reliable method for playlists ===
+    // Stop checkpoints: the Stop button sets _batchCancelled; every tier
+    // boundary below throws a `stopped` error (BatchProcessor does not count
+    // these as failures) instead of spending seconds on more tiers. The cache
+    // check above intentionally returns before the first checkpoint (#15): a
+    // cached lookup completes instantly, so there are no boundaries to guard.
+    const throwIfStopped = () => {
+      if (!this._batchCancelled) return;
+      log('[Batch] Stopped — aborting remaining tiers for this video');
+      const stopped = new Error(`Batch stopped for ${videoId}`);
+      stopped.logs = logs;
+      stopped.stopped = true;
+      throw stopped;
+    };
+    throwIfStopped();
+
+    // === TIER 0 (Primary): Android API Bypass ===
+    // ANDROID client often works without PoToken for /get_transcript.
+    // Uses player endpoint with ANDROID context to get params,
+    // then calls get_transcript to bypass PoToken enforcement.
     try {
-      log('[Tier 3] Attempting Innertube (primary)...');
-      
-      const tier3Options = {
-        lang: sourceLang,
-        translate: translate,
-        targetLang: targetLang
-      };
-      
-      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
-      
-      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
-        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
-        
-        const normalized = tier3Result.segments.map(s => ({
-          start: s.start,
-          duration: s.end - s.start,
-          text: s.text
-        }));
-        
+      log('[Tier 0] Attempting Android API bypass...');
+      const androidResult = await getTranscriptViaAndroid(videoId, sourceLang, {
+        translate,
+        translateLang: targetLang
+      });
+
+      if (androidResult && androidResult.segments && androidResult.segments.length > 0) {
+        log(`[Tier 0] Success! ${androidResult.segments.length} segments from ${androidResult.source}`);
+
         const response = {
-          source: 'tier3-playlist',
-          result: normalized,
+          source: androidResult.source || 'tier0-android',
+          result: androidResult.segments,
           translated: translate,
-          sourceLang: tier3Result.language || sourceLang,
+          sourceLang: androidResult.language || sourceLang,
           targetLang,
           logs
         };
@@ -1521,18 +2102,58 @@ export class TranslationManager {
         return response;
       }
     } catch (err) {
-      errors.push({ tier: 3, error: err.message });
-      log(`[Tier 3] Failed: ${err.message}`);
+      errors.push({ tier: 0, error: err.message });
+      log(`[Tier 0] Failed: ${err.message}`);
     }
 
-    // === FALLBACK: Try Tier 1 (updated client chain: IOS -> MWEB -> WEB_EMBEDDED) ===
-    // Only used if Tier 3 fails, for edge cases
+    throwIfStopped();
+    // === TIER 0.1: /next Endpoint → Engagement Panel Transcript ===
+    // Calls /youtubei/v1/next instead of /player to get engagement
+    // panels, then extracts transcript via continuation token.
+    // Different endpoint path may have different PoToken enforcement.
+    // The panel transcript has no translation path (getTranscriptViaNext never
+    // reads its options), so a translated request skips it rather than
+    // returning source-language text labelled as translated.
+    if (translate) {
+      log('[Tier 0.1] Skipped: the /next panel transcript cannot be translated');
+    } else try {
+      log('[Tier 0.1] Attempting /next engagement panel transcript...');
+      const nextResult = await getTranscriptViaNext(videoId, sourceLang, {
+        translate,
+        translateLang: targetLang
+      });
+
+      if (nextResult && nextResult.segments && nextResult.segments.length > 0) {
+        log(`[Tier 0.1] Success! ${nextResult.segments.length} segments`);
+
+        const response = {
+          source: nextResult.source || 'tier0.1-next',
+          result: nextResult.segments,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '0.1', error: err.message });
+      log(`[Tier 0.1] Failed: ${err.message}`);
+    }
+
+    throwIfStopped();
+    // === TIER 1 (Primary): InnerTube client chain (IOS -> MWEB -> WEB_EMBEDDED) ===
+    // Promoted ahead of Tier 3 (2026-09-27) — this is the tier that actually
+    // succeeds for most videos.
     try {
-      log('[Tier 1 Fallback] Attempting updated client chain...');
-      
+      log('[Tier 1] Attempting InnerTube client chain...');
+
       const result = await getSubtitles({
         videoID: videoId,
-        lang: sourceLang !== 'auto' ? sourceLang : 'en',
+        // Pass 'auto' through: getSubtitles resolves it to the first available
+        // track. Substituting 'en' broke videos whose captions are not English.
+        lang: sourceLang,
         translate: translate,
         translateLang: translate ? targetLang : undefined
       });
@@ -1543,7 +2164,7 @@ export class TranslationManager {
           duration: s.duration,
           text: s.text
         }));
-        
+
         log(`[Tier 1] Success! ${normalized.length} segments`);
         const response = {
           source: 'tier1-playlist',
@@ -1561,7 +2182,52 @@ export class TranslationManager {
       log(`[Tier 1] Failed: ${err.message}`);
     }
 
+    throwIfStopped();
+    // === TIER 3 (Fallback): youtubei.js ===
+    // Demoted behind Tier 1 (2026-09-27): historic-green check found 0
+    // successes across every available real batch run (this session's two
+    // live diagnostic runs + the original console log that started this
+    // investigation) since the 2026-09-21 'iOS' client-name fix — see
+    // docs/LESSONS.md 2026-09-27. Kept as a fallback attempt, not removed,
+    // in case a youtubei.js upgrade changes that.
+    try {
+      log('[Tier 3] Attempting Innertube (fallback)...');
+
+      const tier3Options = {
+        lang: sourceLang,
+        translate: translate,
+        targetLang: targetLang
+      };
+
+      const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
+
+      if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
+        log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
+
+        const normalized = tier3Result.segments.map(s => ({
+          start: s.start,
+          duration: s.end - s.start,
+          text: s.text
+        }));
+
+        const response = {
+          source: 'tier3-playlist',
+          result: normalized,
+          translated: translate,
+          sourceLang: tier3Result.language || sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: 3, error: err.message });
+      log(`[Tier 3] Failed: ${err.message}`);
+    }
+
     // === LAST RESORT: Embed Page ===
+    throwIfStopped();
     try {
       log('[Tier 1.5] Attempting embed page (last resort)...');
       const result = await this._extractFromEmbed(videoId, sourceLang, translate, targetLang);
@@ -1584,6 +2250,114 @@ export class TranslationManager {
       log(`[Tier 1.5] Failed: ${err.message}`);
     }
 
+    // (Tier 1.6, the hidden nocookie embed iframe, was deleted 2026-09-29 —
+    // see docs/LESSONS.md. Cold tiers go straight to 1.7 player coercion.)
+
+    // === TIER 1.7 (Player Coercion): loadVideoById on the shared player ===
+    // Switches videos in-page via player.loadVideoById() — no navigation, no
+    // page load — so the REAL player solves BotGuard and makes
+    // PoToken-authenticated timedtext requests, captured by the MAIN-world
+    // sniffer. Requires the tab to already be on a /watch page (batch seeds
+    // it once via seedWatchPage in main.mjs); otherwise the content script
+    // fails fast. Serialized on _pageLegLock — the ONE lock shared with 2C,
+    // because both drive the same pinned tab; API tiers above stay parallel.
+    throwIfStopped();
+    // Player capture records whatever language the player arms and has no
+    // translation option, yet its result is cached as `translated: translate`.
+    // For a translated request skip it (and 2C below) so the translation-aware
+    // Tier 0.5 Auth fallback runs instead of shipping source-language text
+    // under a target-language label (docs/ISSUES.md #3).
+    if (translate) {
+      log('[Tier 1.7 Player Coercion] Skipped: player capture cannot translate');
+    } else try {
+      log('[Tier 1.7 Player Coercion] Coercing shared player...');
+      const coerced = await this._coercePlayerTranscript(videoId, {
+        lang: sourceLang,
+        timeout: 25000
+      });
+
+      if (coerced && coerced.length > 0) {
+        log(`[Tier 1.7 Player Coercion] Success! ${coerced.length} segments`);
+        const response = {
+          source: 'tier1.7-player-coercion',
+          result: coerced,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+      log('[Tier 1.7 Player Coercion] No transcript captured, falling through...');
+    } catch (err) {
+      errors.push({ tier: '1.7-player-coercion', error: err.message });
+      log(`[Tier 1.7 Player Coercion] Failed: ${err.message}`);
+    }
+
+    // === TIER 2C (Tab Navigation): Navigate to watch page ===
+    // Navigates the active YouTube tab to the video's watch page.
+    // The REAL player solves BotGuard and makes PoToken-authenticated
+    // timedtext request. The sniffer captures the response body.
+    // This is the only tier that reliably works for heavily restricted
+    // videos. The tab briefly visits each video.
+    throwIfStopped();
+    if (translate) {
+      log('[Tier 2C Tab Nav] Skipped: player capture cannot translate');
+    } else try {
+      log('[Tier 2C Tab Nav] Navigating tab to watch page...');
+      const tabResult = await this._fetchTranscriptViaTabNav(videoId, {
+        timeout: 30000
+      });
+
+      if (tabResult && tabResult.length > 0) {
+        log(`[Tier 2C Tab Nav] Success! ${tabResult.length} segments`);
+        const response = {
+          source: 'tier2c-tab-nav',
+          result: tabResult,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '2c-tab-nav', error: err.message });
+      log(`[Tier 2C Tab Nav] Failed: ${err.message}`);
+    }
+
+    // === TIER 0.5 AUTH (last resort): Credentialed transcript fetch ===
+    // Only works if user has a YouTube tab open (content script needs cookies).
+    // Used when all API-only tiers fail with LOGIN_REQUIRED.
+    throwIfStopped();
+    try {
+      log('[Tier 0.5 Auth] Attempting credentialed transcript fetch...');
+      const authResult = await this._fetchTranscriptAuth(videoId, {
+        lang: sourceLang,
+        translate,
+        translateLang: targetLang
+      });
+
+      if (authResult && authResult.length > 0) {
+        log(`[Tier 0.5 Auth] Success! ${authResult.length} segments`);
+        const response = {
+          source: 'tier0.5-auth',
+          result: authResult,
+          translated: translate,
+          sourceLang,
+          targetLang,
+          logs
+        };
+        this._setCache(cacheKey, response);
+        return response;
+      }
+    } catch (err) {
+      errors.push({ tier: '0.5-auth', error: err.message });
+      log(`[Tier 0.5 Auth] Failed: ${err.message}`);
+    }
+
     // All tiers failed
     const finalError = new Error(`All API-only tiers failed for ${videoId}`);
     finalError.logs = logs;
@@ -1594,9 +2368,11 @@ export class TranslationManager {
   // ─────────────────────────────────────────────────────────────
   // Cache Clear
   // ─────────────────────────────────────────────────────────────
-  clearCache() {
-    this.cache.clear();
-  }
+  // NOTE: only ONE clearCache may exist on the class. A no-arg duplicate here
+  // (removed 2026-09-25) shadowed the per-video definition above, so
+  // main.mjs:253's videoId argument was ignored and Reset wiped everything
+  // including playlist:* entries (#10). The definition at the top handles
+  // both shapes: videoId → scoped clear, no arg → clear all.
 }
 
 // Singleton

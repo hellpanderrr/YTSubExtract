@@ -1,4 +1,7 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
+import { readUntilStable } from '../utils/stable-read.js';
+import { runFastAbort } from '../utils/fast-abort.js';
+import { pruneOldest } from '../utils/prune-map.js';
 
 // Content Script works in the context of youtube.com
 // Has access to cookies and correct headers
@@ -11,28 +14,94 @@ const URL_LANG_REGEX = /[?&]lang=([^&]+)/;
 // Storage for captured URLs (videoId -> Map<lang, {url, timestamp}>)
 const capturedUrls = new Map();
 
+// Storage for full transcript bodies captured by sniffer (MAIN world)
+// videoId -> Map<lang, {text, timestamp}>
+const capturedTranscripts = new Map();
+// One full caption body per (videoId, lang) lives here for the life of the tab,
+// so cap how many videos are kept (oldest-inserted evicted first).
+const MAX_CAPTURED_VIDEOS = 40;
+
+// Bridge: read MAIN-world captured transcripts from the document_start
+// sniffer. The sniffer (MAIN world, top frame only) stores bodies in
+// window.__ytsub_captured_transcripts AND postMessages every capture live;
+// the live YTSUB_CAPTURED_TRANSCRIPT listener below is the primary feed. This bridge is a best-effort
+// backfill for captures that fired before this script loaded: it asks the
+// sniffer for a re-broadcast instead of injecting a script element (script
+// injection from ISOLATED world does not execute on youtube.com — proven
+// 2026-09-20 — so the old inject-and-read pattern silently did nothing).
+(function bridgeCapturedTranscripts() {
+  const requestId = 'bridge_ct_' + Math.random().toString(36).substring(2, 10);
+  const listener = (event) => {
+    if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT_BRIDGE' || event.data?.requestId !== requestId) return;
+    const data = event.data?.data;
+    if (!data) return;
+    for (const videoId in data) {
+      for (const lang in data[videoId]) {
+        for (const entry of data[videoId][lang]) {
+          if (!capturedTranscripts.has(videoId)) {
+            capturedTranscripts.set(videoId, new Map());
+          }
+          capturedTranscripts.get(videoId).set(lang, { text: entry.text, timestamp: entry.timestamp });
+        }
+      }
+    }
+    pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
+    window.removeEventListener('message', listener);
+  };
+  window.addEventListener('message', listener);
+  window.postMessage({ type: 'YTSUB_REQUEST_BACKFILL', requestId }, '*');
+  setTimeout(() => window.removeEventListener('message', listener), 5000);
+})();
+
 // === REQUEST DEDUPLICATION ===
 // Lock for player tracks requests to prevent concurrent duplicate operations
 const playerTracksLocks = new Map(); // videoId -> Promise
 
-// Listen for messages from sniffer.js (MAIN world)
+// Listen for messages from sniffer.js (MAIN world).
 window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    
+    // No event.source filter today. The original reason (an embed-iframe tier
+    // relayed captures via window.parent.postMessage) is gone: that tier and
+    // the sniffer's iframe relay were deleted 2026-09-29. A source check would
+    // now harden this against forged messages from child iframes
+    // (docs/ISSUES.md #10), but how event.source behaves across the
+    // ISOLATED/MAIN worlds is documented inconsistently (docs/LESSONS.md
+    // 2026-09-20 vs the sniffer's probe round-trip) — verify in a real
+    // browser before adding one.
+
     if (event.data?.type === 'YTSUB_CAPTURED_URL') {
         const { videoId, lang, url, timestamp } = event.data;
-        
+        // A malformed message must not throw below (url.match) and abort the
+        // rest of this listener, including the transcript branch.
+        if (!videoId || typeof url !== 'string') return;
+
         if (!capturedUrls.has(videoId)) {
             capturedUrls.set(videoId, new Map());
         }
-        
+
         capturedUrls.get(videoId).set(lang, { url, timestamp });
-        
+
         // Log the lang parameter from the URL for verification
         if (DEBUG) {
             const urlLangMatch = url.match(URL_LANG_REGEX);
             const urlLang = urlLangMatch ? urlLangMatch[1] : 'no-lang';
             console.log(`[Content] Captured URL: video=${videoId}, storedLang=${lang}, urlLang=${urlLang}, url=${url.substring(0, 100)}...`);
+        }
+    }
+
+    // Store full captured transcript bodies (sniffer captures these
+    // when the real YouTube player makes PoToken-authenticated requests)
+    if (event.data?.type === 'YTSUB_CAPTURED_TRANSCRIPT') {
+        const { videoId, lang, text, timestamp } = event.data;
+        if (!videoId || !text) return;
+
+        if (!capturedTranscripts.has(videoId)) {
+            capturedTranscripts.set(videoId, new Map());
+        }
+        capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp });
+        pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
+
+        if (DEBUG) {
+            console.log(`[Content] Stored transcript for video=${videoId}, lang=${lang || 'unknown'}, ${text.length} bytes`);
         }
     }
 });
@@ -402,6 +471,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_CAPTURED_URL') {
     const url = getCapturedUrl(msg.videoId, msg.lang);
     sendResponse({ success: !!url, url });
+    return true;
+  }
+
+  // === PLAYER READINESS PROBE (Tier 1.7 seed) ===
+  // Reports whether this tab hosts a usable movie_player for loadVideoById
+  // coercion. Used by _ensureWatchPlayer to decide if a navigation is needed.
+  if (msg.type === 'CHECK_PLAYER_READY') {
+    // NOTE: this content script runs in the ISOLATED world, where the
+    // movie_player node is visible but its JS API (loadVideoById,
+    // getPlayerResponse, ...) is NOT — page JS attaches those in MAIN world.
+    // Probing them here always reports "no API" on a healthy watch page
+    // (proven 2026-09-20). Two routes to MAIN world, in order:
+    //  1. the MAIN-world sniffer (document_start) via postMessage;
+    //  2. chrome.scripting.executeScript({world:'MAIN'}) via the background
+    //     (needs "scripting" + activeTab; granted on the YouTube tab).
+    // Route 1 is tried first (no extra permission surface); route 2 is the
+    // fallback. Both report the same state shape.
+    (async () => {
+      const requestId = 'ready_' + Math.random().toString(36).substring(2, 10);
+      const viaSniffer = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          window.removeEventListener('message', listener);
+          resolve(null);
+        }, 2500);
+        const listener = (event) => {
+          if (event.data?.type !== 'YTSUB_PLAYER_READY' || event.data?.requestId !== requestId) return;
+          clearTimeout(timer);
+          window.removeEventListener('message', listener);
+          resolve(event.data.state);
+        };
+        window.addEventListener('message', listener);
+        window.postMessage({ type: 'YTSUB_PROBE_PLAYER', requestId }, '*');
+      });
+      if (viaSniffer) {
+        sendResponse(viaSniffer);
+        return;
+      }
+      // Fallback: ask the background to run the probe directly in MAIN world.
+      chrome.runtime.sendMessage({ type: 'PROBE_PLAYER_MAIN', requestId }, (resp) => {
+        if (chrome.runtime.lastError || !resp?.state) {
+          sendResponse({ ready: false, probeErr: 'sniffer + scripting probes failed' });
+          return;
+        }
+        sendResponse(resp.state);
+      });
+    })();
     return true;
   }
 
@@ -1113,24 +1228,85 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         log(`Extracting videos for playlist: ${listId}`);
 
-        // Try multiple selectors for playlist video items
+        // Try multiple selectors for playlist video items.
+        // `yt-lockup-view-model` is the current (2026) structure YouTube renders
+        // playlist rows with; the older `ytd-playlist-video-renderer` elements
+        // are no longer emitted, so without it this tier matched nothing.
         const selectors = [
           'ytd-playlist-video-renderer',
           'ytd-playlist-panel-video-renderer',
           '.ytd-playlist-video-list-renderer > .ytd-playlist-video-renderer',
+          // Scope the lockup selector to the playlist browse container first, so
+          // unrelated lockups (recommendations, shelves) are not swept in.
+          'ytd-browse[page-subtype="playlist"] yt-lockup-view-model',
+          'yt-lockup-view-model',
           '[data-playlist-item]'
         ];
 
-        let videoElements = [];
-        for (const selector of selectors) {
-          videoElements = document.querySelectorAll(selector);
-          if (videoElements.length > 0) {
-            log(`Found ${videoElements.length} videos using selector: ${selector}`);
-            break;
+        // One DOM snapshot: selector sweep + per-row extraction. Stabilized
+        // via readUntilStable — a one-shot read accepted any partial count
+        // > 0 as complete (slow/proxy hydration silently shortened the
+        // playlist; only 0 fell through to the API). Each read re-queries
+        // until two consecutive counts agree; bounded by DEFAULT_MAX_READS.
+        const readDomSnapshot = () => {
+          let videoElements = [];
+          for (const selector of selectors) {
+            videoElements = document.querySelectorAll(selector);
+            if (videoElements.length > 0) {
+              log(`Found ${videoElements.length} videos using selector: ${selector}`);
+              break;
+            }
           }
-        }
 
-        if (videoElements.length === 0) {
+          const rows = [];
+          for (const el of videoElements) {
+            try {
+              // Find video link
+              const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
+              if (!link) continue;
+
+              const href = link.getAttribute('href');
+              if (!href) continue;
+
+              // Extract video ID from href
+              const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+              if (!videoIdMatch) continue;
+              const videoId = videoIdMatch[1];
+
+              // Extract title
+              let title = 'Unknown';
+              const titleEl = el.querySelector('#video-title') ||
+                             el.querySelector('yt-lockup-metadata-view-model h3') ||
+                             el.querySelector('a[title]') ||
+                             el.querySelector('.ytd-video-meta-block #video-title') ||
+                             link;
+              if (titleEl) {
+                title = titleEl.getAttribute('title') ||
+                       titleEl.textContent?.trim() ||
+                       'Unknown';
+              }
+
+              // Extract duration
+              let duration = '';
+              const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                                el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
+                                el.querySelector('.badge-shape-wiz__text') ||
+                                el.querySelector('[class*="duration"]');
+              if (durationEl) {
+                duration = durationEl.textContent?.trim() || '';
+              }
+
+              rows.push({ videoId, title, duration });
+            } catch (e) {
+              log(`Error extracting video: ${e.message}`);
+            }
+          }
+          return rows;
+        };
+
+        const videos = await readUntilStable(readDomSnapshot);
+
+        if (videos.length === 0) {
           // Try to find in ytInitialData via page context
           log('Trying ytInitialData via getPageVariable...');
           try {
@@ -1211,49 +1387,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
 
-        // Extract from DOM elements
-        const videos = [];
-        for (const el of videoElements) {
-          try {
-            // Find video link
-            const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
-            if (!link) continue;
-
-            const href = link.getAttribute('href');
-            if (!href) continue;
-
-            // Extract video ID from href
-            const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-            if (!videoIdMatch) continue;
-            const videoId = videoIdMatch[1];
-
-            // Extract title
-            let title = 'Unknown';
-            const titleEl = el.querySelector('#video-title') ||
-                           el.querySelector('a[title]') ||
-                           el.querySelector('.ytd-video-meta-block #video-title') ||
-                           link;
-            if (titleEl) {
-              title = titleEl.getAttribute('title') ||
-                     titleEl.textContent?.trim() ||
-                     'Unknown';
-            }
-
-            // Extract duration
-            let duration = '';
-            const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
-                              el.querySelector('.badge-shape-wiz__text') ||
-                              el.querySelector('[class*="duration"]');
-            if (durationEl) {
-              duration = durationEl.textContent?.trim() || '';
-            }
-
-            videos.push({ videoId, title, duration });
-          } catch (e) {
-            log(`Error extracting video: ${e.message}`);
-          }
-        }
-
         log(`Successfully extracted ${videos.length} videos from DOM`);
 
         // Try to get playlist title from DOM
@@ -1316,6 +1449,688 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true; // Keep channel open for async
+  }
+
+  // === TIER 0.5 Auth: Credentialed Playlist Page Fetch ===
+  // Used as fallback for private playlists (e.g. LL - Liked Videos) where
+  // unauthenticated InnerTube API returns "does not exist".
+  // Fetches the playlist page with session cookies and parses ytInitialData.
+  if (msg.type === 'FETCH_PLAYLIST_PAGE') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[PlaylistFetch] ${m}`);
+
+      try {
+        const playlistUrl = `https://www.youtube.com/playlist?list=${msg.playlistId}`;
+        log(`Fetching: ${playlistUrl}`);
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const resp = await fetch(playlistUrl, { cache: 'no-store' });
+          const html = await resp.text();
+          log(`Response: ${resp.status}, ${html.length} bytes`);
+
+          // Extract ytInitialData from HTML — same pattern as getRobustPlayerResponse
+          const match = html.match(/ytInitialData\s*=\s*({.+?});/s);
+          if (!match) {
+            log('ytInitialData not found in HTML');
+            if (attempt < 2) {
+              log('Retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error('Failed to extract playlist data from page');
+          }
+
+          const initialData = JSON.parse(match[1]);
+
+          // Check for alerts in the response
+          const alert = initialData?.alerts?.[0]?.alertRenderer;
+          if (alert) {
+            const alertText = alert.text?.simpleText || alert.text?.runs?.map(r => r.text).join('');
+            log(`Alert found: ${alertText}`);
+            if (attempt < 2) {
+              log('Retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error(`Playlist unavailable: ${alertText}`);
+          }
+
+          // Extract videos — reuse the same structure parsing as the API path
+          const videos = [];
+          const twoColumn = initialData?.contents?.twoColumnBrowseResultsRenderer;
+          const tabs = twoColumn?.tabs;
+          let contents = null;
+
+          if (tabs) {
+            const videoTab = tabs.find(t => t?.tabRenderer?.content?.sectionListRenderer?.contents);
+            if (videoTab) {
+              contents = videoTab.tabRenderer.content.sectionListRenderer.contents;
+            }
+          }
+
+          if (contents) {
+            for (const content of contents) {
+              const itemSection = content?.itemSectionRenderer;
+              const playlistVideoList = itemSection?.contents?.[0]?.playlistVideoListRenderer ||
+                                        content?.playlistVideoListRenderer;
+
+              if (playlistVideoList?.contents) {
+                for (const item of playlistVideoList.contents) {
+                  const renderer = item?.playlistVideoRenderer;
+                  if (renderer?.videoId) {
+                    let title = 'Unknown';
+                    if (renderer.title?.runs) {
+                      title = renderer.title.runs.map(r => r.text).join('');
+                    } else if (renderer.title?.simpleText) {
+                      title = renderer.title.simpleText;
+                    }
+                    let duration = '';
+                    if (renderer.lengthText?.simpleText) {
+                      duration = renderer.lengthText.simpleText;
+                    } else if (renderer.lengthText?.runs) {
+                      duration = renderer.lengthText.runs.map(r => r.text).join('');
+                    }
+                    videos.push({ videoId: renderer.videoId, title: title.trim(), duration: duration.trim() });
+                  }
+                }
+                continue;
+              }
+
+              // Fallback: lockupViewModel (new YouTube 2026 format)
+              const itemSectionContents = itemSection?.contents || [];
+              for (const itemContent of itemSectionContents) {
+                const lockup = itemContent?.lockupViewModel;
+                if (lockup && lockup.contentId) {
+                  let title = 'Unknown';
+                  const metadata = lockup.metadata?.lockupMetadataViewModel;
+                  if (metadata?.title?.content) title = metadata.title.content;
+                  let duration = '';
+                  if (metadata?.subtitle?.content) {
+                    const parts = metadata.subtitle.content.split(' / ');
+                    duration = parts[0] || metadata.subtitle.content;
+                  }
+                  videos.push({ videoId: lockup.contentId, title: title.trim(), duration: duration.trim() });
+                }
+              }
+            }
+          }
+
+          // Also extract title from metadata
+          let playlistTitle = '';
+          const metadata = initialData?.metadata?.playlistMetadataRenderer;
+          if (metadata?.title) {
+            playlistTitle = metadata.title;
+          }
+
+          log(`Extracted ${videos.length} videos, title: "${playlistTitle}"`);
+
+          if (videos.length === 0) {
+            if (attempt < 2) {
+              log('No videos found, retrying...');
+              await new Promise(r => setTimeout(r, 1000));
+              continue;
+            }
+            throw new Error('No videos found in playlist page');
+          }
+
+          sendResponse({ success: true, videos, title: playlistTitle, logs, source: 'tier0.5-auth' });
+          return;
+        }
+
+        throw new Error('All attempts failed');
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === TIER 0.5 Auth: Credentialed Transcript Fetch ===
+  // Fetches watch page with session cookies, extracts caption tracks,
+  // then fetches the timedtext URL directly from the content script
+  // context (same session as the watch page fetch). Returns parsed segments.
+  if (msg.type === 'FETCH_TRANSCRIPT_AUTH') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[Content] ${m}`);
+      const { videoId, lang = 'auto', translate = false, translateLang = 'en' } = msg;
+
+      try {
+        log(`Fetching watch page for ${videoId}...`);
+
+        // Step 1: Fetch the watch page HTML with session cookies
+        const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const resp = await fetch(watchUrl, { cache: 'no-store' });
+        if (!resp.ok) {
+          throw new Error(`Watch page fetch failed: HTTP ${resp.status}`);
+        }
+        const html = await resp.text();
+
+        // Step 2: Extract ytInitialPlayerResponse from HTML
+        const match = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/s);
+        if (!match) {
+          throw new Error('Could not find ytInitialPlayerResponse in watch page');
+        }
+        const playerResponse = JSON.parse(match[1]);
+
+        // Step 3: Get caption tracks
+        const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (!captionTracks || captionTracks.length === 0) {
+          throw new Error('No caption tracks in player response');
+        }
+
+        // Step 4: Select the right track
+        let track;
+        if (lang && lang !== 'auto') {
+          track = captionTracks.find(t => t.languageCode === lang);
+        }
+        if (!track) {
+          track = captionTracks.find(t => t.languageCode === 'en') || captionTracks[0];
+        }
+
+        const trackLang = track.languageCode;
+        log(`Selected track: ${trackLang}`);
+
+        // Try multiple format strategies for the timedtext URL
+        let segments = null;
+        const tryFetch = async (url, label) => {
+          log(`[${label}] ${url.substring(0, 120)}`);
+          const r = await fetch(url, { cache: 'no-store' });
+          if (!r.ok) { log(`[${label}] HTTP ${r.status}`); return null; }
+          const text = await r.text();
+          log(`[${label}] ${text.length} bytes`);
+          if (!text || text.trim().length === 0) return null;
+
+          // Parse JSON3
+          if (url.includes('fmt=json3') || text.startsWith('{')) {
+            try {
+              const json = JSON.parse(text);
+              if (json.events) {
+                const segs = json.events.filter(e => e.segs).map(e => ({
+                  start: (e.tStartMs || 0) / 1000,
+                  duration: (e.dDurationMs || 0) / 1000,
+                  text: e.segs.map(s => s.utf8 || '').join('')
+                })).filter(e => e.text.trim().length > 0);
+                if (segs.length > 0) return segs;
+              }
+            } catch (e) {}
+          }
+
+          // Parse XML
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          const xmlSegs = []; let m;
+          while ((m = xmlRe.exec(text)) !== null) {
+            xmlSegs.push({ start: parseFloat(m[1]), duration: parseFloat(m[2]), text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"') });
+          }
+          if (xmlSegs.length > 0) return xmlSegs;
+
+          // Parse VTT
+          if (text.includes('WEBVTT')) {
+            const lines = text.split('\n'); const vtt = []; let cs = 0, ct = '';
+            for (let i = 0; i < lines.length; i++) {
+              const l = lines[i].trim();
+              if (l.includes('-->')) {
+                if (ct) { vtt.push({ start: cs, duration: 0, text: ct.trim() }); ct = ''; }
+                const p = l.split('-->')[0].trim().split(/\s+/)[0].split(':').map(Number);
+                cs = p.length === 3 ? p[0]*3600 + p[1]*60 + p[2] : p.length === 2 ? p[0]*60 + p[1] : 0;
+              } else if (l && !l.startsWith('WEBVTT') && isNaN(parseFloat(l))) { ct += l + ' '; }
+            }
+            if (ct) vtt.push({ start: cs, duration: 0, text: ct.trim() });
+            if (vtt.length > 0) return vtt;
+          }
+          return null;
+        };
+
+        // Strategy 1: Clean api/timedtext URL with json3
+        let cleanBase = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${trackLang}`;
+        let cleanUrl = cleanBase + '&fmt=json3';
+        if (translate) cleanUrl += `&tlang=${translateLang}`;
+        segments = await tryFetch(cleanUrl, 'Clean-JSON3');
+
+        // Strategy 2: Clean URL without fmt (default XML)
+        if (!segments) {
+          let url = cleanBase;
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-XML');
+        }
+
+        // Strategy 3: Clean URL with VTT
+        if (!segments) {
+          let url = cleanBase + '&fmt=vtt';
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-VTT');
+        }
+
+        // Strategy 4: Clean URL with srv3
+        if (!segments) {
+          let url = cleanBase + '&fmt=srv3';
+          if (translate) url += `&tlang=${translateLang}`;
+          segments = await tryFetch(url, 'Clean-SRV3');
+        }
+
+        // Strategy 5: Signed URL from player response (with JSON3)
+        if (!segments) {
+          let signedUrl = track.baseUrl + '&fmt=json3';
+          if (translate) signedUrl += `&tlang=${translateLang}`;
+          segments = await tryFetch(signedUrl, 'Signed-JSON3');
+        }
+
+        // Strategy 6: Signed URL without format override
+        if (!segments) {
+          let signedUrl = track.baseUrl;
+          if (translate) signedUrl += `&tlang=${translateLang}`;
+          segments = await tryFetch(signedUrl, 'Signed-XML');
+        }
+
+        if (!segments) {
+          throw new Error('Empty timedtext response');
+        }
+
+        if (segments.length === 0) {
+          throw new Error('No text segments found');
+        }
+
+        log(`Success! ${segments.length} segments`);
+        sendResponse({ success: true, result: segments, source: trackLang, logs });
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === GET_CAPTURED_TRANSCRIPT: Return parsed segments from sniffer ===
+  // After tab navigation, the sniffer in MAIN world captures the
+  // PoToken-authenticated timedtext response body. This handler
+  // returns it as parsed segments.
+  if (msg.type === 'GET_CAPTURED_TRANSCRIPT') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[CapturedTranscript] ${m}`);
+      const { videoId, lang = null } = msg;
+
+      try {
+        const videoMap = capturedTranscripts.get(videoId);
+        if (!videoMap || videoMap.size === 0) {
+          throw new Error('No captured transcript for this video');
+        }
+
+        let entry = null;
+        if (lang && videoMap.has(lang)) {
+          entry = videoMap.get(lang);
+        } else {
+          entry = videoMap.values().next().value;
+        }
+
+        if (!entry || !entry.text) {
+          throw new Error('No transcript text found');
+        }
+
+        log(`Found ${entry.text.length} bytes`);
+
+        let segments = null;
+        if (entry.text.startsWith('{')) {
+          try {
+            const json = JSON.parse(entry.text);
+            if (json.events) {
+              segments = json.events
+                .filter(e => e.segs)
+                .map(e => ({
+                  start: (e.tStartMs || 0) / 1000,
+                  duration: (e.dDurationMs || 0) / 1000,
+                  text: e.segs.map(s => s.utf8 || '').join('')
+                }))
+                .filter(e => e.text.trim().length > 0);
+            }
+          } catch (e) {}
+        }
+
+        if (!segments || segments.length === 0) {
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          segments = [];
+          let m;
+          while ((m = xmlRe.exec(entry.text)) !== null) {
+            segments.push({
+              start: parseFloat(m[1]),
+              duration: parseFloat(m[2]),
+              text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+            });
+          }
+        }
+
+        if (segments && segments.length > 0) {
+          log(`Parsed ${segments.length} segments`);
+          sendResponse({ success: true, result: segments, logs });
+        } else {
+          throw new Error('No segments parsed');
+        }
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
+  }
+
+  // === POLL TRANSCRIPT (for tab navigation approach) ===
+  // After the background navigates the tab to a watch page, it polls
+  // this handler to check if the sniffer has captured the PoToken-
+  // authenticated timedtext response from the real YouTube player.
+  if (msg.type === 'POLL_TRANSCRIPT') {
+    const { videoId } = msg;
+    const videoMap = capturedTranscripts.get(videoId);
+    if (!videoMap || videoMap.size === 0) {
+      // No capture yet — but report whether the page has SETTLED with 0
+      // tracks (confirmed-this-video response, nothing to wait for) vs still
+      // navigating (videoId mismatch). Lets TabNav fast-abort the wait while
+      // keeping the independent 0.5 Auth path. NOTE: this ISOLATED-side read
+      // only sees the API when page JS has attached it; an unreadable player
+      // reports not-settled (never a false "no tracks").
+      let settledNoTracks = false;
+      try {
+        const player = document.getElementById('movie_player');
+        const resp = (player && typeof player.getPlayerResponse === 'function')
+          ? player.getPlayerResponse()
+          : null;
+        if (resp && resp.videoDetails?.videoId === videoId) {
+          const tracks = resp.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+          settledNoTracks = tracks.length === 0;
+        }
+      } catch (e) { /* unreadable player → not settled */ }
+      sendResponse({ success: false, error: 'Not yet captured', settledNoTracks });
+      return true;
+    }
+
+    // Find the first entry with actual content
+    for (const [, entry] of videoMap) {
+      if (entry.text && entry.text.trim().length > 0) {
+        // Parse into segments
+        let segments = null;
+        if (entry.text.startsWith('{')) {
+          try {
+            const json = JSON.parse(entry.text);
+            if (json.events) {
+              segments = json.events
+                .filter(e => e.segs)
+                .map(e => ({ start: (e.tStartMs || 0) / 1000, duration: (e.dDurationMs || 0) / 1000, text: e.segs.map(s => s.utf8 || '').join('') }))
+                .filter(e => e.text.trim().length > 0);
+            }
+          } catch (e) {}
+        }
+        if (!segments || segments.length === 0) {
+          const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+          segments = [];
+          let m;
+          while ((m = xmlRe.exec(entry.text)) !== null) {
+            segments.push({ start: parseFloat(m[1]), duration: parseFloat(m[2]), text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"') });
+          }
+        }
+        if (segments && segments.length > 0) {
+          sendResponse({ success: true, result: segments });
+        } else {
+          sendResponse({ success: false, error: 'No segments parsed' });
+        }
+        return true;
+      }
+    }
+
+    sendResponse({ success: false, error: 'No content found' });
+    return true;
+  }
+
+  // === PLAYER COERCION (Pathway 1) ===
+  // Uses the native YouTube player on the current page to load the target
+  // video, trigger captions, and capture the PoToken-authenticated response.
+  // The sniffer intercepts the timedtext request made by the real player.
+  if (msg.type === 'COERCE_PLAYER_TRANSCRIPT') {
+    (async () => {
+      const logs = [];
+      const log = (m) => logs.push(`[CoercePlayer] ${m}`);
+      const { videoId, lang = null, desiredLang = null, timeout = 22000 } = msg;
+
+      // The player lives in MAIN world, untouchable from here — including the
+      // fail-fast element check: a player shell in ISOLATED DOM tells us
+      // nothing about the API. All driving goes through the MAIN-world
+      // sniffer via YTSUB_DRIVE_PLAYER; the isolated-side element check that
+      // used to reject healthy watch pages ("no loadVideoById") is gone.
+      const wantLang = desiredLang || lang || null;
+
+      // INSTRUMENTATION (2026-09-26): measure arm→tracklist and
+      // arm→first-capture latencies so a future wait-level fast-abort can be
+      // tuned from captioned positive controls instead of guessed. Log-only.
+      const t0 = performance.now();
+      // Fast-abort window (2026-09-27): floor measured from arm (t0), not
+      // from when the zero report arrives -- clears the observed 9646ms
+      // captioned-video arm-to-tracklist max with margin. See
+      // src/utils/fast-abort.js and docs/LESSONS.md 2026-09-26/27.
+      const FAST_ABORT_WINDOW_MS = 10000;
+      let tracklistAt = null, tracklistCount = null, captureAt = null;
+      const noteTracklist = (tracks) => {
+        if (tracklistAt === null) {
+          tracklistAt = performance.now();
+          tracklistCount = tracks.length;
+        }
+      };
+
+      try {
+        log(`Coercing player to load video: ${videoId} (wantLang=${wantLang || 'auto'})`);
+
+        const parseSegments = (text) => {
+          let segments = null;
+          if (text.startsWith('{')) {
+            try {
+              const json = JSON.parse(text);
+              if (json.events) {
+                segments = json.events
+                  .filter(e => e.segs)
+                  .map(e => ({
+                    start: (e.tStartMs || 0) / 1000,
+                    duration: (e.dDurationMs || 0) / 1000,
+                    text: e.segs.map(s => s.utf8 || '').join('')
+                  }))
+                  .filter(e => e.text.trim().length > 0);
+              }
+            } catch (e) {}
+          }
+          if (!segments || segments.length === 0) {
+            const xmlRe = /<text start="([\d.]+)" dur="([\d.]+)".*?>(.*?)<\/text>/g;
+            segments = [];
+            let m;
+            while ((m = xmlRe.exec(text)) !== null) {
+              segments.push({
+                start: parseFloat(m[1]),
+                duration: parseFloat(m[2]),
+                text: m[3].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+              });
+            }
+          }
+          return (segments && segments.length > 0) ? segments : null;
+        };
+
+        const drainCache = () => {
+          const videoMap = capturedTranscripts.get(videoId);
+          if (!videoMap || videoMap.size === 0) return null;
+          const order = [];
+          if (wantLang && videoMap.has(wantLang)) order.push(videoMap.get(wantLang));
+          for (const entry of videoMap.values()) order.push(entry);
+          for (const entry of order) {
+            if (entry?.text) {
+              const segments = parseSegments(entry.text);
+              if (segments) return { segments, bytes: entry.text.length };
+            }
+          }
+          return null;
+        };
+
+        // Inject a MAIN world script to control the player
+        const result = await new Promise((resolve, reject) => {
+          const requestId = `coerce_${videoId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+          let finished = false;
+          let fastAbortArmed = false;
+
+          const finish = (segments, note) => {
+            if (finished) return;
+            finished = true;
+            cleanup();
+            if (note) log(note);
+            resolve(segments);
+          };
+
+          // Arm once, on the first confirmed-zero tracklist report (a
+          // non-zero report needs no fast-abort -- capture will finish
+          // normally). The check itself waits out FAST_ABORT_WINDOW_MS from
+          // arm (t0), not from now, so it never fires before the window a
+          // slow captioned video is known to need.
+          const armFastAbortIfZero = (tracks) => {
+            if (fastAbortArmed || tracks.length !== 0) return;
+            fastAbortArmed = true;
+            runFastAbort({
+              armedAt: t0,
+              windowMs: FAST_ABORT_WINDOW_MS,
+              getTracklistCount: () => tracklistCount,
+            }).then((result) => {
+              if (finished || !result.fire) return;
+              const hit = drainCache();
+              if (hit) {
+                if (captureAt === null) captureAt = performance.now();
+                finish(hit.segments, `Late capture from cache (fast-abort check): ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+              } else {
+                finish(null, `Fast-abort: confirmed 0 tracks, still 0 at arm+${result.elapsedMs}ms`);
+              }
+            });
+          };
+
+          const messageHandler = (event) => {
+            if (finished) return;
+            if (event.data?.type === 'COERCE_TRACKLIST') {
+              if (event.data?.requestId !== requestId) return;
+              const tracks = event.data?.tracks || [];
+              noteTracklist(tracks);
+              armFastAbortIfZero(tracks);
+              log(`Player reports ${tracks.length} tracks for ${event.data?.videoId || '?'}: ` +
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
+                ` (arm+${Math.round(tracklistAt - t0)}ms)`);
+              return;
+            }
+            if (event.data?.type !== 'YTSUB_CAPTURED_TRANSCRIPT') return;
+            if (event.data?.videoId !== videoId) return;
+
+            const { text, lang: captureLang, tlang } = event.data;
+            if (!text || text.trim().length === 0) return;
+
+            const segments = parseSegments(text);
+            if (segments) {
+              if (captureAt === null) captureAt = performance.now();
+              finish(segments, `Captured ${text.length} bytes (lang=${captureLang}, tlang=${tlang || 'none'}), parsed ${segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+            }
+          };
+
+          const statusHandler = (statusEvent) => {
+            // Sniffer posts requestId=requestId; the scripting fallback posts
+            // requestId='scripting' (it never saw ours). Accept both.
+            const rid = statusEvent.data?.requestId;
+            if (rid !== requestId && rid !== 'scripting') return;
+            if (statusEvent.data?.type === 'COERCE_TRACKLIST') {
+              const tracks = statusEvent.data?.tracks || [];
+              noteTracklist(tracks);
+              armFastAbortIfZero(tracks);
+              log(`Player reports ${tracks.length} tracks: ` +
+                tracks.map(t => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`).join(', ') +
+                ` (arm+${Math.round(tracklistAt - t0)}ms)`);
+              return;
+            }
+            if (statusEvent.data?.type === 'COERCE_PLAYER_COMPLETE') {
+              log(`Player script: ${statusEvent.data?.detail || 'completed execution'}`);
+            } else if (statusEvent.data?.type === 'COERCE_PLAYER_FAILED') {
+              finish(null, `Player script failed: ${statusEvent.data?.detail || 'unknown'}`);
+            }
+          };
+
+          const timer = setTimeout(() => {
+            const hit = drainCache();
+            if (hit) {
+              if (captureAt === null) captureAt = performance.now();
+              finish(hit.segments, `Late capture from cache: ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+            } else {
+              finish(null, `Timeout after ${timeout}ms (tracklist: ` +
+                (tracklistAt === null ? 'never reported' : `${tracklistCount} tracks at arm+${Math.round(tracklistAt - t0)}ms`) + ')');
+            }
+          }, timeout);
+
+          const poller = setInterval(() => {
+            if (finished) return;
+            const hit = drainCache();
+            if (hit) {
+              if (captureAt === null) captureAt = performance.now();
+              finish(hit.segments, `Polled capture: ${hit.bytes} bytes, parsed ${hit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+            }
+          }, 1500);
+
+          const cleanup = () => {
+            window.removeEventListener('message', messageHandler);
+            window.removeEventListener('message', statusHandler);
+            clearTimeout(timer);
+            clearInterval(poller);
+          };
+
+          window.addEventListener('message', messageHandler);
+          window.addEventListener('message', statusHandler);
+
+          // Drain anything the player fetched between seed and this call BEFORE
+          // injecting — closes the capture-miss race where timedtext fires
+          // before our listener attaches.
+          const preHit = drainCache();
+          if (preHit) {
+            if (captureAt === null) captureAt = performance.now();
+            finish(preHit.segments, `Pre-existing capture: ${preHit.bytes} bytes, parsed ${preHit.segments.length} segments (arm+${Math.round(captureAt - t0)}ms)`);
+            return;
+          }
+
+          // Drive the player in MAIN world (script injection from ISOLATED
+          // world does not execute on youtube.com — proven 2026-09-20).
+          // Route 1: the MAIN-world sniffer (document_start) via postMessage.
+          // Route 2 (fallback): chrome.scripting.executeScript({world:'MAIN'})
+          // via the background. Status arrives via COERCE_PLAYER_FAILED/COMPLETE.
+          window.postMessage({
+            type: 'YTSUB_DRIVE_PLAYER',
+            videoId,
+            requestId,
+            wantLang,
+          }, '*');
+          log('Player drive request sent to MAIN-world sniffer');
+          // If the sniffer never reports within 6s, fall back to scripting.
+          setTimeout(() => {
+            if (finished) return;
+            chrome.runtime.sendMessage({
+              type: 'DRIVE_PLAYER_MAIN',
+              videoId,
+              requestId,
+              wantLang,
+            }, (resp) => {
+              if (finished) return;
+              if (chrome.runtime.lastError || !resp?.success) {
+                log(`Scripting drive fallback failed: ${chrome.runtime.lastError?.message || resp?.error || 'no response'}`);
+                return;
+              }
+              log('Scripting drive fallback dispatched');
+            });
+          }, 6000);
+        });
+
+        if (result && result.length > 0) {
+          sendResponse({ success: true, result, logs });
+        } else {
+          sendResponse({ success: false, error: 'No transcript captured from player', logs });
+        }
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        sendResponse({ success: false, error: err.message, logs });
+      }
+    })();
+    return true;
   }
 });
 

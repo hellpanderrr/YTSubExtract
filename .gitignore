@@ -5,3 +5,23 @@ builds/
 .env
 .DS_Store
 *.log
+
+# e2e test artifacts — the profiles hold live YouTube session cookies
+.e2e-profile/
+.e2e-profile-golden/
+.e2e-downloads/
+.session-cookies.json
+logs/
+test-results/
+playwright-report/
+
+# local secrets / session artifacts (oauth client_secret, live PoToken probes)
+*oauth*.json
+YOUTUBE_POTOKEN_TRIALS.md
+
+# weekly canary scratch (scripts/weekly-canary.mjs)
+.canary-*.json
+.canary-body.md
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

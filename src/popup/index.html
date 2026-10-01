@@ -15,13 +15,15 @@
       <a href="https://github.com/hellpanderrr/YTSubExtract" target="_blank" class="github-link" title="View on GitHub">
         <span class="github-icon"></span>
       </a>
-      <span class="version">v1.1.2</span>
+      <span class="version">v1.1.4</span>
     </div>
   </header>
   
   <div class="status-container">
     <div id="status-icon" class="spinner"></div>
     <div id="status" class="status-text">Initializing...</div>
+    <button id="discard-parked-zip" class="discard-btn hidden"
+            title="Give up on the stored ZIP that cannot be delivered and clear its record">Discard ZIP</button>
     <button id="reset-btn" class="reset-btn" title="Reset Cache & Refresh" style="display: none;">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M23 4v6h-6"></path>
@@ -125,7 +127,10 @@
         <div class="progress-bar">
           <div id="progress-fill" class="progress-fill" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0 of 0"></div>
         </div>
-        <span id="progress-text" aria-live="polite">0 / 0</span>
+        <div class="progress-row">
+          <span id="progress-text" aria-live="polite">0 / 0</span>
+          <button id="btn-stop-download" title="Stop batch download">Stop</button>
+        </div>
       </div>
     </div>
   </div>
