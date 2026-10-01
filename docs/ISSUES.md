@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 16 open, 2 fixed.
+Total: 15 open, 3 fixed.
 
 ---
 
@@ -98,11 +98,11 @@ env-gated, since the current un-gated config is the one producing the 4/6s.
 
 ### #3 — Tier 1.7 / 2C ignore `translate` but results are labelled translated
 
-**Status: OPEN** · medium · verified
+**Status: FIXED** (2026-10-02) · medium · verified
 
 `getTranscriptForPlaylist` passes only `lang` to `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` yet sets `translated: translate`; `main.mjs` names files with `targetLang` when `translate` is on. A "translate to ru" batch can ship untranslated source-language cues under `_ru` filenames with no error. Fix: pass translation through, or fail/label honestly when a tier cannot translate.
 
-**2026-10-01 — Tier 0 and Tier 0.1 parts FIXED** (found by CodeRabbit on PR #2, verified): Tier 0's `/get_transcript` path and Tier 0.1 never translated but ran before Tier 1. Now a translated request skips `/get_transcript` (uses timedtext `&tlang=`) and skips Tier 0.1. Pinned by `test/android-translate.test.mjs` and `test/tier01-translate.test.mjs`. The Tier 1.7 / 2C part above is still OPEN.
+**2026-10-01 — Tier 0 and Tier 0.1 parts FIXED** (found by CodeRabbit on PR #2, verified): Tier 0's `/get_transcript` path and Tier 0.1 never translated but ran before Tier 1. Now a translated request skips `/get_transcript` (uses timedtext `&tlang=`) and skips Tier 0.1. Pinned by `test/android-translate.test.mjs` and `test/tier01-translate.test.mjs`. **2026-10-02 — Tier 1.7 / 2C part FIXED too** (CodeRabbit + Pullfrog, round 2 on PR #2; Pullfrog also noted that gating Tier 0 made this path more reachable): a translated request now skips both and falls through to the translation-aware Tier 0.5 Auth fallback, which appends `&tlang=` throughout. Pinned by `test/tier01-translate.test.mjs`, mutation-killed three ways. Trade-off: a translated request for a PoToken-gated video now relies on Auth and may fail honestly, instead of returning source-language text under a target-language filename.
 
 ---
 
@@ -233,6 +233,7 @@ Each finding was checked against the code before fixing; two bot claims were wro
 - Batch e2e spec now requires every selected video to have a subtitle when there is no `_errors.txt`.
 - False/stale comments corrected: `content.js` and `sniffer.js` described the deleted iframe relay; the `_enqueuePageLeg` comment claimed the failed caller times out; `fixtures.mjs` header claimed test-scoped while the code is worker-scoped (the README was right).
 - `.env.e2e.example` trailing newline.
+- Round 2 (Pullfrog): the batch spec's `E2E_RESULT_FILE` write sat BELOW the new strict assertion and below two older ones, so a failing run lost its counts and the comment saying otherwise was false. It now precedes every assertion.
 
 ---
 

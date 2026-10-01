@@ -2262,7 +2262,14 @@ export class TranslationManager {
     // fails fast. Serialized on _pageLegLock — the ONE lock shared with 2C,
     // because both drive the same pinned tab; API tiers above stay parallel.
     throwIfStopped();
-    try {
+    // Player capture records whatever language the player arms and has no
+    // translation option, yet its result is cached as `translated: translate`.
+    // For a translated request skip it (and 2C below) so the translation-aware
+    // Tier 0.5 Auth fallback runs instead of shipping source-language text
+    // under a target-language label (docs/ISSUES.md #3).
+    if (translate) {
+      log('[Tier 1.7 Player Coercion] Skipped: player capture cannot translate');
+    } else try {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
       const coerced = await this._coercePlayerTranscript(videoId, {
         lang: sourceLang,
@@ -2295,7 +2302,9 @@ export class TranslationManager {
     // This is the only tier that reliably works for heavily restricted
     // videos. The tab briefly visits each video.
     throwIfStopped();
-    try {
+    if (translate) {
+      log('[Tier 2C Tab Nav] Skipped: player capture cannot translate');
+    } else try {
       log('[Tier 2C Tab Nav] Navigating tab to watch page...');
       const tabResult = await this._fetchTranscriptViaTabNav(videoId, {
         timeout: 30000

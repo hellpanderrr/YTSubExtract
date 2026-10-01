@@ -110,6 +110,17 @@ test.describe('batch ZIP download', () => {
 
     console.log(`[e2e] ZIP entries: ${entries.join(', ') || '(none)'}`);
 
+    // Machine-readable outcome for scripts/weekly-canary.mjs. Written before
+    // EVERY assertion below, so a run that fails one still reports its counts
+    // (otherwise the canary sees "no usable result file" and loses the one
+    // diagnostic it exists to give).
+    if (process.env.E2E_RESULT_FILE) {
+      fs.writeFileSync(
+        process.env.E2E_RESULT_FILE,
+        JSON.stringify({ selected, subtitles: subtitleEntries.length, errorReport })
+      );
+    }
+
     // The ZIP must account for every selected video exactly once — as a subtitle
     // file when extraction succeeded, otherwise in the error report. This
     // verifies the batch pipeline end-to-end without depending on whether the
@@ -132,15 +143,6 @@ test.describe('batch ZIP download', () => {
         type: 'all-failed',
         description: 'Playlist videos had no accessible captions; ZIP contains only _errors.txt',
       });
-    }
-
-    // Machine-readable outcome for scripts/weekly-canary.mjs, written BEFORE
-    // any strict assertion so a failing run still reports its counts.
-    if (process.env.E2E_RESULT_FILE) {
-      fs.writeFileSync(
-        process.env.E2E_RESULT_FILE,
-        JSON.stringify({ selected, subtitles: subtitleEntries.length, errorReport })
-      );
     }
 
     // Opt-in stricter check for a known-good playlist.
