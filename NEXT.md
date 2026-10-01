@@ -31,10 +31,21 @@ assertions) and the follow-up that translated requests must also skip Tiers
   `event.source` across worlds first), #8 (untested output formatters,
   duplicated timedtext parser), #6 (ZIP loss / download completion
   unobserved), #9 (no coverage/lint; release workflows on Node 18).
+- `docs/ISSUES.md` #19 (translation paths skip the `isTranslatable` and same-language checks): confirm YouTube's behaviour with ONE real request (`lang=en&tlang=en` on an English track) before building the shared guard.
 
 ## Running / unfinished
 Nothing running. `dist/` matches the current sources; reload the unpacked
 extension before any manual run.
+
+Graft (`@nanonets/graft`, a code-graph tool for coding agents) is wired into
+this repo at project level only: `.claude/settings.json` (hooks, permission
+allows, NO `statusLine`), `.claude/helpers/`, `.claude/skills/graft/`,
+`.mcp.json`, and a gitignored `graft/` graph cache. The user-level
+`~/.claude/settings.json` and `~/.claude.json` were verified byte-identical
+before and after, so the user's own statusline is untouched. Telemetry is
+disabled persistently (`~/.graft/telemetry.json`). Restart Claude Code to load
+its MCP server. Nothing graft wrote has been committed; `scheduled_tasks.lock`
+in `.claude/` is already excluded via `.git/info/exclude`.
 
 ## Don't redo
 - The pre/post-`5016f65` comparison: not a regression. The 0/6 runs are
@@ -51,5 +62,10 @@ extension before any manual run.
   untracked local files inflated the count above CI's.
 - `actions/checkout` git-cleans ignored files — the golden profile must live
   outside the workspace on CI.
+- Re-running graft: only `npx -y @nanonets/graft init --agents claude
+  --no-global --no-statusline` (set `DO_NOT_TRACK=1`). Its `--dry-run` listing
+  ignores those flags and shows user-level writes that the real run does not
+  make. To remove it: delete `.claude/settings.json`, `.claude/helpers/graft-*`,
+  `.claude/skills/graft/`, `.mcp.json` and `/graft/` (all created by graft).
 - Untracked `.psd`/analysis files in the repo root are not this work's;
   `YOUTUBE_POTOKEN_TRIALS.md` and `*oauth*.json` must never be committed.

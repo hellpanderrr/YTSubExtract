@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 15 open, 3 fixed.
+Total: 16 open, 3 fixed.
 
 ---
 
@@ -234,6 +234,7 @@ Each finding was checked against the code before fixing; two bot claims were wro
 - False/stale comments corrected: `content.js` and `sniffer.js` described the deleted iframe relay; the `_enqueuePageLeg` comment claimed the failed caller times out; `fixtures.mjs` header claimed test-scoped while the code is worker-scoped (the README was right).
 - `.env.e2e.example` trailing newline.
 - Round 2 (Pullfrog): the batch spec's `E2E_RESULT_FILE` write sat BELOW the new strict assertion and below two older ones, so a failing run lost its counts and the comment saying otherwise was false. It now precedes every assertion.
+- Round 3 (Pullfrog): `seedWatchPage` is skipped for translated batches. Its only readers are Tiers 1.7/2C, which translated requests now skip, so it was a forced navigation of the user's tab plus up to ~45s of blocking probes for nothing. `test/seed-translate.test.mjs`, mutation-killed both ways (condition removed, condition inverted).
 
 ---
 
@@ -242,3 +243,11 @@ Each finding was checked against the code before fixing; two bot claims were wro
 **Status: OPEN** · low · verified by `test/tab-pin.test.mjs` ("this caller is lost")
 
 If the executor inside `_coercePlayerTranscript` / `_fetchTranscriptViaTabNav` throws before its timer is created, the lock chain recovers but that call's promise never settles, so one batch worker waits forever. Tier code is not expected to throw there, so only the misleading comment was corrected. Fix: wrap the executor body so any throw calls `passThrough(null)`.
+
+---
+
+### #19 — translation requests skip the `isTranslatable` and same-language checks
+
+**Status: OPEN** · medium · half-verified
+
+Raised by Pullfrog, round 3 on PR #2. **Verified in the code:** every `&tlang=` append in the batch paths is unconditional on `translate` — Tier 0.5 Auth's six strategies (`content.js` ~1689-1723), Tier 1 (`youtube-caption-extractor.js:611`) and the Tier 0 timedtext fallback (`:733`). `isTranslatable` is consulted only in the single-video path (`content.js:2352`). **Not verified** (rests on the bot's yt-dlp references): that YouTube returns the source or a damaged track when the target equals the track's own language or the track is not translatable, and that an 'auto' request picks the English track. Suspected effect: a 'translate to English' batch on an English track sends `lang=en&tlang=en` and may return source text labelled translated — the #3 mislabel, relocated. Fix: one shared guard (skip `tlang` when the track is not translatable or the target equals the track language, and label the result `translated: false` truthfully), with a test. Confirm YouTube's actual behaviour with one real request first.

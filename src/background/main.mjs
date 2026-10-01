@@ -673,7 +673,10 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     // real movie_player to drive via loadVideoById (one navigation per
     // batch; later videos switch in-page). Keeps playlist context (&list=).
     // restoreOriginalTab (end of batch) returns the user to the list page.
-    if (videos.length > 0) {
+    // Skipped for translated batches: Tiers 1.7/2C (the only readers of the
+    // seeded player) cannot translate and are skipped, so the navigation and
+    // up-to-45s probe would be pure latency.
+    if (videos.length > 0 && !options.translate) {
       await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
     }
     results = await processor.process(videos, options);
