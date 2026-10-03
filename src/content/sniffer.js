@@ -5,6 +5,8 @@
 // Runs in the top-level YouTube frame only (manifest all_frames:false) — it
 // must never run in third-party embeds: see docs/LESSONS.md 2026-09-29.
 
+import { buildCaptionTrackOptions } from '../utils/translated-capture.js';
+
 (function() {
     'use strict';
 
@@ -306,14 +308,16 @@
                             // translationLanguage — the player then builds
                             // `tlang=<code>` into its own timedtext request
                             // (player JS: `u.translationLanguage && (H.tlang = lM(u))`).
-                            // Sentinel 'translate-to:' prefix marks the
-                            // translation target for the ISOLATED side to
-                            // verify against the captured URL (2026-10-03).
-                            const trackOpt = { languageCode: pick.languageCode };
-                            if (pick.kind) trackOpt.kind = pick.kind;
-                            if (wantTlang) trackOpt.translationLanguage = { languageCode: wantTlang };
-                            try { player.setOption('captions', 'track', trackOpt); } catch (e) {}
-                            try { player.setOption('captions', 'track', { languageCode: pick.languageCode, kind: pick.kind || undefined }); } catch (e) {}
+                            // FALLBACK, not both: the second setOption must run
+                            // ONLY if the first threw. Both always running
+                            // clobbers the translationLanguage (observed
+                            // 2026-10-03: every capture came back tlang=none).
+                            const [rich, bare] = buildCaptionTrackOptions(pick, wantTlang);
+                            let armed = false;
+                            try { player.setOption('captions', 'track', rich); armed = true; } catch (e) {}
+                            if (!armed) {
+                                try { player.setOption('captions', 'track', bare); } catch (e) {}
+                            }
                         }
                         // Nudge the player into issuing the timedtext request:
                         // toggle off→on with a beat between, up to 3 cycles.

@@ -146,11 +146,21 @@ const MAIN_DRIVE_FUNC = (videoId, wantLang, wantTlang) => {
             try { player.loadModule('cc'); } catch (e) {}
           }
           if (pick && typeof player.setOption === 'function') {
-            const trackOpt = { languageCode: pick.languageCode };
-            if (pick.kind) trackOpt.kind = pick.kind;
-            if (wantTlang) trackOpt.translationLanguage = { languageCode: wantTlang };
-            try { player.setOption('captions', 'track', trackOpt); } catch (e) {}
-            try { player.setOption('captions', 'track', { languageCode: pick.languageCode, kind: pick.kind || undefined }); } catch (e) {}
+            // Inlined twin of src/utils/translated-capture.js's
+            // buildCaptionTrackOptions — this function is serialized into the
+            // page by executeScript, so it cannot import. Keep it in sync.
+            // FALLBACK, not both: a bare follow-up setOption clobbers the
+            // translationLanguage (2026-10-03 tlang=none bug).
+            const rich = { languageCode: pick.languageCode };
+            if (pick.kind) rich.kind = pick.kind;
+            if (wantTlang) rich.translationLanguage = { languageCode: wantTlang };
+            const bare = { languageCode: pick.languageCode };
+            if (wantTlang) bare.translationLanguage = { languageCode: wantTlang };
+            let armed = false;
+            try { player.setOption('captions', 'track', rich); armed = true; } catch (e) {}
+            if (!armed) {
+              try { player.setOption('captions', 'track', bare); } catch (e) {}
+            }
           }
           let cycle = 0;
           const toggleTimer = setInterval(() => {

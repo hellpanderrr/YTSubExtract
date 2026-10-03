@@ -30,3 +30,28 @@ export function captureMatchesRequest(captureTlang, wantTlang) {
   if (!wantTlang) return true;
   return captureTlang === wantTlang;
 }
+
+/**
+ * The `captions`/`track` options to try when arming the player, in order.
+ *
+ * Both entries MUST carry the same translationLanguage when one is wanted:
+ * the driver tries them in sequence and the LAST successful setOption wins,
+ * so a bare fallback after a translated one silently strips the translation
+ * (that exact clobber shipped once — every capture came back `tlang=none`
+ * and the acceptance gate refused them, 2026-10-03 19:0x log).
+ *
+ * Two shapes because player builds differ on whether an explicit
+ * `kind: undefined` is accepted; `bare` is the minimal object.
+ *
+ * @param {{languageCode: string, kind?: string|null}} pick
+ * @param {string|null|undefined} wantTlang
+ * @returns {Array<object>} options for setOption('captions','track', ...)
+ */
+export function buildCaptionTrackOptions(pick, wantTlang) {
+  const tlang = wantTlang ? { translationLanguage: { languageCode: wantTlang } } : {};
+  const rich = { languageCode: pick.languageCode, ...tlang };
+  if (pick.kind) rich.kind = pick.kind;
+  const bare = { languageCode: pick.languageCode };
+  if (wantTlang) bare.translationLanguage = { languageCode: wantTlang };
+  return [rich, bare];
+}
