@@ -96,7 +96,7 @@ const MAIN_PROBE_FUNC = () => {
   return state;
 };
 
-const MAIN_DRIVE_FUNC = (videoId, wantLang) => {
+const MAIN_DRIVE_FUNC = (videoId, wantLang, wantTlang) => {
   const fail = (detail) => window.postMessage({ type: 'COERCE_PLAYER_FAILED', requestId: 'scripting', videoId, detail }, '*');
   const done = (detail) => window.postMessage({ type: 'COERCE_PLAYER_COMPLETE', requestId: 'scripting', videoId, detail }, '*');
   try { document.querySelectorAll('video, audio').forEach((el) => { el.muted = true; el.volume = 0; }); } catch (e) {}
@@ -146,7 +146,10 @@ const MAIN_DRIVE_FUNC = (videoId, wantLang) => {
             try { player.loadModule('cc'); } catch (e) {}
           }
           if (pick && typeof player.setOption === 'function') {
-            try { player.setOption('captions', 'track', { languageCode: pick.languageCode }); } catch (e) {}
+            const trackOpt = { languageCode: pick.languageCode };
+            if (pick.kind) trackOpt.kind = pick.kind;
+            if (wantTlang) trackOpt.translationLanguage = { languageCode: wantTlang };
+            try { player.setOption('captions', 'track', trackOpt); } catch (e) {}
             try { player.setOption('captions', 'track', { languageCode: pick.languageCode, kind: pick.kind || undefined }); } catch (e) {}
           }
           let cycle = 0;
@@ -222,7 +225,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           target: { tabId },
           world: 'MAIN',
           func: MAIN_DRIVE_FUNC,
-          args: [request.videoId, request.wantLang || null],
+          args: [request.videoId, request.wantLang || null, request.wantTlang || null],
         });
         sendResponse({ success: true });
       } catch (e) {
@@ -673,10 +676,11 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     // real movie_player to drive via loadVideoById (one navigation per
     // batch; later videos switch in-page). Keeps playlist context (&list=).
     // restoreOriginalTab (end of batch) returns the user to the list page.
-    // Skipped for translated batches: Tiers 1.7/2C (the only readers of the
-    // seeded player) cannot translate and are skipped, so the navigation and
-    // up-to-45s probe would be pure latency.
-    if (videos.length > 0 && !options.translate) {
+    // Since 2026-10-03 this runs for translated batches too: 1.7 is now the
+    // translation-capable player tier (arms a translationLanguage and the
+    // capture is accepted only with a matching tlang), and with API tiers
+    // bot-checked it is the tier that actually works. See ISSUES #3/#21.
+    if (videos.length > 0) {
       await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
     }
     results = await processor.process(videos, options);

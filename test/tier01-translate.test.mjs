@@ -72,10 +72,14 @@ test('control: an untranslated request still tries Tier 0.1 before Tier 1', asyn
   assert.deepEqual(calls, ['tier0', 'tier0.1', 'tier1']);
 });
 
-// Tiers 1.7 (player coercion) and 2C (tab navigation) record whatever language
-// the player arms and have no translation option, yet their results were
-// cached as `translated: translate`. For a translated request they must be
-// skipped so the translation-aware Tier 0.5 Auth fallback runs instead.
+// Tier 1.7 (player coercion) CAN translate since 2026-10-03: it arms the
+// source track carrying a translationLanguage, the player builds `tlang=` into
+// its own timedtext request, and the content script accepts the capture only
+// when the URL carried the requested tlang (src/utils/translated-capture.js).
+// So a translated request now DOES use 1.7 — a hard reversal of the
+// 2026-10-02 skip, forced by the real 2026-10-03 log where every API tier was
+// bot-checked and the skip left translated batches with zero working tiers.
+// Tier 2C still cannot translate (it never arms a track) and stays skipped.
 function patchPageLegTiers() {
   const orig = {
     embed: tm._extractFromEmbed,
@@ -89,7 +93,7 @@ function patchPageLegTiers() {
   };
   tm._coercePlayerTranscript = async () => {
     calls.push('tier1.7');
-    return [{ start: 0, duration: 1, text: 'source-language text' }];
+    return [{ start: 0, duration: 1, text: 'translated text' }];
   };
   tm._fetchTranscriptViaTabNav = async () => {
     calls.push('tier2c');
@@ -107,20 +111,49 @@ function patchPageLegTiers() {
   };
 }
 
-test('a translated request never uses player capture (1.7 / 2C) and falls through to Auth', async () => {
+test('a translated request arms Tier 1.7 with the target tlang (and never 2C)', async () => {
   tier1Fails = true;
   const restore = patchPageLegTiers();
+  const seenOptions = [];
+  const origCoerce = tm._coercePlayerTranscript;
+  tm._coercePlayerTranscript = async (videoId, options) => {
+    seenOptions.push(options);
+    return origCoerce(videoId, options);
+  };
   try {
     const result = await tm.getTranscriptForPlaylist(`pl-tr-yes-${Date.now()}`, {
       sourceLang: 'auto',
       translate: true,
       targetLang: 'ru',
     });
-    assert.ok(!calls.includes('tier1.7'), '1.7 cannot translate and must be skipped');
-    assert.ok(!calls.includes('tier2c'), '2C cannot translate and must be skipped');
-    assert.ok(calls.includes('auth'));
-    assert.equal(result.source, 'tier0.5-auth');
+    assert.ok(calls.includes('tier1.7'), '1.7 is now the translation-capable player tier');
+    assert.ok(!calls.includes('tier2c'), '2C cannot arm a translationLanguage and must be skipped');
+    assert.equal(seenOptions.length, 1);
+    assert.equal(seenOptions[0].tlang, 'ru', '1.7 must be armed with the requested target language');
+    assert.equal(result.source, 'tier1.7-player-coercion');
     assert.equal(result.result[0].text, 'translated text');
+  } finally {
+    restore();
+  }
+});
+
+test('an untranslated request arms Tier 1.7 with NO tlang', async () => {
+  tier1Fails = true;
+  const restore = patchPageLegTiers();
+  const seenOptions = [];
+  const origCoerce = tm._coercePlayerTranscript;
+  tm._coercePlayerTranscript = async (videoId, options) => {
+    seenOptions.push(options);
+    return origCoerce(videoId, options);
+  };
+  try {
+    await tm.getTranscriptForPlaylist(`pl-tr-no-lang-${Date.now()}`, {
+      sourceLang: 'auto',
+      translate: false,
+      targetLang: 'en',
+    });
+    assert.equal(seenOptions.length, 1);
+    assert.equal(seenOptions[0].tlang, null, 'no translation requested → no tlang arming');
   } finally {
     restore();
   }

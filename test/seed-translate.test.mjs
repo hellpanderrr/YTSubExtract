@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { installChrome, waitFor } from './helpers/chrome-mock.mjs';
 
 // seedWatchPage navigates the user's tab to a /watch page (and restores it at
-// the end) so Tiers 1.7 and 2C have a real player to drive. A translated
-// request skips both tiers (they cannot translate), so the seed would be a
-// forced navigation plus up to ~45s of blocking probes that nothing reads.
+// the end) so Tier 1.7 (and 2C, untranslated) has a real player to drive.
+// NOTE: until 2026-10-03 this file documented the opposite contract (a
+// translated batch skipped the seed because 1.7/2C were skipped as
+// untranslatable). 1.7 gained translation support that day — it is the seed's
+// main reader for translated batches now.
 
 const { state, send } = installChrome();
 const { translationManager: tm } = await import('../src/background/translation-manager.mjs');
@@ -61,9 +63,14 @@ test('an untranslated batch seeds the watch page once (control)', async () => {
   assert.equal(seedCalls, 1);
 });
 
-test('a translated batch does NOT seed the watch page', async () => {
+test('a translated batch DOES seed the watch page (1.7 became translation-capable)', async () => {
+  // Reversed 2026-10-03: Tier 1.7 now arms a translationLanguage and the
+  // capture is accepted only with a matching tlang, so a translated batch
+  // reads the seeded player again. With API tiers bot-checked it is the tier
+  // that actually works (ISSUES #3/#21). The header comment at the top of
+  // this file predates the reversal.
   await runBatch({ translate: true });
-  assert.equal(seedCalls, 0, 'nothing in a translated batch reads the seeded player');
+  assert.equal(seedCalls, 1, '1.7 reads the seeded player for translated batches again');
 });
 
 test('a batch with no translate flag at all still seeds (undefined is not "translated")', async () => {

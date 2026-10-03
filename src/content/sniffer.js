@@ -244,7 +244,7 @@
     // source of truth is getPlayerResponse, and arming uses setOption +
     // toggle unconditionally instead of waiting on getOption.
     function drivePlayerCoercion(payload) {
-        const { videoId, requestId, wantLang } = payload;
+        const { videoId, requestId, wantLang, wantTlang } = payload;
         const fail = (detail) => window.postMessage({ type: 'COERCE_PLAYER_FAILED', requestId, videoId, detail }, '*');
         const done = (detail) => window.postMessage({ type: 'COERCE_PLAYER_COMPLETE', requestId, videoId, detail }, '*');
         const respTracks = () => {
@@ -302,7 +302,17 @@
                             try { player.loadModule('cc'); } catch (e) {}
                         }
                         if (pick && typeof player.setOption === 'function') {
-                            try { player.setOption('captions', 'track', { languageCode: pick.languageCode }); } catch (e) {}
+                            // wantTlang: arm the SOURCE track carrying a
+                            // translationLanguage — the player then builds
+                            // `tlang=<code>` into its own timedtext request
+                            // (player JS: `u.translationLanguage && (H.tlang = lM(u))`).
+                            // Sentinel 'translate-to:' prefix marks the
+                            // translation target for the ISOLATED side to
+                            // verify against the captured URL (2026-10-03).
+                            const trackOpt = { languageCode: pick.languageCode };
+                            if (pick.kind) trackOpt.kind = pick.kind;
+                            if (wantTlang) trackOpt.translationLanguage = { languageCode: wantTlang };
+                            try { player.setOption('captions', 'track', trackOpt); } catch (e) {}
                             try { player.setOption('captions', 'track', { languageCode: pick.languageCode, kind: pick.kind || undefined }); } catch (e) {}
                         }
                         // Nudge the player into issuing the timedtext request:

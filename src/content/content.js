@@ -1,5 +1,7 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
 import { readUntilStable } from '../utils/stable-read.js';
+import { extractPlaylistListId, pickRowHref, sweepPlaylistSelectors } from '../utils/playlist-rows.js';
+import { captureMatchesRequest } from '../utils/translated-capture.js';
 import { runFastAbort } from '../utils/fast-abort.js';
 import { pruneOldest } from '../utils/prune-map.js';
 
@@ -41,7 +43,7 @@ const MAX_CAPTURED_VIDEOS = 40;
           if (!capturedTranscripts.has(videoId)) {
             capturedTranscripts.set(videoId, new Map());
           }
-          capturedTranscripts.get(videoId).set(lang, { text: entry.text, timestamp: entry.timestamp });
+          capturedTranscripts.get(videoId).set(lang, { text: entry.text, timestamp: entry.timestamp, tlang: entry.tlang || null });
         }
       }
     }
@@ -91,13 +93,13 @@ window.addEventListener('message', (event) => {
     // Store full captured transcript bodies (sniffer captures these
     // when the real YouTube player makes PoToken-authenticated requests)
     if (event.data?.type === 'YTSUB_CAPTURED_TRANSCRIPT') {
-        const { videoId, lang, text, timestamp } = event.data;
+        const { videoId, lang, text, timestamp, tlang } = event.data;
         if (!videoId || !text) return;
 
         if (!capturedTranscripts.has(videoId)) {
             capturedTranscripts.set(videoId, new Map());
         }
-        capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp });
+        capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp, tlang: tlang || null });
         pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
 
         if (DEBUG) {
@@ -1233,15 +1235,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // playlist rows with; the older `ytd-playlist-video-renderer` elements
         // are no longer emitted, so without it this tier matched nothing.
         const selectors = [
+          // Scoped FIRST: the container for the playlist actually on screen.
+          // Document-wide selectors used to run before this and could match
+          // stale rows from a previous playlist kept elsewhere in the SPA
+          // document (2026-10-02: German playlist, popup showed old DL rows).
+          'ytd-browse[page-subtype="playlist"] yt-lockup-view-model',
           'ytd-playlist-video-renderer',
           'ytd-playlist-panel-video-renderer',
           '.ytd-playlist-video-list-renderer > .ytd-playlist-video-renderer',
-          // Scope the lockup selector to the playlist browse container first, so
-          // unrelated lockups (recommendations, shelves) are not swept in.
-          'ytd-browse[page-subtype="playlist"] yt-lockup-view-model',
+          // Unscoped lockup sweep is last resort only — it also sees
+          // recommendations/shelves; the row-level list filter below is what
+          // actually keeps foreign rows out.
           'yt-lockup-view-model',
           '[data-playlist-item]'
         ];
+
+        // Counters from the last snapshot read, for post-stability logging
+        // (the read itself runs up to DEFAULT_MAX_READS times).
+        let lastSelector = null;
+        let lastMatch = null;
+        let lastRawCount = 0;
+        let lastFilteredCount = 0;
+        let sawAnyElements = false;
+        // Per-selector attempt lines, deduped across stability re-reads.
+        const attemptLinesLogged = new Set();
 
         // One DOM snapshot: selector sweep + per-row extraction. Stabilized
         // via readUntilStable — a one-shot read accepted any partial count
@@ -1249,62 +1266,94 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // playlist; only 0 fell through to the API). Each read re-queries
         // until two consecutive counts agree; bounded by DEFAULT_MAX_READS.
         const readDomSnapshot = () => {
-          let videoElements = [];
-          for (const selector of selectors) {
-            videoElements = document.querySelectorAll(selector);
-            if (videoElements.length > 0) {
-              log(`Found ${videoElements.length} videos using selector: ${selector}`);
-              break;
-            }
-          }
+          // sawAnyElements accumulates across stability reads (never reset):
+          // the empty-branch log must say whether elements were EVER seen,
+          // not just on the last read.
 
-          const rows = [];
-          for (const el of videoElements) {
-            try {
-              // Find video link
-              const link = el.querySelector('a[href*="/watch"]') || el.querySelector('#video-title');
-              if (!link) continue;
+          // Row extraction for ONE selector's elements (fed to the sweep).
+          const extractRows = (selector) => {
+            const videoElements = document.querySelectorAll(selector);
+            if (videoElements.length > 0) sawAnyElements = true;
 
-              const href = link.getAttribute('href');
-              if (!href) continue;
+            const rows = [];
+            for (const el of videoElements) {
+              try {
+                // A lockup row renders BOTH a bare `/watch?v=X` anchor (a
+                // click-tracking endpoint) and the real `/watch?v=X&list=…`
+                // link. Take the first anchor that carries the playlist id —
+                // order-independent, so row identity survives whichever comes
+                // first in the DOM (verified 2026-10-02 against a live page's
+                // lockupViewModel: 14 list-bearing vs 16 bare watch urls).
+                const watchAnchors = el.querySelectorAll('a[href*="/watch"]');
+                const href = pickRowHref(watchAnchors) ||
+                             (el.querySelector('#video-title')?.getAttribute('href')) || '';
+                if (!href) continue;
 
-              // Extract video ID from href
-              const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-              if (!videoIdMatch) continue;
-              const videoId = videoIdMatch[1];
+                // Extract video ID from href
+                const videoIdMatch = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+                if (!videoIdMatch) continue;
+                const videoId = videoIdMatch[1];
 
-              // Extract title
-              let title = 'Unknown';
-              const titleEl = el.querySelector('#video-title') ||
-                             el.querySelector('yt-lockup-metadata-view-model h3') ||
-                             el.querySelector('a[title]') ||
-                             el.querySelector('.ytd-video-meta-block #video-title') ||
-                             link;
-              if (titleEl) {
-                title = titleEl.getAttribute('title') ||
-                       titleEl.textContent?.trim() ||
-                       'Unknown';
+                // Extract title
+                let title = 'Unknown';
+                const titleEl = el.querySelector('#video-title') ||
+                               el.querySelector('yt-lockup-metadata-view-model h3') ||
+                               el.querySelector('a[title]') ||
+                               el.querySelector('.ytd-video-meta-block #video-title');
+                if (titleEl) {
+                  title = titleEl.getAttribute('title') ||
+                         titleEl.textContent?.trim() ||
+                         'Unknown';
+                }
+
+                // Extract duration
+                let duration = '';
+                const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
+                                  el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
+                                  el.querySelector('.badge-shape-wiz__text') ||
+                                  el.querySelector('[class*="duration"]');
+                if (durationEl) {
+                  duration = durationEl.textContent?.trim() || '';
+                }
+
+                rows.push({ videoId, title, duration, listId: extractPlaylistListId(href) });
+              } catch (e) {
+                log(`Error extracting video: ${e.message}`);
               }
-
-              // Extract duration
-              let duration = '';
-              const durationEl = el.querySelector('ytd-thumbnail-overlay-time-status-renderer span') ||
-                                el.querySelector('yt-thumbnail-bottom-overlay-view-model') ||
-                                el.querySelector('.badge-shape-wiz__text') ||
-                                el.querySelector('[class*="duration"]');
-              if (durationEl) {
-                duration = durationEl.textContent?.trim() || '';
-              }
-
-              rows.push({ videoId, title, duration });
-            } catch (e) {
-              log(`Error extracting video: ${e.message}`);
             }
-          }
-          return rows;
+            return rows;
+          };
+
+          // First selector whose identity-filtered rows belong to THIS
+          // playlist wins — positive tags preferred over untagged survivors,
+          // so a stale container matching an early selector cannot suppress
+          // a correct scoped selector behind it (ISSUES #21).
+          const onAttempt = (selector, rawCount, keptCount) => {
+            const line = `${selector}: ${rawCount} rows, ${keptCount} for list=${msg.playlistId}`;
+            if (attemptLinesLogged.has(line)) return;
+            attemptLinesLogged.add(line);
+            log(line);
+          };
+          const hit = sweepPlaylistSelectors(selectors, extractRows, msg.playlistId, onAttempt);
+          lastSelector = hit ? hit.selector : null;
+          lastMatch = hit ? hit.match : null;
+          lastRawCount = hit ? hit.rawCount : 0;
+          lastFilteredCount = hit ? hit.rows.length : 0;
+          return hit ? hit.rows : [];
         };
 
         const videos = await readUntilStable(readDomSnapshot);
+
+        if (videos.length === 0) {
+          log(sawAnyElements
+            ? `Candidate rows existed but none belonged to list=${msg.playlistId} — trying fallbacks`
+            : 'No playlist elements found in DOM — trying fallbacks');
+        } else {
+          if (lastFilteredCount !== lastRawCount) {
+            log(`Row filter: kept ${lastFilteredCount} of ${lastRawCount} candidate rows (${lastRawCount - lastFilteredCount} tagged with another playlist)`);
+          }
+          log(`Selector "${lastSelector}" won with ${lastFilteredCount} rows${lastMatch === 'tagged' ? ' (positive list= match)' : ' (untagged fallback)'}`);
+        }
 
         if (videos.length === 0) {
           // Try to find in ytInitialData via page context
@@ -1323,6 +1372,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     for (const item of videoList.contents) {
                       const renderer = item?.playlistVideoRenderer;
                       if (renderer?.videoId) {
+                        // Same row-identity guard as the DOM path: stale
+                        // ytInitialData survives SPA navigation.
+                        const rowListId = renderer.navigationEndpoint?.watchEndpoint?.playlistId;
+                        if (rowListId && rowListId !== msg.playlistId) {
+                          log(`ytInitialData: skipping ${renderer.videoId} (list=${rowListId})`);
+                          continue;
+                        }
                         let title = 'Unknown';
                         if (renderer.title?.runs?.length > 0) {
                           title = renderer.title.runs.map(r => r.text).join('');
@@ -1889,7 +1945,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const logs = [];
       const log = (m) => logs.push(`[CoercePlayer] ${m}`);
-      const { videoId, lang = null, desiredLang = null, timeout = 22000 } = msg;
+      const { videoId, lang = null, desiredLang = null, wantTlang = null, timeout = 22000 } = msg;
 
       // The player lives in MAIN world, untouchable from here — including the
       // fail-fast element check: a player shell in ISOLATED DOM tells us
@@ -1958,6 +2014,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           for (const entry of videoMap.values()) order.push(entry);
           for (const entry of order) {
             if (entry?.text) {
+              // Translated requests accept ONLY a capture whose URL carried
+              // the requested tlang — a source capture would be mislabeled
+              // (docs/ISSUES.md #3). Source requests accept anything.
+              if (!captureMatchesRequest(entry.tlang, wantTlang)) continue;
               const segments = parseSegments(entry.text);
               if (segments) return { segments, bytes: entry.text.length };
             }
@@ -2020,6 +2080,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
             const { text, lang: captureLang, tlang } = event.data;
             if (!text || text.trim().length === 0) return;
+
+            // Same acceptance rule as drainCache: for a translated request, a
+            // source-language capture (no tlang / wrong tlang) must not be
+            // taken as the answer.
+            if (!captureMatchesRequest(tlang, wantTlang)) {
+              log(`Ignoring capture (lang=${captureLang}, tlang=${tlang || 'none'}) — request needs tlang=${wantTlang}`);
+              return;
+            }
 
             const segments = parseSegments(text);
             if (segments) {
@@ -2099,6 +2167,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             videoId,
             requestId,
             wantLang,
+            wantTlang,
           }, '*');
           log('Player drive request sent to MAIN-world sniffer');
           // If the sniffer never reports within 6s, fall back to scripting.
@@ -2109,6 +2178,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               videoId,
               requestId,
               wantLang,
+              wantTlang,
             }, (resp) => {
               if (finished) return;
               if (chrome.runtime.lastError || !resp?.success) {

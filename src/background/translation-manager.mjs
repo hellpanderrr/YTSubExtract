@@ -209,6 +209,12 @@ export class TranslationManager {
           }
 
           console.log(`[Tier 0.5 Playlist] Success: ${response.videos?.length || 0} videos, title: ${response.title}`);
+          // Print the extraction log on success too — selector wins and row
+          // filter drops were previously failure-only, which left the 2026-10-02
+          // wrong-playlist incident undiagnosable from the log.
+          if (response.logs?.length) {
+            console.log('[Tier 0.5 Playlist] Logs:', response.logs);
+          }
           resolve({
             videos: response.videos || [],
             title: response.title || ''
@@ -326,7 +332,7 @@ export class TranslationManager {
   // Requires an active YouTube tab with a initialized player.
   // ─────────────────────────────────────────────────────────────
   async _coercePlayerTranscript(videoId, options = {}) {
-    const { lang = 'auto', timeout = 25000 } = options;
+    const { lang = 'auto', timeout = 25000, tlang = null } = options;
     // Serialize: every caller drives the same movie_player via loadVideoById.
     return new Promise((resolve) => {
       this._enqueuePageLeg(() => new Promise((innerResolve) => {
@@ -352,6 +358,7 @@ export class TranslationManager {
             videoId,
             lang: lang !== 'auto' ? lang : null,
             desiredLang: lang !== 'auto' ? lang : null,
+            wantTlang: tlang,
             timeout: timeout - 2000
           }, (response) => {
             clearTimeout(timer);
@@ -2262,17 +2269,22 @@ export class TranslationManager {
     // fails fast. Serialized on _pageLegLock — the ONE lock shared with 2C,
     // because both drive the same pinned tab; API tiers above stay parallel.
     throwIfStopped();
-    // Player capture records whatever language the player arms and has no
-    // translation option, yet its result is cached as `translated: translate`.
-    // For a translated request skip it (and 2C below) so the translation-aware
-    // Tier 0.5 Auth fallback runs instead of shipping source-language text
-    // under a target-language label (docs/ISSUES.md #3).
-    if (translate) {
-      log('[Tier 1.7 Player Coercion] Skipped: player capture cannot translate');
-    } else try {
+    // 2026-10-03: player capture CAN translate — the player's track option
+    // takes a translationLanguage, which makes the player itself request
+    // `&tlang=` (player JS: `u.translationLanguage && (H.tlang = lM(u))`; see
+    // src/utils/translated-capture.js). The content script accepts a capture
+    // for a translated request ONLY when its URL carried the requested tlang,
+    // so a player that ignores the option falls through to Auth instead of
+    // shipping source-language text under a target label (docs/ISSUES.md #3).
+    // This deliberately reverses the 2026-10-02 blanket skip: with every API
+    // tier bot-checked, skipping 1.7 left translated batches with zero working
+    // tiers (real log, 2026-10-03). 2C below stays skipped — it arms nothing,
+    // so it can never produce a tlang capture.
+    try {
       log('[Tier 1.7 Player Coercion] Coercing shared player...');
       const coerced = await this._coercePlayerTranscript(videoId, {
         lang: sourceLang,
+        tlang: translate ? targetLang : null,
         timeout: 25000
       });
 
@@ -2303,7 +2315,11 @@ export class TranslationManager {
     // videos. The tab briefly visits each video.
     throwIfStopped();
     if (translate) {
-      log('[Tier 2C Tab Nav] Skipped: player capture cannot translate');
+      // 2C navigates and lets the player do whatever it does — it never arms
+      // a translationLanguage, so a translated request through it can only
+      // produce a source capture, which the acceptance gate rejects anyway.
+      // Skip it so the translation-aware Auth fallback runs instead.
+      log('[Tier 2C Tab Nav] Skipped: cannot arm tlang (no player drive)');
     } else try {
       log('[Tier 2C Tab Nav] Navigating tab to watch page...');
       const tabResult = await this._fetchTranscriptViaTabNav(videoId, {
