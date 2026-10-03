@@ -1,5 +1,16 @@
-import { Innertube, UniversalCache } from 'youtubei.js';
+import { Innertube, UniversalCache, Log } from 'youtubei.js';
 import { fetchTextWithTimeout, fetchResponseWithTimeout } from '../utils/fetch-timeout.js';
+
+// youtubei.js logs "[YOUTUBEJS][Parser]: X changed!" warnings for every
+// YouTube response-shape drift. Against a live YouTube these fire hundreds of
+// times per session (observed 2026-10-03: a single batch produced ~26k log
+// lines, nearly all parser warnings) and bury OUR logs in the SW console.
+// They are upstream parse noise for a tier that is demoted behind Tier 1 and
+// has no recorded success in this environment — not actionable here.
+// WARNING keeps genuine failures visible (e.g. the HTTP 400s we do read)
+// while silencing the shape-drift chatter. Note: this cannot be expressed in
+// Log.setLevel args via the default export shape — setLevel takes levels.
+Log.setLevel(Log.Level.ERROR);
 
 // Polyfill for youtubei.js environment detection
 if (typeof document === 'undefined') {

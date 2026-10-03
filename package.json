@@ -35,7 +35,7 @@
     "vite": "^6.4.1",
     "vite-plugin-node-polyfills": "^0.25.0",
     "vite-plugin-static-copy": "^2.3.2",
-    "youtubei.js": "^16.0.1",
+    "youtubei.js": "^18.1.0",
     "zip-a-folder": "^3.1.9"
   }
 }
