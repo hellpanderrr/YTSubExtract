@@ -108,6 +108,11 @@ Fall back to Grep/Read for non-code files (`docs/`, `manifest.json`,
   scripted `null` instead of delivering it (`test/watch-seed.test.mjs`,
   2026-09-26).
 
+## Working with the PR review bots (Pullfrog, CodeRabbit)
+
+- After every push to an open PR, read **both** bots' newest reviews in full before reporting: `gh api repos/hellpanderrr/YTSubExtract/pulls/N/reviews` and `.../pulls/N/comments`. Pullfrog puts findings inside collapsed `<details>` blocks — never `cut`/`sed` bot text. Skipped twice (`docs/LESSONS.md` 2026-10-02, 2026-10-05).
+- "Pre-existing / outside the diff" is relative to the PR base, not your own commits: check `git show origin/main:<file> | grep` before using it.
+
 ## Project Structure
 
 ### Chrome Extension (MV3) — YouTube Subtitle Downloader
@@ -144,6 +149,10 @@ src/
     fetch-timeout.js              fetchTextWithTimeout — 10s AbortController covering headers + body;
                                   fetchResponseWithTimeout — same deadline, raw Response (youtubei.js)
     stable-read.js                readUntilStable — re-read a live DOM snapshot until two counts agree
+    fast-abort.js                 runFastAbort — Tier 1.7 wait-level abort window (arm+10s)
+    prune-map.js                  pruneOldest — caps the content-script capture store (40 videos)
+    playlist-rows.js              Tier 0.5 row identity: list= filter, positive-evidence selector sweep, pickRowHref
+    translated-capture.js         bidirectional tlang acceptance gate, captureKey, caption-track arming options
 ```
 
 ### Multi-Tier Extraction System
@@ -172,7 +181,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 ### Key Architectural Decisions
 
 - **PoToken / BotGuard**: YouTube's JS VM generates runtime client attestation tokens. Timedtext requests without a valid PoToken return HTTP 200 with 0-byte body. The only reliable bypass is navigating a real YouTube tab to the watch page where the native player solves BotGuard.
-- **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. `content.js` (document_idle, ISOLATED world) injects a bootstrap script that reads this global and relays it via `postMessage` to the ISOLATED-world `capturedTranscripts` Map. This solves the timing gap where the content script's message listener doesn't exist when the sniffer fires at document_start.
+- **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. The sniffer also `postMessage`s every capture live (`YTSUB_CAPTURED_TRANSCRIPT`, carrying `tlang`) — that is the primary feed into `content.js`'s (document_idle, ISOLATED world) `capturedTranscripts` Map, keyed `captureKey(lang, tlang)`. Captures that fired before that listener existed are recovered by `content.js` posting `YTSUB_REQUEST_BACKFILL`, to which the sniffer re-broadcasts the global; `content.js` does NOT inject a script for this (script injection from the ISOLATED world does not execute on youtube.com — proven 2026-09-20).
 - **event.source filtering**: `content.js` currently does not filter `YTSUB_CAPTURED_TRANSCRIPT` by `event.source`. The old reason (the embed-iframe tier relayed via `window.parent.postMessage()`) is gone — that tier and the sniffer's iframe relay were deleted 2026-09-29 and the sniffer is top-frame-only — so adding `event.source === window` is now a safe hardening against child-iframe forgery (`docs/ISSUES.md`), not yet done.
 - **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7 so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
 - **DNR rules** (`rules.json` — 2 rules, ids 1/3; ids 4/5 deleted 2026-09-29):
@@ -184,4 +193,4 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 - **Progress polling**: background writes to `chrome.storage.local`, popup polls every 500ms
 - **Deduplication**: TranslationManager deduplicates concurrent metadata/transcript requests by video ID
 - **Atomic progress updates**: batch download progress reads-merges-writes to prevent stale state from SW restarts
-- **`content.js` runs in ISOLATED world** (no `"world": "MAIN"` in manifest) — this means it cannot access page-defined JS variables (ytInitialPlayerResponse, etc.) directly. Must use script injection for MAIN-world access or `window.__ytsub_*` globals.
+- **`content.js` runs in ISOLATED world** (no `"world": "MAIN"` in manifest) — this means it cannot access page-defined JS variables (ytInitialPlayerResponse, etc.) directly. Script injection from this world does not execute on youtube.com; reach the MAIN world by `postMessage` to the sniffer (`YTSUB_DRIVE_PLAYER`, `YTSUB_REQUEST_BACKFILL`) or through the background's `chrome.scripting.executeScript({world:'MAIN'})` (`DRIVE_PLAYER_MAIN`).

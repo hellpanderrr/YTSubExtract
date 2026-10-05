@@ -3,31 +3,39 @@
 _Updated 2026-10-05 — branch playlist-download_
 
 ## State
-PR #2 (`playlist-download` -> `main`; merge-commit, don't squash) carries the
-1.1.5 release: playlist-identity fix (#21), Tier 1.7 translating via the
-player's `translationLanguage` (#3), youtubei.js 18. Translated requests skip
-Tiers 0.1 and 2C only; 1.7 arms `tlang` and the watch-page seed runs for them.
-Every bot finding so far is fixed or logged. Store already has 1.1.4.
+1.1.5 is uploaded to the Web Store as a DRAFT (`uploadState: SUCCESS`, built from
+`925e361`; the shipped code is identical to HEAD). PR #2 (`playlist-download` ->
+`main`; merge-commit, don't squash) has had three bot rounds; what is left is
+logged (#6, #23-#25). The close commit is local and unpushed.
 
 ## Open threads
-- **Publish:** run `publish_store_draft.yml` on this branch (uploads with
-  `publish: false`), check the dashboard draft, then publish. Needs the user's go.
+- **Submit the 1.1.5 draft** in the Web Store dashboard (user action).
+- **#23:** check Cloud project `ytsubextract-api` -> Audience says "In production"
+  (needs home-page + privacy URLs, see #23). If still Testing, the new
+  `REFRESH_TOKEN` dies ~2026-10-12. The token was pasted into a chat: revoke it at
+  myaccount.google.com/permissions, make a new one, set it with
+  `printf '%s' "$T" | gh secret set REFRESH_TOKEN`.
 - **Unconfirmed:** that the live player honors `translationLanguage`. Proof is
-  `Captured … tlang=<target>` in a real translated batch log, or a headed
-  `PROBE_TLANG=1` run of `e2e/probe-tlang.spec.mjs`.
-- After any push: read both bots (`gh pr checks 2`, then the PR comments).
-- Open, not release-blocking: #6 (ZIP lost when both delivery paths fail), #22
-  (first-srt latency), #16, #18, #19.
+  `Captured … tlang=<target>` in a real translated-batch log, or a headed
+  `PROBE_TLANG=1 E2E_HEADED=1` run of `e2e/probe-tlang.spec.mjs` (first run
+  `npx playwright install chromium`; the browser cache was pruned).
+- **Pullfrog console:** add to Review PRs custom instructions "post each finding
+  as its own comment, never only inside `<details>`"; delete its stale Learnings
+  line about CLAUDE.md `event.source` drift (the doc is now correct).
+- Open, in 1.1.5: #6 (ZIP delivery double-failure still says completed), #24
+  (Stop during the seed waits it out), #25 (Tier 3). Also #22, #16, #18, #19.
+- After any push: read both bots' newest reviews in full (CLAUDE.md has the commands).
 
 ## Running / unfinished
 Nothing running. Reload the unpacked extension after every build.
 
 ## Don't redo
-- E2E can't test #21: a reload can't carry stale SPA rows, and an empty Tier
-  0.5 falls through to a correct API list. Unit tests + mutation scripts cover it.
-- Run `node scripts/mutate-playlist-rows.mjs` and
-  `node scripts/mutate-translated-capture.mjs`; both must exit 0.
-- 0/6 headless e2e results are YouTube's bot-check, not a regression.
+- E2E can't test #21 (reload carries no stale SPA rows; an empty Tier 0.5 falls
+  through to a correct API list). Unit tests + mutation scripts cover it.
+- `node scripts/mutate-playlist-rows.mjs` and `node scripts/mutate-translated-capture.mjs`
+  must both exit 0.
+- 0/6 headless e2e is expected under YouTube's bot-check (#1); confirm "Sign in to
+  confirm you're not a bot" in the SW log before ruling out an extraction regression.
 - Graft: only `init --agents claude --no-global --no-statusline`; never `npx graft`.
-- Root `.psd`/analysis files and `scripts/login.js`, `scripts/test-batch.js`
-  aren't this work's; leave them untracked.
+- Untracked root `.psd`/analysis files, `scripts/login.js`, `scripts/test-batch.js`
+  and `.puppeteer-profile/` (a Chrome profile: never `git add` it) aren't this work's.
