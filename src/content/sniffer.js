@@ -5,7 +5,7 @@
 // Runs in the top-level YouTube frame only (manifest all_frames:false) — it
 // must never run in third-party embeds: see docs/LESSONS.md 2026-09-29.
 
-import { buildCaptionTrackOptions } from '../utils/translated-capture.js';
+import { buildCaptionTrackOptions, captureKey } from '../utils/translated-capture.js';
 
 (function() {
     'use strict';
@@ -96,17 +96,23 @@ import { buildCaptionTrackOptions } from '../utils/translated-capture.js';
         if (!window.__ytsub_captured_transcripts[videoId]) {
             window.__ytsub_captured_transcripts[videoId] = {};
         }
-        if (!window.__ytsub_captured_transcripts[videoId][lang || 'unknown']) {
-            window.__ytsub_captured_transcripts[videoId][lang || 'unknown'] = [];
+        // Keyed by lang AND tlang: a translated capture (lang=en&tlang=ru)
+        // must not overwrite the source one (lang=en), or vice versa. tlang is
+        // stored on the entry too, so the backfill bridge can apply the
+        // acceptance gate (it used to arrive as null).
+        const key = captureKey(lang, tlang);
+        if (!window.__ytsub_captured_transcripts[videoId][key]) {
+            window.__ytsub_captured_transcripts[videoId][key] = [];
         }
-        window.__ytsub_captured_transcripts[videoId][lang || 'unknown'].push({
+        window.__ytsub_captured_transcripts[videoId][key].push({
             text: text,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            tlang: tlang || null
         });
-        // Keep only the latest capture per video/lang
-        if (window.__ytsub_captured_transcripts[videoId][lang || 'unknown'].length > 1) {
-            window.__ytsub_captured_transcripts[videoId][lang || 'unknown'] =
-                window.__ytsub_captured_transcripts[videoId][lang || 'unknown'].slice(-1);
+        // Keep only the latest capture per video/lang/tlang
+        if (window.__ytsub_captured_transcripts[videoId][key].length > 1) {
+            window.__ytsub_captured_transcripts[videoId][key] =
+                window.__ytsub_captured_transcripts[videoId][key].slice(-1);
         }
 
         const message = {

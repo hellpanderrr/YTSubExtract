@@ -1,7 +1,7 @@
 import { YouTubeTranscriptApi } from '@playzone/youtube-transcript/dist/api/index.js';
 import { readUntilStable } from '../utils/stable-read.js';
 import { extractPlaylistListId, pickRowHref, sweepPlaylistSelectors } from '../utils/playlist-rows.js';
-import { captureMatchesRequest } from '../utils/translated-capture.js';
+import { captureMatchesRequest, captureKey } from '../utils/translated-capture.js';
 import { runFastAbort } from '../utils/fast-abort.js';
 import { pruneOldest } from '../utils/prune-map.js';
 
@@ -43,6 +43,7 @@ const MAX_CAPTURED_VIDEOS = 40;
           if (!capturedTranscripts.has(videoId)) {
             capturedTranscripts.set(videoId, new Map());
           }
+          // `lang` here is already the sniffer's captureKey (lang or lang|tlang).
           capturedTranscripts.get(videoId).set(lang, { text: entry.text, timestamp: entry.timestamp, tlang: entry.tlang || null });
         }
       }
@@ -99,7 +100,9 @@ window.addEventListener('message', (event) => {
         if (!capturedTranscripts.has(videoId)) {
             capturedTranscripts.set(videoId, new Map());
         }
-        capturedTranscripts.get(videoId).set(lang || 'unknown', { text, timestamp, tlang: tlang || null });
+        // lang|tlang key: source and translated captures of one track must not
+        // overwrite each other (see captureKey).
+        capturedTranscripts.get(videoId).set(captureKey(lang, tlang), { text, timestamp, tlang: tlang || null });
         pruneOldest(capturedTranscripts, MAX_CAPTURED_VIDEOS);
 
         if (DEBUG) {
@@ -1814,11 +1817,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           throw new Error('No captured transcript for this video');
         }
 
+        // Untranslated reader: never hand out a translated (tlang) capture.
         let entry = null;
         if (lang && videoMap.has(lang)) {
           entry = videoMap.get(lang);
         } else {
-          entry = videoMap.values().next().value;
+          for (const candidate of videoMap.values()) {
+            if (captureMatchesRequest(candidate.tlang, null)) { entry = candidate; break; }
+          }
         }
 
         if (!entry || !entry.text) {
@@ -1900,8 +1906,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
 
-    // Find the first entry with actual content
+    // Find the first entry with actual content. 2C (this handler's only
+    // caller) runs untranslated only, so a translated capture is never its
+    // answer.
     for (const [, entry] of videoMap) {
+      if (!captureMatchesRequest(entry.tlang, null)) continue;
       if (entry.text && entry.text.trim().length > 0) {
         // Parse into segments
         let segments = null;

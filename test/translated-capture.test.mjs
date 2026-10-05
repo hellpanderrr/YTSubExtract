@@ -11,14 +11,21 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   captureMatchesRequest,
-  buildCaptionTrackOptions
+  buildCaptionTrackOptions,
+  captureKey
 } from '../src/utils/translated-capture.js';
 
-test('no translation requested: any capture is acceptable', () => {
+test('no translation requested: a source capture (no tlang) is accepted', () => {
   assert.equal(captureMatchesRequest(null, null), true);
   assert.equal(captureMatchesRequest(null, undefined), true);
-  assert.equal(captureMatchesRequest('ru', null), true);
-  assert.equal(captureMatchesRequest('en', undefined), true);
+  assert.equal(captureMatchesRequest(undefined, null), true);
+});
+
+test('no translation requested: a TRANSLATED capture is refused (reverse mislabel)', () => {
+  // A leftover tlang=ru capture for the same video must not ship as source
+  // text. The first version of the rule accepted it (review 2026-10-05).
+  assert.equal(captureMatchesRequest('ru', null), false);
+  assert.equal(captureMatchesRequest('en', undefined), false);
 });
 
 test('translation requested: only the exact requested tlang is accepted', () => {
@@ -92,4 +99,33 @@ test('wiring: drivers must gate the bare setOption behind a thrown rich one', ()
       `${name}: the old unconditional bare setOption (clobber) must be gone`
     );
   }
+});
+
+// ── captureKey ────────────────────────────────────────────────────────────
+// Source (lang=en) and translated (lang=en&tlang=ru) captures used to share
+// the key 'en' — last writer won, so a source capture could erase the
+// translated body the gate was waiting for.
+
+test('captureKey: source captures keep the plain lang key', () => {
+  assert.equal(captureKey('en', null), 'en');
+  assert.equal(captureKey('en', undefined), 'en');
+  assert.equal(captureKey('en', ''), 'en');
+  assert.equal(captureKey(null, null), 'unknown');
+});
+
+test('captureKey: translated captures never collide with their source', () => {
+  assert.equal(captureKey('en', 'ru'), 'en|ru');
+  assert.notEqual(captureKey('en', 'ru'), captureKey('en', null));
+  assert.notEqual(captureKey('en', 'ru'), captureKey('en', 'de'));
+});
+
+test('wiring: every capture store keys on captureKey and carries tlang', () => {
+  const sniffer = readFileSync(new URL('../src/content/sniffer.js', import.meta.url), 'utf8');
+  const content = readFileSync(new URL('../src/content/content.js', import.meta.url), 'utf8');
+  assert.match(sniffer, /const key = captureKey\(lang, tlang\)/, 'sniffer global keys on lang+tlang');
+  assert.match(sniffer, /tlang: tlang \|\| null\s*\n\s*\}\);/, 'sniffer global entry carries tlang');
+  assert.match(content, /\.set\(captureKey\(lang, tlang\),/, 'content live store keys on lang+tlang');
+  // The two untranslated readers must refuse translated captures.
+  const gated = content.match(/captureMatchesRequest\([a-z.]+tlang, null\)/g) || [];
+  assert.ok(gated.length >= 2, `untranslated readers gated (found ${gated.length})`);
 });
