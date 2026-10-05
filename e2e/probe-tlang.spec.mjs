@@ -1,6 +1,7 @@
 /**
  * Opt-in diagnostic probe (skips unless PROBE_TLANG=1): does the YouTube player honor
- * `setOption('captions', 'translationLanguage', ...)`?
+ * a `translationLanguage` carried inside the caption track object —
+ * `setOption('captions', 'track', { languageCode, translationLanguage: { languageCode } })`?
  *
  * If yes, the player issues its own timedtext request with `&tlang=<lang>`
  * (BotGuard-solved, server-side translation), which the sniffer already
@@ -83,16 +84,23 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
       out.setTrack = 'ok';
     } catch (e) { out.setTrack = 'threw: ' + e.message; }
 
-    // Nudge subtitles on.
-    try {
-      if (typeof player.toggleSubtitles === 'function') {
-        player.toggleSubtitles(true);
-        out.toggled = 'ok';
+    // Nudge the player the way both production drivers do: captions off,
+    // then on, three cycles. A bare toggleSubtitles(true) is a no-op when the
+    // profile's sticky preference already has captions on — zero requests,
+    // and a false "not honored" (Pullfrog, PR #2, 2026-10-05).
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    out.toggled = typeof player.toggleSubtitles === 'function' ? 0 : 'no toggleSubtitles';
+    if (typeof player.toggleSubtitles === 'function') {
+      for (let cycle = 0; cycle < 3; cycle++) {
+        try { player.toggleSubtitles(false); } catch (e) {}
+        await sleep(300);
+        try { player.toggleSubtitles(true); out.toggled++; } catch (e) { out.toggled = 'threw: ' + e.message; }
+        await sleep(800);
       }
-    } catch (e) { out.toggled = 'threw: ' + e.message; }
+    }
 
     // Give the player a few seconds to issue the request(s).
-    await new Promise((r) => setTimeout(r, 6000));
+    await sleep(6000);
 
     // Read back what the player thinks is set.
     try { out.currentTrackOption = player.getOption('captions', 'track'); } catch (e) { out.currentTrackOption = 'threw'; }
@@ -109,7 +117,13 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
   }
   const afterArming = timedtextRequests.slice(armedAt);
   const honored = afterArming.some((u) => (u.match(/[?&]tlang=([^&]+)/) || [])[1] === TARGET_LANG);
-  console.log(`[probe:tlang] VERDICT: ${honored
+  // INCONCLUSIVE when the probe never armed a track (bot-check: no tracks,
+  // no player) — only a correctly armed player may produce a negative.
+  const armed = !report.error && report.setTrack === 'ok';
+  const verdict = honored
     ? `PLAYER HONORS translationLanguage (tlang=${TARGET_LANG} requested after arming)`
-    : `NO tlang=${TARGET_LANG} request after arming — option not honored (or tracks blocked)`}`);
+    : armed
+      ? `NOT HONORED: armed track, but no tlang=${TARGET_LANG} request after arming`
+      : `INCONCLUSIVE: track never armed (${report.error || `setTrack=${report.setTrack}`})`;
+  console.log(`[probe:tlang] VERDICT: ${verdict}`);
 });
