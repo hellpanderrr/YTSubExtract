@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   fast-abort window math (`test/fast-abort.test.mjs`), manifest/DNR hygiene
   (`test/manifest-hygiene.test.mjs`), and the playlist
   tier-chain order (`test/tier3-order.test.mjs`) and translate gating (`test/tier01-translate.test.mjs`) — both need
-  `--experimental-test-module-mocks`, supplied by `npm test`; also `playlist-extractor`, `android-translate`, `prune-map`, `weekly-canary` — all pure node. Background modules are
+  `--experimental-test-module-mocks`, supplied by `npm test`; also `playlist-extractor`, `android-translate`, `prune-map`, `weekly-canary`, `playlist-rows` (Tier 0.5 row identity: `list=` filter, positive-evidence sweep, `pickRowHref`) and `translated-capture` (bidirectional `tlang` gate, `captureKey`, no-clobber arming options) — all pure node. The last two have committed mutation harnesses: `node scripts/mutate-playlist-rows.mjs`, `node scripts/mutate-translated-capture.mjs` (exit 0 = every mutant killed). Background modules are
   imported for real with a `chrome.*` mock
   (`test/helpers/chrome-mock.mjs`) and `translationManager` network seams
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
