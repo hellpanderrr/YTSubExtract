@@ -125,7 +125,18 @@ test('wiring: every capture store keys on captureKey and carries tlang', () => {
   assert.match(sniffer, /const key = captureKey\(lang, tlang\)/, 'sniffer global keys on lang+tlang');
   assert.match(sniffer, /tlang: tlang \|\| null\s*\n\s*\}\);/, 'sniffer global entry carries tlang');
   assert.match(content, /\.set\(captureKey\(lang, tlang\),/, 'content live store keys on lang+tlang');
-  // The two untranslated readers must refuse translated captures.
-  const gated = content.match(/captureMatchesRequest\([a-z.]+tlang, null\)/g) || [];
-  assert.ok(gated.length >= 2, `untranslated readers gated (found ${gated.length})`);
+  // Every read site, exactly. A '>= N' count could not detect a missing gate
+  // (Pullfrog, PR #2, 2026-10-05); this list changes only on purpose.
+  const gates = content.match(/captureMatchesRequest\([^()]*(?:\([^()]*\))?[^()]*\)/g) || [];
+  assert.deepEqual(gates, [
+    'captureMatchesRequest(videoMap.get(lang).tlang, null)', // GET_CAPTURED_TRANSCRIPT fast path
+    'captureMatchesRequest(candidate.tlang, null)',          // GET_CAPTURED_TRANSCRIPT scan
+    'captureMatchesRequest(entry.tlang, null)',              // POLL_TRANSCRIPT (2C)
+    'captureMatchesRequest(entry.tlang, wantTlang)',         // 1.7 drainCache
+    'captureMatchesRequest(tlang, wantTlang)',               // 1.7 live capture
+  ]);
+  // Three handlers read the store (GET_CAPTURED_TRANSCRIPT, POLL_TRANSCRIPT,
+  // 1.7's drainCache); a fourth reader would need its own gate above.
+  const readers = (content.match(/= capturedTranscripts\.get\(videoId\);/g) || []).length;
+  assert.equal(readers, 3, 'a new capture-store reader must be added to the gate list');
 });

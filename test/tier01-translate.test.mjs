@@ -12,6 +12,7 @@ installChrome();
 
 let calls;
 let tier1Fails = false;
+let tier3Result = null;
 
 mock.module('../src/utils/youtube-caption-extractor.js', {
   namedExports: {
@@ -37,7 +38,7 @@ mock.module('../src/background/tier3-worker.mjs', {
   namedExports: {
     fetchTier3Transcript: async () => {
       calls.push('tier3');
-      return null;
+      return tier3Result;
     },
     getVideoMetadata: async () => ({ title: '', languages: [] }),
   },
@@ -48,6 +49,7 @@ const { translationManager: tm } = await import('../src/background/translation-m
 beforeEach(() => {
   calls = [];
   tier1Fails = false;
+  tier3Result = null;
 });
 
 test('a translated request skips Tier 0.1 and goes on to Tier 1', async () => {
@@ -174,4 +176,62 @@ test('control: an untranslated request still uses player capture (1.7) before Au
   } finally {
     restore();
   }
+});
+
+// Tier 2C never arms a translationLanguage, so for a translated request it can
+// only capture source text. Once 1.7 started succeeding for translated
+// requests, the test above short-circuits before 2C and no longer guards this
+// skip (Pullfrog, PR #2, 2026-10-05: removing the gate left the suite green).
+test('a translated request whose 1.7 attempt fails still skips 2C and reaches Auth', async () => {
+  tier1Fails = true;
+  const restore = patchPageLegTiers();
+  tm._coercePlayerTranscript = async () => {
+    calls.push('tier1.7');
+    return null;
+  };
+  try {
+    const result = await tm.getTranscriptForPlaylist(`pl-tr-2c-${Date.now()}`, {
+      sourceLang: 'auto',
+      translate: true,
+      targetLang: 'ru',
+    });
+    assert.ok(calls.includes('tier1.7'));
+    assert.ok(!calls.includes('tier2c'), '2C cannot translate and must be skipped');
+    assert.ok(calls.includes('auth'));
+    assert.equal(result.source, 'tier0.5-auth');
+  } finally {
+    restore();
+  }
+});
+
+// Tier 3's engagement-panel fallback is always source language. A translated
+// request must refuse a Tier 3 result that does not say it is translated, or
+// source text ships under the target filename (Pullfrog, PR #2, 2026-10-05).
+test('a translated request refuses an untranslated Tier 3 result', async () => {
+  tier1Fails = true;
+  tier3Result = { segments: [{ start: 0, end: 1, text: 'source text' }], language: 'en' };
+  const restore = patchPageLegTiers();
+  try {
+    const result = await tm.getTranscriptForPlaylist(`pl-tr-t3-no-${Date.now()}`, {
+      sourceLang: 'auto',
+      translate: true,
+      targetLang: 'ru',
+    });
+    assert.ok(calls.includes('tier3'));
+    assert.notEqual(result.source, 'tier3-playlist', 'an untranslated Tier 3 result must not answer');
+  } finally {
+    restore();
+  }
+});
+
+test('a translated request accepts a Tier 3 result marked isTranslated', async () => {
+  tier1Fails = true;
+  tier3Result = { segments: [{ start: 0, end: 1, text: 'перевод' }], language: 'ru', isTranslated: true };
+  const result = await tm.getTranscriptForPlaylist(`pl-tr-t3-yes-${Date.now()}`, {
+    sourceLang: 'auto',
+    translate: true,
+    targetLang: 'ru',
+  });
+  assert.equal(result.source, 'tier3-playlist');
+  assert.equal(result.translated, true);
 });

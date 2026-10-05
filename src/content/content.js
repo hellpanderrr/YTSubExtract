@@ -1819,7 +1819,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         // Untranslated reader: never hand out a translated (tlang) capture.
         let entry = null;
-        if (lang && videoMap.has(lang)) {
+        if (lang && videoMap.has(lang) && captureMatchesRequest(videoMap.get(lang).tlang, null)) {
           entry = videoMap.get(lang);
         } else {
           for (const candidate of videoMap.values()) {
@@ -2023,9 +2023,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           for (const entry of videoMap.values()) order.push(entry);
           for (const entry of order) {
             if (entry?.text) {
-              // Translated requests accept ONLY a capture whose URL carried
-              // the requested tlang — a source capture would be mislabeled
-              // (docs/ISSUES.md #3). Source requests accept anything.
+              // The capture's tlang must equal the request's, both ways: a
+              // translated request refuses a source capture and a source
+              // request refuses a translated one (docs/ISSUES.md #3).
               if (!captureMatchesRequest(entry.tlang, wantTlang)) continue;
               const segments = parseSegments(entry.text);
               if (segments) return { segments, bytes: entry.text.length };

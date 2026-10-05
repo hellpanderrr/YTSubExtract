@@ -62,7 +62,12 @@ export class BatchProcessor {
 
     try {
       this.isRunning = true;
-      this.shouldStop = false;
+      // Do NOT reset shouldStop here. The processor is created per batch (the
+      // constructor already starts it false), and main.mjs registers it as
+      // activeBatchProcessor BEFORE the watch-page seed — so a Stop pressed
+      // during the seed calls stop() first. Resetting here discarded that
+      // Stop, and cached videos (which skip every Stop checkpoint) were then
+      // processed into the ZIP. (CodeRabbit, PR #2, 2026-10-05.)
 
       const results = {
         success: [],

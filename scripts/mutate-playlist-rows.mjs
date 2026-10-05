@@ -30,6 +30,22 @@ const MUTATIONS = [
   },
 ];
 
+const runSuite = () =>
+  spawnSync(
+    process.execPath,
+    ['--test', '--experimental-test-module-mocks', 'test/playlist-rows.test.mjs'],
+    { encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL' }
+  );
+
+// Baseline: the unmodified suite must pass, or every mutant would look
+// "killed" by a suite that cannot run at all.
+const baseline = runSuite();
+if (baseline.status !== 0) {
+  console.error('BASELINE FAILED: test/playlist-rows.test.mjs does not pass unmodified — aborting.');
+  console.error((baseline.stdout || '') + (baseline.stderr || ''));
+  process.exit(2);
+}
+
 let survived = 0;
 for (const m of MUTATIONS) {
   if (!original.includes(m.from)) {
@@ -38,11 +54,7 @@ for (const m of MUTATIONS) {
     continue;
   }
   writeFileSync(FILE, original.replace(m.from, m.to));
-  const r = spawnSync(
-    process.execPath,
-    ['--test', '--experimental-test-module-mocks', 'test/playlist-rows.test.mjs'],
-    { encoding: 'utf8', timeout: 60_000 }
-  );
+  const r = runSuite();
   const killed = r.status !== 0;
   console.log(`${killed ? 'KILLED' : 'SURVIVED'}: ${m.name}`);
   if (!killed) survived++;

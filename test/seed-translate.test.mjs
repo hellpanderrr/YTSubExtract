@@ -77,3 +77,29 @@ test('a batch with no translate flag at all still seeds (undefined is not "trans
   await runBatch({});
   assert.equal(seedCalls, 1);
 });
+
+// Stop pressed DURING the watch-page seed must hold. activeBatchProcessor is
+// registered before the seed, so the STOP handler calls processor.stop() then;
+// BatchProcessor.process() used to reset shouldStop, discarding that Stop —
+// and cached videos (which skip every Stop checkpoint) were processed into the
+// ZIP anyway (CodeRabbit, PR #2, 2026-10-05).
+test('a Stop accepted during the seed is honoured: no video is processed', async () => {
+  let fetches = 0;
+  tm.getTranscriptForPlaylist = async () => {
+    fetches++;
+    return { source: 'unit-test', result: [{ start: 0, duration: 1, text: 'hi' }], logs: [] };
+  };
+  tm.seedWatchPage = async () => {
+    seedCalls++;
+    const stop = await send({ type: 'STOP_BATCH_DOWNLOAD' });
+    assert.equal(stop.success, true, 'the Stop must be accepted while the seed runs');
+    return true;
+  };
+  const resp = await send(batchMsg({ translate: false }));
+  assert.equal(resp.success, true);
+  await waitFor(() => ['stopped', 'completed'].includes(progress()?.status), { label: 'batch terminal' });
+  await waitFor(() => globalThis.isBatchProcessing === false, { label: 'guard reset' });
+  assert.equal(seedCalls, 1);
+  assert.equal(fetches, 0, 'no video may be processed after an accepted Stop');
+  assert.equal(progress().status, 'stopped');
+});

@@ -1,5 +1,5 @@
 /**
- * PROBE (temporary, not a committed test): does the YouTube player honor
+ * Opt-in diagnostic probe (skips unless PROBE_TLANG=1): does the YouTube player honor
  * `setOption('captions', 'translationLanguage', ...)`?
  *
  * If yes, the player issues its own timedtext request with `&tlang=<lang>`
@@ -47,10 +47,13 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
       const t = r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
       return t.length > 0;
     } catch (e) { return false; }
-  }, { timeout: 45000 }).catch(() => {
+  }, undefined, { timeout: 45000 }).catch(() => {
     console.log('[probe:tlang] no tracklist appeared in 45s (bot-check in headless?)');
   });
 
+  // Only requests made AFTER arming count toward the verdict: navigation or a
+  // sticky caption preference could already have requested a translation.
+  const armedAt = timedtextRequests.length;
   const report = await page.evaluate(async ({ targetLang }) => {
     const player = document.getElementById('movie_player');
     if (!player) return { error: 'no movie_player' };
@@ -108,6 +111,9 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
     const lang = u.match(/[?&]lang=([^&]+)/);
     console.log(`[probe:tlang]   lang=${lang?.[1]} tlang=${tlang?.[1] ?? '(none)'}`);
   }
-  const anyTlang = timedtextRequests.some((u) => /[?&]tlang=/.test(u));
-  console.log(`[probe:tlang] VERDICT: ${anyTlang ? 'PLAYER HONORS translationLanguage (tlang request seen)' : 'NO tlang request — option not honored (or tracks blocked)'}`);
+  const afterArming = timedtextRequests.slice(armedAt);
+  const honored = afterArming.some((u) => (u.match(/[?&]tlang=([^&]+)/) || [])[1] === TARGET_LANG);
+  console.log(`[probe:tlang] VERDICT: ${honored
+    ? `PLAYER HONORS translationLanguage (tlang=${TARGET_LANG} requested after arming)`
+    : `NO tlang=${TARGET_LANG} request after arming — option not honored (or tracks blocked)`}`);
 });

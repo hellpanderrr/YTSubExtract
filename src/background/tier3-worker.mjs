@@ -7,9 +7,9 @@ import { fetchTextWithTimeout, fetchResponseWithTimeout } from '../utils/fetch-t
 // lines, nearly all parser warnings) and bury OUR logs in the SW console.
 // They are upstream parse noise for a tier that is demoted behind Tier 1 and
 // has no recorded success in this environment — not actionable here.
-// WARNING keeps genuine failures visible (e.g. the HTTP 400s we do read)
-// while silencing the shape-drift chatter. Note: this cannot be expressed in
-// Log.setLevel args via the default export shape — setLevel takes levels.
+// ERROR level: youtubei.js's own warnings (including the parser-drift ones)
+// are suppressed; its errors still print. Request failures such as HTTP 400
+// are thrown, not logged, so they still reach our own [Tier 3] Failed lines.
 Log.setLevel(Log.Level.ERROR);
 
 // Polyfill for youtubei.js environment detection
@@ -271,8 +271,18 @@ export async function fetchTier3Transcript(videoId, options = {}) {
 
     // 2. If no caption tracks or failed, try Innertube's getTranscript
     // This uses the engagement panel API which might be blocked (400 Bad Request)
+    //
+    // The engagement-panel transcript has no translation parameter — it is
+    // always the source language. For a translated request it must not answer
+    // (same reason Tier 0.1 is skipped): both callers used to label whatever
+    // came back `translated: translate`, shipping source text under a
+    // target-language filename (Pullfrog, PR #2, 2026-10-05). The youtubei.js
+    // 18 bump made this path reachable again.
+    if (translate) {
+        throw new Error('Innertube getTranscript cannot translate; skipped for a translated request');
+    }
     console.log('[Tier 3] Falling back to Innertube getTranscript...');
-    
+
     try {
         const transcriptData = await info.getTranscript();
         
@@ -292,7 +302,8 @@ export async function fetchTier3Transcript(videoId, options = {}) {
         
         return {
             segments: segments,
-            language: lang
+            language: lang,
+            isTranslated: false
         };
 
     } catch (e) {

@@ -1815,7 +1815,13 @@ export class TranslationManager {
         };
         
         const legacyResult = await fetchTier3Transcript(videoId, legacyOptions);
-        
+
+        // Same rule as the playlist Tier 3 call: a translated request takes
+        // only a result that is itself translated.
+        if (translate && legacyResult?.segments?.length > 0 && legacyResult.isTranslated !== true) {
+            throw new Error('Tier 3 returned an untranslated transcript for a translated request');
+        }
+
         if (legacyResult && legacyResult.segments && legacyResult.segments.length > 0) {
              log('[Tier 3] Legacy Success!');
              
@@ -1828,7 +1834,7 @@ export class TranslationManager {
              const response = {
                  source: 'tier3-legacy',
                  result: normalized,
-                 translated: translate,
+                 translated: legacyResult.isTranslated === true,
                  sourceLang: legacyResult.language || sourceLang,
                  targetLang: targetLang,
                  logs
@@ -2208,6 +2214,12 @@ export class TranslationManager {
 
       const tier3Result = await fetchTier3Transcript(videoId, tier3Options);
 
+      // A translated request accepts only a result that says it IS translated
+      // (the worker's engagement-panel fallback is always source language).
+      if (translate && tier3Result?.segments?.length > 0 && tier3Result.isTranslated !== true) {
+        throw new Error('Tier 3 returned an untranslated transcript for a translated request');
+      }
+
       if (tier3Result && tier3Result.segments && tier3Result.segments.length > 0) {
         log(`[Tier 3] Success! ${tier3Result.segments.length} segments`);
 
@@ -2220,7 +2232,7 @@ export class TranslationManager {
         const response = {
           source: 'tier3-playlist',
           result: normalized,
-          translated: translate,
+          translated: tier3Result.isTranslated === true,
           sourceLang: tier3Result.language || sourceLang,
           targetLang,
           logs

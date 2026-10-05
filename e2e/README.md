@@ -88,6 +88,7 @@ changing either value.
 | `private-playlist.spec.mjs` | Liked Videos (`LL`): listing via the credentialed-fetch fallback, and a batch ZIP producing a real subtitle |
 | `single-video.spec.mjs` | Language dropdown populates; SRT and VTT download with valid content |
 | `batch-download.spec.mjs` | Batch ZIP lands with one file per video (or an error report) |
+| `probe-tlang.spec.mjs` | **Diagnostic, opt-in** (`PROBE_TLANG=1`; optional `PROBE_VIDEO_URL`, `PROBE_TARGET_LANG`, default `ru`): arms the player's caption track with a `translationLanguage` and reports whether it then requests `tlang=<target>`. Headless never gets an attested tracklist (bot-check, `docs/ISSUES.md` #1), so run it headed (`E2E_HEADED=1`) on a signed-in profile. Skipped in a normal `npm run e2e`. |
 
 ## How it works
 
