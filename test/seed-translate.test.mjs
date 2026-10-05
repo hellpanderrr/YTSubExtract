@@ -67,8 +67,7 @@ test('a translated batch DOES seed the watch page (1.7 became translation-capabl
   // Reversed 2026-10-03: Tier 1.7 now arms a translationLanguage and the
   // capture is accepted only with a matching tlang, so a translated batch
   // reads the seeded player again. With API tiers bot-checked it is the tier
-  // that actually works (ISSUES #3/#21). The header comment at the top of
-  // this file predates the reversal.
+  // that actually works (ISSUES #3/#21).
   await runBatch({ translate: true });
   assert.equal(seedCalls, 1, '1.7 reads the seeded player for translated batches again');
 });

@@ -69,22 +69,19 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
 
     try { player.loadModule('captions'); } catch (e) { out.loadModuleErr = String(e); }
 
-    // The candidate option (name from community docs; probe verifies it).
+    // Arm exactly the way production does (buildCaptionTrackOptions in
+    // src/utils/translated-capture.js): the target rides INSIDE the track
+    // object, set once. The player reads translationLanguage off the track
+    // (`u.translationLanguage && (H.tlang = lM(u))`). An earlier version of
+    // this probe set a separate 'translationLanguage' option and then a bare
+    // track — the same clobber fixed in e598267 — so a "not honored" verdict
+    // from it would have been false (Pullfrog, PR #2, 2026-10-05).
+    const trackOpt = { languageCode: source.languageCode, translationLanguage: { languageCode: targetLang } };
+    if (source.kind) trackOpt.kind = source.kind;
     try {
-      player.setOption('captions', 'translationLanguage', { languageCode: targetLang });
-      out.setTranslationLanguage = 'ok';
-    } catch (e) { out.setTranslationLanguage = 'threw: ' + e.message; }
-
-    try {
-      player.setOption('captions', 'track', { languageCode: source.languageCode, kind: source.kind });
+      player.setOption('captions', 'track', trackOpt);
       out.setTrack = 'ok';
     } catch (e) { out.setTrack = 'threw: ' + e.message; }
-
-    // Also try the raw translationLanguage format some builds use.
-    try {
-      player.setOption('captions', 'translationLanguage', targetLang);
-      out.setTranslationLanguage2 = 'ok (bare string form)';
-    } catch (e) { out.setTranslationLanguage2 = 'threw: ' + e.message; }
 
     // Nudge subtitles on.
     try {
@@ -99,7 +96,6 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
 
     // Read back what the player thinks is set.
     try { out.currentTrackOption = player.getOption('captions', 'track'); } catch (e) { out.currentTrackOption = 'threw'; }
-    try { out.currentTranslationOption = player.getOption('captions', 'translationLanguage'); } catch (e) { out.currentTranslationOption = 'threw'; }
 
     return out;
   }, { targetLang: TARGET_LANG });
