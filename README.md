@@ -3,210 +3,144 @@
 
 # YTSubExtract: YouTube Subtitle Extractor (MV3)
 
-A Chrome Extension for extracting subtitles from YouTube videos using a multi-tier fallback system. Built for Manifest V3.
+A Chrome Extension for extracting subtitles from YouTube videos and playlists using a multi-tier fallback system. Built for Manifest V3.
 
 ## Tech Stack
 
 | Component | Library / Tool | Purpose |
 | :--- | :--- | :--- |
-| Network Interception | Vanilla JS | MAIN world script intercepts `fetch`/`XHR` for URL capture |
-| Player API | Vanilla JS | Direct `movie_player.getPlayerResponse()` access |
-| API Client | `youtube-caption-extractor` (modified) | Android/iOS client impersonation |
-| InnerTube API | `youtubei.js` | Full InnerTube client with protobuf support |
-| DOM Extraction | `@playzone/youtube-transcript` | Extracts transcripts from `ytInitialPlayerResponse` |
-| Text Processing | `he` | HTML entity decoding |
+| Network Interception | Vanilla JS | MAIN-world script intercepts `fetch`/`XHR` for timedtext capture |
+| Player API | Vanilla JS | Direct `movie_player` access for track lists and track switching |
+| API Client | `youtube-caption-extractor` (modified) | InnerTube client impersonation (IOS, MWEB, WEB, TVHTML5, ANDROID) |
+| InnerTube SDK | `youtubei.js` 18 | Tier 3 fallback |
+| DOM Extraction | `@playzone/youtube-transcript` | Tier 2 (content-script) extraction |
+| HTML entities | `he` | Caption text entity decoding |
 | Sanitization | `striptags` | HTML/XML tag stripping |
-| Bundler | `vite` | Build tool with multiple configurations |
-| Packaging | `crx` & `zip-a-folder` | Chrome Web Store distribution |
+| ZIP packaging | `fflate` | Playlist ZIPs (pure JS — works in the service worker) |
+| Bundler | `vite` | Three build configurations |
+| Packager | `crx` + `node-rsa` | Optional signed `.crx` for local testing |
+| Tests | `node:test`, Playwright | Unit suite + headless e2e suite |
 
 ## Architecture
 
-The extension uses a priority fallback model with multiple extraction methods. **Note:** Due to YouTube's PoToken anti-bot measures (2025), many direct API clients are now blocked. The extension has been optimized to prioritize working methods.
+The extension uses a priority fallback model. Due to YouTube's PoToken / BotGuard anti-bot enforcement, direct API clients are frequently blocked; the tiers that use a real signed-in player tab are the ones that keep working at scale.
 
-### Current Tier Status
+**Two MAIN-world channels.** The page's player API (`loadVideoById`, `getPlayerResponse`) lives in the page's MAIN world. The ISOLATED content script cannot read it directly, and script injection from ISOLATED does not even execute on youtube.com. So all page-JS access goes through either the `document_start` MAIN-world sniffer (via `window.postMessage`) or `chrome.scripting.executeScript({world:'MAIN'})` from the background.
 
-#### For Single Videos (Popup Flow)
+### Single-video flow (popup)
 
-| Tier | Method | Status | When It Works |
-|------|--------|--------|---------------|
-| **Tier 0.5** | Player API from active tab | ✅ Works | User has YouTube video open in active tab |
-| **Tier 1.5** | Embed page scraping | ⚠️ Limited | Often blocked by CSP/redirects |
-| **Tier 1** | Direct InnerTube API | ⚠️ **PARTIAL** | IOS works; MWEB/WEB_EMBEDDED require PoToken; ANDROID deprecated |
-| **Tier 2** | Content script injection | ⚠️ Timeout | Requires active tab, often hangs |
-| **Tier 3** | youtubei.js library | ✅ **PRIMARY** | Most reliable method, no active tab needed |
-| **Tier 4** | Page context extraction | ⚠️ Slow | Last resort, requires active tab |
-
-#### For Playlist Downloads (Background)
-
-| Tier | Method | Status | Notes |
-|------|--------|--------|-------|
-| **Tier 1** (API clients) | youtube-caption-extractor | ⚠️ Partial | IOS works; others blocked or deprecated |
-| **Tier 1.5** | Embed page | ❌ Broken | No active tab in service worker context |
-| **Tier 3** | youtubei.js | ✅ **PRIMARY** | Only reliable method for playlists |
-
-### Phase 1 Optimizations (Implemented)
-
-1. **New Client Priority** (IOS → MWEB → WEB → WEB_EMBEDDED → TVHTML5 → ANDROID)
-   - Based on yt-dlp's successful client fallback chain
-   - WEB client added; ANDROID moved to last (deprecated by YouTube in 2026)
-   - Fast-fail on UNPLAYABLE/ERROR/LOGIN_REQUIRED responses
-   - Client-specific payloads: only ANDROID gets legacy params/playbackContext
-
-2. **VisitorData Caching** (24h)
-   - Reduces bot-like behavior
-   - Cached in memory, persists during service worker lifetime
-
-3. **Playlist-First Tier 3**
-   - Skips slow/broken Tier 0.5/1/1.5 for playlist downloads
-   - ~2-3x faster per video in playlist mode
-
-### Phase 2 Fixes (Latest)
-
-4. **Client-Specific Payloads** — Only ANDROID gets legacy `params`/`playbackContext`; others use minimal payload
-5. **User-Agent Consistency** — Fixed DNR rules to match client type (removed forced ANDROID UA override)
-6. **IOS Metadata** — Updated device model (`iPhone17,2`) and OS version (`18.4.1`) to match current UA
-
-### Tier Details
-
-#### Tier 0.5: Player API
-**Mechanism**: Direct access to `document.getElementById('movie_player').getPlayerResponse()`.  
-**Use Case**: Fastest method when user has YouTube open in active tab.  
-**Status**: ✅ Reliable when active tab available.
-
-#### Tier 1: Direct API Clients (PARTIAL)
-**Mechanism**: HTTP requests to `youtubei/v1` with client-specific payloads.  
-**Status**: ⚠️ **IOS works**, others require PoToken or deprecated:
-- ✅ **IOS**: Minimal payload, works for most videos (primary Tier 1 client)
-- ❌ **MWEB/WEB**: Require PoToken (enforcement rolled out Apr 2026)
-- ❌ **WEB_EMBEDDED**: Requires embed auth + PoToken
-- ❌ **ANDROID**: Deprecated by YouTube for programmatic access (early 2026)
-- ❌ **TVHTML5**: HTTP 400 — payload incompatible
-
-#### Tier 3: InnerTube Emulation (PRIMARY)
-**Mechanism**: Full `youtubei.js` session with proper handshake.  
-**Use Case**: **Primary method** for both single videos and playlists.  
-**Status**: ✅ Works reliably, handles complex signatures automatically.
-
-#### Tier 1.5: Embed Page Extraction
-**Mechanism**: Fetches `/embed/{videoId}` and extracts `ytInitialPlayerResponse`.  
-**Status**: ⚠️ Often blocked by CSP or returns empty responses.
-
-#### Tier 4: Main World Fetcher
-**Mechanism**: Fetches timedtext URLs from MAIN world context.  
-**Use Case**: Bypasses empty response protection for age-restricted videos.
-
-## Extraction Cascades
-
-### Metadata Cascade (Single Video - Popup)
+**Metadata / language list** (`extractWithTranslation` → metadata):
 ```text
-Parallel: [Tier 0.5, Tier 1.5] → Tier 1 (API) → Tier 2 → Tier 3 → Tier 4
+parallel [Tier 0.5, Tier 1.5] → Tier 1 (API) → Tier 3 (youtubei.js) → Tier 2 → Tier 4
 ```
-- Tiers 0.5 and 1.5 execute in parallel first (cheap, fast when available)
-- Tier 1 (direct API) usually fails with UNPLAYABLE — fast-fail to Tier 3
-- **Tier 3 is primary fallback** and handles most cases reliably
 
-### Download Cascade (Single Video - Popup)
+**Transcript download**:
+| Tier | Method | Notes |
+|------|--------|-------|
+| 0 | Network sniffer | Instant if the player already fetched the `timedtext` URL |
+| 0.5 | Player API track URL | Reads caption tracks from the open player |
+| 1 | InnerTube clients | IOS first; others often need a PoToken |
+| 1.5 | Embed page | Age-restricted fallback; sometimes blocked |
+| 2 | Content script | `@playzone/youtube-transcript` |
+| 3 | youtubei.js (+ legacy InnerTube) | No active tab needed; demoted below Tier 1 in batch since it had no recorded real wins |
+| 4 | Page context injection | Last resort |
+
+### Playlist batch flow (`getTranscriptForPlaylist`, background)
+
 ```text
-Tier 0 (sniffer) → Tier 0.5 → Tier 1 → Tier 2 → Tier 3 → Tier 4
-```
-- Tier 0: Uses captured URL from network sniffer (instant if available)
-- Falls back through tiers until one succeeds
-
-### Playlist Cascade (Background Service Worker)
-```text
-Tier 3 (PRIMARY) → Tier 1 (fallback) → Tier 1.5 (last resort)
-```
-- **Optimized**: Starts with Tier 3 immediately (youtubei.js)
-- Skips broken/slow tiers (0.5, 1, 1.5) that waste 2-3s per video
-- ~2-3x faster than previous implementation
-
-**Timeout Protection**: Each tier has 8-10 second timeout to prevent UI freezing.
-
-## MAIN World Injection
-
-Uses Manifest V3's `"world": "MAIN"` feature:
-
-```json
-{
-  "matches": ["*://*.youtube.com/*"],
-  "js": ["sniffer.js"],
-  "run_at": "document_start",
-  "world": "MAIN"
-}
+Tier 0 (Android /player) → Tier 0.1 (/next panel) → Tier 1 (InnerTube chain)
+→ Tier 3 (youtubei.js) → Tier 1.5 (embed) → Tier 1.7 (player coercion)
+→ Tier 2C (tab navigation) → Tier 0.5 Auth (credentialed fetch)
 ```
 
-**Benefits**:
-- Intercepts `window.fetch` and `XMLHttpRequest` before YouTube's code
-- No deprecated `webRequest` API required
-- Captures early network requests at `document_start`
+- **Tier 1.7** seeds one YouTube tab once per batch, then drives `loadVideoById` per video so the real player solves BotGuard; the sniffer captures the resulting `timedtext` response.
+- **Tier 2C** navigates the tab to the watch page and waits for the same capture. It fast-aborts (~10s instead of 30s) when the player is confirmed settled on the video with zero caption tracks.
+- **Tier 0.5 Auth** fetches the watch page HTML with the user's cookies and extracts `ytInitialPlayerResponse` — the translation-aware last resort.
+- Tiers 1.7 and 2C share one promise-chain mutex (one tab, one page-leg operation at a time) and restore the user's original tab URL after the batch.
 
-**Communication Flow**:
-```
-sniffer.js (MAIN world)
-    ↓ window.postMessage ↓
-content.js (ISOLATED world)
-    ↓ chrome.runtime.sendMessage ↓
-background.js (Service Worker)
-```
+**Translated requests** (`translate: true`) skip Tiers 0.1 and 2C (they can never produce a `tlang` capture). Tier 0 uses the timedtext `&tlang=` path; Tier 1.7 arms the player's caption track with `translationLanguage`, making the player itself request `&tlang=`. A capture is accepted **only** when its URL's `tlang` matches the request (in both directions — an untranslated request refuses a `tlang` capture too), so a player that ignores the option falls through honestly instead of shipping untranslated text under a translated filename.
 
-## Performance
+### PoToken / bot check
 
-- **Parallel Tier Execution**: Tiers 0.5 and 1.5 run in parallel (2-8s). Tier 1 is fallback if both fail.
-- **Format Switching**: Raw transcript cached in memory (`metadata:${videoId}`). SRT/VTT/TXT conversion is instant.
-- **State Persistence**: `chrome.storage.local` for user preferences including per-playlist language selections.
-- **URL Expiration**: Sniffer-captured URLs checked before use.
-- **Timeout Protection**: All HTTP requests have timeouts (8s for embed pages, 10s for API calls) to prevent UI freezing.
+Timedtext requests without a valid PoToken return HTTP 200 with a 0-byte body. The reliable bypass is a real player tab (Tiers 1.7 / 2C / 0.5 Auth). When YouTube shows "Sign in to confirm you're not a bot", every API-only tier fails and the tab-based tiers carry the batch.
+
+## Permissions
+
+| Permission | Why |
+| :--- | :--- |
+| `activeTab`, host access to youtube.com / youtube-nocookie.com | Read the playlist/video page the user is on |
+| `storage` | Preferences, per-playlist language selection, download progress |
+| `declarativeNetRequest` | Set `Origin`/`Referer` on YouTube API requests (2 rules) |
+| `downloads` | Save the subtitle file / playlist ZIP the user requested |
+| `scripting` | Run a small static function in the page to read the player state (video ID, caption tracks, track switching) when the MAIN-world sniffer bridge is unreachable |
+
+No remote code, no `eval`, no tracking, no external servers. All requests go to YouTube endpoints.
 
 ## Features
 
 ### Playlist Mode
+- Lists the playlist on the current page (rows are matched to the opened playlist by their `list=` identity — a wrong-list page read was a fixed regression)
+- Select/deselect videos, per-playlist language preferences
+- ZIP download with organized filenames, real-time progress, and a **Stop** button
+- Stop during the setup phase cancels the whole run; subtitles that already finished are still delivered
+- Progress storage survives popup close and service-worker restarts
 
-Batch download subtitles from YouTube playlists:
-- Select/deselect individual videos or all at once
-- Per-playlist language preferences (saved to storage)
-- ZIP packaging with organized filenames
-- Progress tracking with ARIA accessibility support
-- Resume on browser restart via persistent progress storage
+### Translation
+- Server-side translation via `tlang` (single videos and playlists)
+- Playlist translation is verified: only captures whose `tlang` matches the request are accepted
+- Source language auto-detection (no silent fallback to English)
 
-### Translation Support
+### Formats
+- SRT, VTT, TXT (clean, timestamp-free output for AI prompts)
 
-Server-side translation via `tlang` parameter:
-- Automatic translation to 50+ languages
-- Caching optimized to exclude targetLang when not translating
-- Source language auto-detection with 'en' preference
-
-### ARIA Accessibility
-
-Screen reader compatible progress indicators:
-- `role="progressbar"` with `aria-valuemin`, `aria-valuemax`, `aria-valuenow`
-- `aria-live="polite"` for progress announcements
-- Proper focus management during downloads
+### Accessibility
+- `role="progressbar"` with `aria-*` attributes and `aria-live` announcements
 
 ## Build
 
 ### Prerequisites
-- Node.js 16+
+- Node.js **22.3+** (the unit suite uses `node:test`'s `mock.module`; floor verified on 22.3.0)
 - npm 8+
 
 ### Commands
 ```bash
-# Install dependencies
 npm install
 
-# Development (Hot Reload)
-npm run dev
+npm run dev          # Vite dev server
+npm run build        # build all three bundles (main, content, sniffer)
+npm run zip          # build + builds/extension.zip for the Web Store
+npm run pack         # build + signed builds/extension.crx (local pack)
 
-# Production Build
-npm run build
+npm test             # unit suite (node:test, no network/browser)
+npm run e2e          # Playwright suite — needs `npm run e2e:login` once
+node scripts/mutate-playlist-rows.mjs        # mutation harness, exit 0 = all mutants killed
+node scripts/mutate-translated-capture.mjs   # mutation harness, exit 0 = all mutants killed
 
-# Chrome Web Store ZIP
-npm run zip
-# Output: builds/extension.zip
+npm run bump X.Y.Z  # bump every version copy (refuses on disagreement)
+npm run notes        # print the What's New block used for release notes
 ```
 
-### Build Configuration
-Three Vite configurations:
-- `vite.config.js` - Background script and popup
-- `vite.config.content.js` - Content script (ISOLATED world)
-- `vite.config.sniffer.js` - Network sniffer (MAIN world)
+### Build configuration
+Three Vite configs:
+- `vite.config.js` — background service worker + popup
+- `vite.config.content.js` — content script (ISOLATED world)
+- `vite.config.sniffer.js` — network sniffer (MAIN world)
 
+## Testing & CI
+
+- **Unit tests** (`test/*.test.mjs`, 137 tests): batch Stop state machine, tab pinning, translation gating, capture store keys, playlist row identity, manifest/DNR hygiene, the release rail rules, and more.
+- **Mutation harnesses** for the two highest-risk helpers (`playlist-rows`, `translated-capture`): every seeded bug must be caught.
+- **Playwright e2e** (`e2e/`): smoke, single-video, playlist listing, batch download. Some specs need a signed-in profile (`npm run e2e:login`) and env URLs; headless runs are dominated by YouTube's bot check — see `docs/ISSUES.md` #1.
+- **CI**: `.github/workflows/test.yml` runs the unit suite + a full build on every push/PR. A self-hosted weekly canary (`weekly-canary.yml`) exercises a real playlist.
+
+## Releasing
+
+One rail: `.github/workflows/release.yml` (dispatch-only, main-only).
+- Version comes from `manifest.json`; notes come from the top **What's New** block of `STORE_DESCRIPTION.md`.
+- It refuses an existing tag, gates on `npm test`, builds **one** zip, and uses it for both the GitHub Release (tag at the dispatched commit) and the Chrome Web Store upload (`publish: false` — the dashboard submit stays manual).
+- `announce.yml` posts the same block to Discussions → Announcements, run after the store shows the version live.
+
+## Support
+
+- Questions and issues: [Discussions](https://github.com/hellpanderrr/YTSubExtract/discussions)
+- Disclaimer: YouTube is a trademark of Google LLC. Use of this trademark is subject to Google Permissions.
