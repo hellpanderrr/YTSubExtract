@@ -1,0 +1,129 @@
+name: Release
+
+# Single release rail (introduced 2026-10-07, replacing build-release.yml,
+# build-release-publish.yml, publish_store_draft.yml and publish-store.yml).
+#
+# Everything is derived from the repo — there are NO free-text inputs:
+#   version = manifest.json          (scripts/release-notes.mjs --version)
+#   notes   = STORE_DESCRIPTION.md   (scripts/release-notes.mjs)
+#   tag     = v<version> at this run's commit (${{ github.sha }})
+#   zip     = built once here, used for both the GitHub Release and the store
+#
+# Historical failure this prevents: free-text `version` inputs plus a
+# hardcoded `target_commitish: main` put the v1.1.4 tag on 1.1.2 code.
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create tag + GitHub Release?'
+        required: true
+        default: true
+        type: boolean
+      upload_store:
+        description: 'Upload the same zip to the Chrome Web Store (draft)?'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Assert dispatch is on main
+        run: |
+          # The old rail let you dispatch from any branch with the tag pinned
+          # to main; that is how v1.1.4 ended up tagged on 1.1.2 code.
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Dispatch this workflow from main — releases must be cut from main, not a side branch."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests (gate)
+        run: npm test
+
+      - name: Read version from manifest.json
+        id: version
+        run: echo "version=$(node scripts/release-notes.mjs --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if tag already exists
+        run: |
+          V="v${{ steps.version.outputs.version }}"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$V")" ]; then
+            echo "Tag $V already exists — bump the version before releasing."
+            exit 1
+          fi
+
+      - name: Extract release notes from STORE_DESCRIPTION.md
+        run: |
+          node scripts/release-notes.mjs > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
+
+      - name: Build extension
+        run: npm run build
+
+      - name: Zip extension
+        run: node scripts/zip.cjs
+
+      - name: Create tag + GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: builds/extension.zip
+
+      - name: Verify store upload credentials
+        if: ${{ inputs.upload_store }}
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The upload action hides Google's error body: an expired refresh
+          # token surfaces as a bare "HTTPError: Response code 400"
+          # (docs/ISSUES.md #23). Exchange the token up front so the failure
+          # names its cause. Never prints the response (it carries an access
+          # token) — only the HTTP status.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" \
+            -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" \
+            -d grant_type=refresh_token)
+          if [ "$CODE" != "200" ]; then
+            echo "::error::OAuth token exchange failed (HTTP $CODE) — the Web Store refresh token has most likely expired. Generate a new one (OAuth Playground, chromewebstore scope) and set it with: printf '%s' \"\$TOKEN\" | gh secret set REFRESH_TOKEN. See docs/ISSUES.md #23."
+            exit 1
+          fi
+          echo "OAuth refresh token is valid."
+
+      - name: Upload to Chrome Web Store (draft)
+        if: ${{ inputs.upload_store }}
+        uses: mnao305/chrome-extension-upload@v6.0.0
+        with:
+          file-path: builds/extension.zip
+          extension-id: ${{ secrets.EXTENSION_ID }}
+          client-id: ${{ secrets.CLIENT_ID }}
+          client-secret: ${{ secrets.CLIENT_SECRET }}
+          refresh-token: ${{ secrets.REFRESH_TOKEN }}
+          publish: false

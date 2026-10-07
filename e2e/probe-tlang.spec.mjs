@@ -117,13 +117,20 @@ test('probe: player translationLanguage issues a tlang timedtext request', async
   }
   const afterArming = timedtextRequests.slice(armedAt);
   const honored = afterArming.some((u) => (u.match(/[?&]tlang=([^&]+)/) || [])[1] === TARGET_LANG);
-  // INCONCLUSIVE when the probe never armed a track (bot-check: no tracks,
-  // no player) — only a correctly armed player may produce a negative.
+  // INCONCLUSIVE is the floor for anything that cannot be attributed to our
+  // arming (Pullfrog + CodeRabbit, PR #2, 2026-10-05):
+  //  - never armed (bot-check: no tracks / no player / setOption threw): no
+  //    verdict may assert anything about the player, positive OR negative;
+  //  - armed, but the player made NO timedtext request at all afterwards: a
+  //    stalled or bot-checked player says nothing about translationLanguage.
+  // Only "armed, requests happened, none carried tlang=<target>" is negative.
   const armed = !report.error && report.setTrack === 'ok';
-  const verdict = honored
-    ? `PLAYER HONORS translationLanguage (tlang=${TARGET_LANG} requested after arming)`
-    : armed
-      ? `NOT HONORED: armed track, but no tlang=${TARGET_LANG} request after arming`
-      : `INCONCLUSIVE: track never armed (${report.error || `setTrack=${report.setTrack}`})`;
+  const verdict = !armed
+    ? `INCONCLUSIVE: track never armed (${report.error || `setTrack=${report.setTrack}`})`
+    : honored
+      ? `PLAYER HONORS translationLanguage (tlang=${TARGET_LANG} requested after arming)`
+      : afterArming.length === 0
+        ? 'INCONCLUSIVE: armed, but the player made no timedtext request afterwards'
+        : `NOT HONORED: armed track and ${afterArming.length} timedtext request(s), none with tlang=${TARGET_LANG}`;
   console.log(`[probe:tlang] VERDICT: ${verdict}`);
 });

@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 18 open, 4 fixed.
+Total: 21 open, 4 fixed.
 
 ---
 
@@ -134,6 +134,8 @@ Tier 3 Legacy in `translation-manager.mjs` normalizes to `{start,end,text}`; `ha
 **2026-10-01 (Pullfrog, PR #2):** `chrome.downloads.download` resolves when the download STARTS, so `swDownloaded = true` also claims success for a transfer that later interrupts, and nothing watches `downloads.onChanged`. Its specific scenario (a cancelled Save-As chooser reported as success) is probably wrong, since Chrome rejects that case, but this is untested headless.
 
 **2026-10-05 (CodeRabbit, PR #2, re-raised as "outside diff"):** confirmed still true at `main.mjs` (storage-fallback catch only logs, then the terminal write reports `completed`). The popup does notice — `downloadCompletedZip` finds nothing and shows "ZIP could not be delivered; reopen the popup to retry", keeping the record — but retrying cannot succeed, because the data was never stored. Left open deliberately: pre-existing and outside this PR's diff. Fix still as above: an error terminal status when both delivery paths fail.
+
+**Correction (2026-10-05, close):** the paragraph above calls this "pre-existing and outside this PR's diff". That holds only against this session's commits. Against the PR base it is IN scope: `origin/main` has no `chrome.downloads.download`/storage fallback at all, because the whole playlist batch-download feature is new in PR #2 — so it ships in 1.1.5. CodeRabbit's suggested shape: keep the storage-fallback failure in a `deliveryError`, pick `terminalStatus = 'error'` when set, and store its message in the progress record. Before doing that, check how the popup treats `status: 'error'` in `checkAndRestoreProgress`/polling so the user sees the failure rather than a stuck UI. Still OPEN.
 
 ---
 
@@ -292,3 +294,27 @@ Reported 2026-10-02: the user opened a German-philosophy playlist (the page itse
 **Status: OPEN** · medium · verified from the 2026-10-02 popup log
 
 From a real session log (2026-10-02): popup open → first srt = 37.4s wall clock, ~22s of it machine time: (a) **7.1s** language/metadata fetch for `videos[0]` walks cheap → Tier 1 → Tier 3 → Tier 2 → Tier 4, every one fails on bot-check, and the popup then falls back to the full language list anyway; (b) **8.2s** WatchSeed navigation → attested tracklist (BotGuard, unavoidable); (c) **6.5s** per-video Tier 0 → 3 → 1 → 1.5 failures before Tier 1.7 succeeds — while the srt build itself took 60ms. Second video finished 1.5s after the first, so the seed/cascade cost is paid mostly once. Overlaps #1 (bot-check is the driver) and #16. Candidate fixes, cheapest first: fail-fast the popup language fetch (fall back to the full list after the first bot-check-negative tier instead of walking every tier); skip the pre-Tier-1.7 cascade for subsequent videos once this batch has positively seen bot-check from those clients.
+
+---
+
+### #23 — Web Store upload automation: expired refresh token, OAuth app possibly still in Testing
+
+**Status: OPEN** · medium · verified 2026-10-05
+
+`publish_store_draft.yml` failed with a bare `HTTPError: Response code 400` (the upload action hides Google's error body) because `REFRESH_TOKEN` had expired; the previous successful upload was 2026-09-25. Probable cause: the OAuth consent screen of Cloud project `ytsubextract-api` was in **Testing**, whose refresh tokens expire after 7 days. A new token was generated with the OAuth Playground (`chromewebstore` scope) and set as the repo secret; the re-run succeeded (`uploadState: SUCCESS`, built from `925e361`). **Unconfirmed:** whether the app was then switched to **In production** — Google blocked it with "valid app name, support email, homepage URL and privacy policy URL are required"; the values to use are `https://github.com/hellpanderrr/YTSubExtract` and `https://github.com/hellpanderrr/YTSubExtract/blob/main/PRIVACY.MD` (both return 200). If it is still Testing, the new token stops working about 2026-10-12. **Also:** the refresh token was pasted into a chat session, so it should be revoked at https://myaccount.google.com/permissions and replaced (set it with `printf '%s' "$T" | gh secret set REFRESH_TOKEN`; `gh secret set` with no stdin stores an empty value). Fix to build: nothing in code; consider a workflow step that fails with a clear "refresh token expired" message instead of the bare 400. **2026-10-07:** built — `release.yml`'s "Verify store upload credentials" step exchanges the refresh token before the upload and fails with the cause named (it never prints the response, which carries an access token); `publish_store_draft.yml` is retired by the release-rail rework.
+
+---
+
+### #24 — Stop during the watch-page seed holds, but the batch only ends when the seed returns
+
+**Status: OPEN** · low-medium · from CodeRabbit (PR #2, outside-diff), read against the code
+
+`BatchProcessor.process()` no longer resets `shouldStop` (2026-10-05, `5b015e9`), so a Stop accepted while `seedWatchPage` runs now prevents every video from being processed. But `seedWatchPage` itself (`translation-manager.mjs`, the navigation wait and the readiness probe loop, up to roughly 45s) never checks `_batchCancelled`, so the batch stays non-terminal until the seed finishes on its own. Fix: make both waits cancellation-aware and return early; add a test beside the Stop-during-seed case in `test/seed-translate.test.mjs` that fails if the seed keeps waiting.
+
+---
+
+### #25 — Tier 3: both `getInfo` calls failing skips the independent direct `/player` retries
+
+**Status: OPEN** · low (Tier 3 has no recorded real success) · from CodeRabbit (PR #2, outside-diff); the premise verified in `tier3-worker.mjs`
+
+When the iOS and WEB `getInfo` calls both reject, `fetchTier3Transcript` does `throw e2` before the three-attempt direct `/player` loop, which does not use `info`. A direct response that carries caption tracks therefore cannot rescue the transcript. Fix: keep the error instead of throwing, make the `info.captions…` reads null-safe, run the direct loop, and rethrow the kept error only if no tracks are found — and never call `info.getTranscript()` without an `info`. Add a test (the tier3 worker is currently only exercised through `mock.module`).

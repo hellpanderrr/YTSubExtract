@@ -9,6 +9,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run pack` — Build + create signed `.crx`
 - `npm run zip` — Build + create `.zip` for Chrome Web Store upload
 - `npm run clean` — Remove `dist/` and `builds/`
+- `npm run bump X.Y.Z` — bump every version copy (manifest, package,
+  lock ×2, popup span); refuses if any two disagree, or if X.Y.Z is not
+  greater. Commit on the feature branch BEFORE merging.
+- `npm run notes` — print the top `What's New` block of
+  `STORE_DESCRIPTION.md` (the single source of the release body, the
+  store text and the announcement; `release.yml` fails without it).
+
+### Releasing (single rail since 2026-10-07)
+
+One workflow: `.github/workflows/release.yml` (dispatch-only, refuses
+non-main dispatches). It reads the version from `manifest.json`, refuses
+an existing tag, builds ONCE and uses the same zip for the GitHub
+Release (tag at `${{ github.sha }}`, body from `npm run notes`) and the
+store upload (`publish: false`, so a human submits in the dashboard —
+that stays manual on purpose). `announce.yml` posts the same block to
+Discussions → Announcements AFTER the store shows it live. Retired on
+2026-10-07: `build-release.yml`, `build-release-publish.yml`,
+`publish-store.yml`, `publish_store_draft.yml` — free-text version
+inputs plus `target_commitish: main` had put the v1.1.4 tag on 1.1.2
+code. `STORE_DESCRIPTION.md` is tracked because CI reads it.
 
 ### Unit tests (node:test, no network, no browser)
 
@@ -31,8 +51,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
   Needs **Node >= 22.3** (`engines`; `mock.module` — floor verified on
   22.3.0). `.github/workflows/test.yml` runs `npm test` + `npm run build`
-  on every push/PR; the four release workflows still build on Node 18 and
-  do not run tests.
+  on every push/PR; `release.yml` (the single release rail, since
+  2026-10-07) also gates on `npm test` and builds on Node 22.
+  `test/release-rail.test.mjs` pins the rules (version copies agree,
+  notes extract, no free-text version input, no branch tag target, store
+  stays draft-only).
 
 ### E2E tests (Playwright, headless)
 
@@ -108,6 +131,11 @@ Fall back to Grep/Read for non-code files (`docs/`, `manifest.json`,
   scripted `null` instead of delivering it (`test/watch-seed.test.mjs`,
   2026-09-26).
 
+## Working with the PR review bots (Pullfrog, CodeRabbit)
+
+- After every push to an open PR, read **both** bots' newest reviews in full before reporting: `gh api repos/hellpanderrr/YTSubExtract/pulls/N/reviews` and `.../pulls/N/comments`. Pullfrog puts findings inside collapsed `<details>` blocks — never `cut`/`sed` bot text. Skipped twice (`docs/LESSONS.md` 2026-10-02, 2026-10-05).
+- "Pre-existing / outside the diff" is relative to the PR base, not your own commits: check `git show origin/main:<file> | grep` before using it.
+
 ## Project Structure
 
 ### Chrome Extension (MV3) — YouTube Subtitle Downloader
@@ -144,6 +172,10 @@ src/
     fetch-timeout.js              fetchTextWithTimeout — 10s AbortController covering headers + body;
                                   fetchResponseWithTimeout — same deadline, raw Response (youtubei.js)
     stable-read.js                readUntilStable — re-read a live DOM snapshot until two counts agree
+    fast-abort.js                 runFastAbort — Tier 1.7 wait-level abort window (arm+10s)
+    prune-map.js                  pruneOldest — caps the content-script capture store (40 videos)
+    playlist-rows.js              Tier 0.5 row identity: list= filter, positive-evidence selector sweep, pickRowHref
+    translated-capture.js         bidirectional tlang acceptance gate, captureKey, caption-track arming options
 ```
 
 ### Multi-Tier Extraction System
@@ -172,7 +204,7 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 ### Key Architectural Decisions
 
 - **PoToken / BotGuard**: YouTube's JS VM generates runtime client attestation tokens. Timedtext requests without a valid PoToken return HTTP 200 with 0-byte body. The only reliable bypass is navigating a real YouTube tab to the watch page where the native player solves BotGuard.
-- **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. `content.js` (document_idle, ISOLATED world) injects a bootstrap script that reads this global and relays it via `postMessage` to the ISOLATED-world `capturedTranscripts` Map. This solves the timing gap where the content script's message listener doesn't exist when the sniffer fires at document_start.
+- **MAIN-world Bridge**: `sniffer.js` (document_start, MAIN world) stores captured transcript bodies in `window.__ytsub_captured_transcripts` global. The sniffer also `postMessage`s every capture live (`YTSUB_CAPTURED_TRANSCRIPT`, carrying `tlang`) — that is the primary feed into `content.js`'s (document_idle, ISOLATED world) `capturedTranscripts` Map, keyed `captureKey(lang, tlang)`. Captures that fired before that listener existed are recovered by `content.js` posting `YTSUB_REQUEST_BACKFILL`, to which the sniffer re-broadcasts the global; `content.js` does NOT inject a script for this (script injection from the ISOLATED world does not execute on youtube.com — proven 2026-09-20).
 - **event.source filtering**: `content.js` currently does not filter `YTSUB_CAPTURED_TRANSCRIPT` by `event.source`. The old reason (the embed-iframe tier relayed via `window.parent.postMessage()`) is gone — that tier and the sniffer's iframe relay were deleted 2026-09-29 and the sniffer is top-frame-only — so adding `event.source === window` is now a safe hardening against child-iframe forgery (`docs/ISSUES.md`), not yet done.
 - **Tab Navigation**: Shares the `_pageLegLock` promise-chain mutex with Tier 1.7 so no two page-leg operations ever drive the pinned tab concurrently. Navigates tab to `watch?v=VIDEO_ID&list=PLAYLIST_ID` to preserve playlist sidebar. Saves `_originalTabUrl` on first navigation and restores it after batch completes.
 - **DNR rules** (`rules.json` — 2 rules, ids 1/3; ids 4/5 deleted 2026-09-29):
@@ -184,4 +216,4 @@ Transcript extraction uses fallback tiers (defined in `translation-manager.mjs`)
 - **Progress polling**: background writes to `chrome.storage.local`, popup polls every 500ms
 - **Deduplication**: TranslationManager deduplicates concurrent metadata/transcript requests by video ID
 - **Atomic progress updates**: batch download progress reads-merges-writes to prevent stale state from SW restarts
-- **`content.js` runs in ISOLATED world** (no `"world": "MAIN"` in manifest) — this means it cannot access page-defined JS variables (ytInitialPlayerResponse, etc.) directly. Must use script injection for MAIN-world access or `window.__ytsub_*` globals.
+- **`content.js` runs in ISOLATED world** (no `"world": "MAIN"` in manifest) — this means it cannot access page-defined JS variables (ytInitialPlayerResponse, etc.) directly. Script injection from this world does not execute on youtube.com; reach the MAIN world by `postMessage` to the sniffer (`YTSUB_DRIVE_PLAYER`, `YTSUB_REQUEST_BACKFILL`) or through the background's `chrome.scripting.executeScript({world:'MAIN'})` (`DRIVE_PLAYER_MAIN`).

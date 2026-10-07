@@ -5,7 +5,7 @@
 import { getSubtitles, getLanguages, getVideoInfo, getTranscriptViaAndroid, getTranscriptViaNext } from '../utils/youtube-caption-extractor.js';
 import { fetchTier3Transcript, getVideoMetadata as getVideoMetadataTier3 } from './tier3-worker.mjs';
 import { SUPPORTED_LANGUAGES } from '../utils/languages.js';
-import he from 'he';
+import { decode } from 'he';
 
 export class TranslationManager {
   constructor() {
@@ -1939,7 +1939,7 @@ export class TranslationManager {
                              segments.push({
                                  start: parseFloat(match[1]),
                                  duration: parseFloat(match[2]),
-                                 text: he.decode(match[3])
+                                 text: decode(match[3])
                              });
                          }
                      }
