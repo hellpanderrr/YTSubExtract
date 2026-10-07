@@ -1,7 +1,9 @@
 const crx = require('crx');
 const { readdirSync, existsSync, mkdirSync, readFileSync, writeFileSync } = require('fs');
 const { join, resolve } = require('path');
-const NodeRSA = require('node-rsa');
+// node-rsa 2.0 is ESM-first: the constructor is a named export, not the
+// module itself (v1's `require('node-rsa')` shape).
+const { NodeRSA } = require('node-rsa');
 
 const DIST_PATH = resolve(__dirname, '../dist');
 const BUILDS_PATH = resolve(__dirname, '../builds');
