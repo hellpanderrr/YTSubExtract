@@ -9,6 +9,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm run pack` — Build + create signed `.crx`
 - `npm run zip` — Build + create `.zip` for Chrome Web Store upload
 - `npm run clean` — Remove `dist/` and `builds/`
+- `npm run bump X.Y.Z` — bump every version copy (manifest, package,
+  lock ×2, popup span); refuses if any two disagree, or if X.Y.Z is not
+  greater. Commit on the feature branch BEFORE merging.
+- `npm run notes` — print the top `What's New` block of
+  `STORE_DESCRIPTION.md` (the single source of the release body, the
+  store text and the announcement; `release.yml` fails without it).
+
+### Releasing (single rail since 2026-10-07)
+
+One workflow: `.github/workflows/release.yml` (dispatch-only, refuses
+non-main dispatches). It reads the version from `manifest.json`, refuses
+an existing tag, builds ONCE and uses the same zip for the GitHub
+Release (tag at `${{ github.sha }}`, body from `npm run notes`) and the
+store upload (`publish: false`, so a human submits in the dashboard —
+that stays manual on purpose). `announce.yml` posts the same block to
+Discussions → Announcements AFTER the store shows it live. Retired on
+2026-10-07: `build-release.yml`, `build-release-publish.yml`,
+`publish-store.yml`, `publish_store_draft.yml` — free-text version
+inputs plus `target_commitish: main` had put the v1.1.4 tag on 1.1.2
+code. `STORE_DESCRIPTION.md` is tracked because CI reads it.
 
 ### Unit tests (node:test, no network, no browser)
 
@@ -31,8 +51,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   patched — no YouTube calls. Playwright specs stay in `e2e/`.
   Needs **Node >= 22.3** (`engines`; `mock.module` — floor verified on
   22.3.0). `.github/workflows/test.yml` runs `npm test` + `npm run build`
-  on every push/PR; the four release workflows still build on Node 18 and
-  do not run tests.
+  on every push/PR; `release.yml` (the single release rail, since
+  2026-10-07) also gates on `npm test` and builds on Node 22.
+  `test/release-rail.test.mjs` pins the rules (version copies agree,
+  notes extract, no free-text version input, no branch tag target, store
+  stays draft-only).
 
 ### E2E tests (Playwright, headless)
 

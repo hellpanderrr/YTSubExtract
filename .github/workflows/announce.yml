@@ -1,0 +1,54 @@
+name: Announce
+
+# Posts the current release to Discussions -> Announcements. Run this ONLY
+# after the store shows the new version live, so the post is never ahead of
+# reality. Text is the same single source as release.yml: the top What's New
+# block of STORE_DESCRIPTION.md. Announcements is the category the Web Store
+# listing's Support link should point at (it existed but had no posts —
+# checked 2026-10-07 with an empty discussions list).
+on:
+  workflow_dispatch:
+    inputs:
+      store_url:
+        description: 'Store listing URL to link (leave empty for the default)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  discussions: write
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Create the announcement discussion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STORE_URL: ${{ inputs.store_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          V=$(node scripts/release-notes.mjs --version)
+          NOTES=$(node scripts/release-notes.mjs)
+          STORE="${STORE_URL:-https://chromewebstore.google.com/detail/ehfbiallbefapeopggocegeipiimbhli}"
+          RELEASE="https://github.com/$REPO/releases/tag/v$V"
+          BODY=$(printf '%s\n\n---\n\n**Links:** [Chrome Web Store](%s) · [GitHub release](%s)\n' "$NOTES" "$STORE" "$RELEASE")
+
+          REPO_ID=$(gh api graphql -f query='query($o:String!,$n:String!){repository(owner:$o,name:$n){id}}' \
+            -f o="${REPO%%/*}" -f n="${REPO##*/}" --jq '.data.repository.id')
+          CATEGORY_ID=$(gh api graphql -f query='query($o:String!,$n:String!){repository(owner:$o,name:$n){discussionCategories(first:20){nodes{id name}}}}' \
+            -f o="${REPO%%/*}" -f n="${REPO##*/}" --jq '.data.repository.discussionCategories.nodes[] | select(.name=="Announcements") | .id')
+          test -n "$CATEGORY_ID"
+
+          gh api graphql -f query='mutation($repo:ID!,$cat:ID!,$title:String!,$body:String!){createDiscussion(input:{repositoryId:$repo,categoryId:$cat,title:$title,body:$body}){discussion{url}}}' \
+            -f repo="$REPO_ID" -f cat="$CATEGORY_ID" \
+            -f title="YTSubExtract v$V released" -f body="$BODY" --jq '.data.createDiscussion.discussion.url'

@@ -14,6 +14,8 @@
     "pack": "npm run build && node scripts/pack.cjs",
     "zip": "npm run build && node scripts/zip.cjs",
     "clean": "rimraf dist builds",
+    "bump": "node scripts/bump-version.mjs",
+    "notes": "node scripts/release-notes.mjs",
     "e2e:login": "node e2e/login.mjs",
     "e2e": "npm run build && playwright test",
     "e2e:headed": "npm run build && playwright test --headed",
