@@ -1,4 +1,4 @@
-import he from 'he';
+import { decode } from 'he';
 import striptags from 'striptags';
 import { fetchTextWithTimeout } from './fetch-timeout.js';
 
@@ -416,7 +416,7 @@ async function getTranscriptFromEngagementPanel(videoID, nextData) {
         subtitles.push({
           start: (startMs / 1000).toString(),
           dur: ((endMs - startMs) / 1000).toString(),
-          text: he.decode(striptags(text)),
+          text: decode(striptags(text)),
         });
       }
     }
@@ -499,7 +499,7 @@ function extractSubtitlesFromXML(transcript, startRegex, durRegex) {
         .replace(/<text.+>/, '')
         .replace(/&amp;/gi, '&')
         .replace(/<\/?[^>]+(>|$)/g, '');
-      const decodedText = he.decode(htmlText);
+      const decodedText = decode(htmlText);
       const text = striptags(decodedText);
 
       acc.push({
@@ -624,7 +624,7 @@ export const getSubtitles = async ({ videoID, lang = 'en', translate, translateL
          segments.push({
              start: parseFloat(match[1]),
              duration: parseFloat(match[2]),
-             text: he.decode(match[3])
+             text: decode(match[3])
          });
      }
      
@@ -791,7 +791,7 @@ function parseTranscriptSegments(data) {
       return text.trim() ? {
         start: startMs / 1000,
         duration: (endMs - startMs) / 1000,
-        text: he.decode(striptags(text)),
+        text: decode(striptags(text)),
       } : null;
     }).filter(Boolean);
   }
@@ -812,7 +812,7 @@ function parseTranscriptSegments(data) {
       return text.trim() ? {
         start: startMs / 1000,
         duration: (endMs - startMs) / 1000,
-        text: he.decode(striptags(text)),
+        text: decode(striptags(text)),
       } : null;
     }).filter(Boolean);
   }
