@@ -62,7 +62,12 @@ export class BatchProcessor {
 
     try {
       this.isRunning = true;
-      this.shouldStop = false;
+      // Do NOT reset shouldStop here. The processor is created per batch (the
+      // constructor already starts it false), and main.mjs registers it as
+      // activeBatchProcessor BEFORE the watch-page seed — so a Stop pressed
+      // during the seed calls stop() first. Resetting here discarded that
+      // Stop, and cached videos (which skip every Stop checkpoint) were then
+      // processed into the ZIP. (CodeRabbit, PR #2, 2026-10-05.)
 
       const results = {
         success: [],
@@ -90,6 +95,9 @@ export class BatchProcessor {
 
           // Initial delay with jitter for staggered start
           await this._delay(200, 100);
+          if (this.shouldStop) {
+            return; // Stop arrived during the start delay
+          }
 
           try {
             // Report progress BEFORE processing (shows "processing X/Y")
@@ -114,16 +122,22 @@ export class BatchProcessor {
             this.onVideoComplete(result);
 
           } catch (err) {
-            const error = {
-              videoId: video.videoId,
-              title: video.title,
-              index: video.index,
-              error: err.message,
-              logs: err.logs || []
-            };
+            // A cooperative-stop abort is not a per-video failure — don't
+            // record it (the batch will finish with status 'stopped').
+            if (err.stopped || this.shouldStop) {
+              console.log(`[Batch] Stopped during: ${video.videoId}`);
+            } else {
+              const error = {
+                videoId: video.videoId,
+                title: video.title,
+                index: video.index,
+                error: err.message,
+                logs: err.logs || []
+              };
 
-            results.errors.push(error);
-            this.onVideoError(error);
+              results.errors.push(error);
+              this.onVideoError(error);
+            }
           } finally {
             // Update progress after each video (atomic increment)
             completed++;

@@ -1,0 +1,43 @@
+name: Test
+
+# Unit tests + a full build on every push and PR. The e2e suite is NOT run
+# here: it needs a signed-in YouTube profile and a live network path.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # >= 22.3 is required: test/tier3-order.test.mjs uses node:test's
+      # mock.module (behind --experimental-test-module-mocks, already in the
+      # `test` script). The floor was verified locally on 22.3.0 (59/59).
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      # The unit tests import background modules only; content.js, sniffer.js
+      # and the popup are covered by nothing else, so a build catches broken
+      # imports/syntax there.
+      - name: Build all bundles
+        run: npm run build

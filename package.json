@@ -1,15 +1,23 @@
 {
   "name": "youtube-subtitle-downloader-mv3",
-  "version": "1.1.2",
+  "version": "1.1.5",
   "description": "YouTube Subtitle Downloader with 3-tier fallback",
   "type": "module",
+  "engines": {
+    "node": ">=22.3.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build && vite build -c vite.config.content.js && vite build -c vite.config.sniffer.js",
+    "test": "node --experimental-test-module-mocks --test \"test/*.test.mjs\"",
     "preview": "vite preview",
     "pack": "npm run build && node scripts/pack.cjs",
     "zip": "npm run build && node scripts/zip.cjs",
-    "clean": "rimraf dist builds"
+    "clean": "rimraf dist builds",
+    "e2e:login": "node e2e/login.mjs",
+    "e2e": "npm run build && playwright test",
+    "e2e:headed": "npm run build && playwright test --headed",
+    "e2e:smoke": "playwright test e2e/smoke.spec.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.2",
@@ -17,6 +25,7 @@
     "striptags": "^3.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@playzone/youtube-transcript": "^1.0.0",
     "crx": "^5.0.1",
     "node-rsa": "^1.1.1",
@@ -26,7 +35,7 @@
     "vite": "^6.4.1",
     "vite-plugin-node-polyfills": "^0.25.0",
     "vite-plugin-static-copy": "^2.3.2",
-    "youtubei.js": "^16.0.1",
+    "youtubei.js": "^18.1.0",
     "zip-a-folder": "^3.1.9"
   }
 }

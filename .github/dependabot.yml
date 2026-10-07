@@ -1,0 +1,19 @@
+# Dependabot: weekly npm bump PRs, validated by .github/workflows/test.yml
+# (npm test + npm run build on Node 22).
+#
+# FYI for reviewers: the extension bundles its deps at build time (Vite), and
+# MV3 forbids remote code, so a merged dependency bump only reaches users via
+# a store republish — Dependabot here is visibility + CI, not auto-ship.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for routine bumps instead of a dozen singletons.
+      dev-dependencies:
+        patterns:
+          - "*"
+        dependency-type: development

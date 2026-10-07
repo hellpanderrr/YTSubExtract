@@ -45,14 +45,205 @@ if (typeof localStorage === 'undefined') {
 if (typeof globalThis.isBatchProcessing === 'undefined') {
   globalThis.isBatchProcessing = false;
 }
+// Live BatchProcessor instance for the active batch (Stop button target).
+if (typeof globalThis.activeBatchProcessor === 'undefined') {
+  globalThis.activeBatchProcessor = null;
+}
+// True from "processor.process resolved" until the terminal status write.
+// STOP refuses to act during finalization: writing 'stopping' after the
+// terminal status would soft-lock the popup (nothing writes progress again).
+if (typeof globalThis.batchFinalizing === 'undefined') {
+  globalThis.batchFinalizing = false;
+}
+// The terminal status this batch intends to publish ('stopped'/'completed'/
+// 'error'). Re-asserted in the handler's .finally in case a straggling
+// STOP write landed after the terminal write.
+if (typeof globalThis.batchTerminalStatus === 'undefined') {
+  globalThis.batchTerminalStatus = null;
+}
 
 // Memoization for GET_DOWNLOAD_PROGRESS to prevent redundant storage reads
 if (typeof globalThis.restoreProgressPromise === 'undefined') {
   globalThis.restoreProgressPromise = null;
 }
 
+// MAIN-world player probe/drive state shared with the content script.
+// chrome.scripting.executeScript({world:'MAIN'}) is the only channel that
+// provably reaches page JS (ISOLATED-world script injection does not execute
+// on youtube.com; ISOLATED→MAIN postMessage does not cross worlds — proven
+// 2026-09-20). sender.tab.id scopes the injection to the requesting tab.
+const MAIN_PROBE_FUNC = () => {
+  const state = { ready: false, hasCaptions: false, hasPlayer: false,
+    trackCount: 0, tracks: [], trackErr: null, playerState: null, url: location.href };
+  try {
+    const p = document.getElementById('movie_player');
+    state.hasPlayer = !!p;
+    if (p && typeof p.loadVideoById === 'function') {
+      state.ready = true;
+      try { state.playerState = (typeof p.getPlayerState === 'function') ? p.getPlayerState() : null; }
+      catch (e) { state.playerState = 'threw'; }
+      try {
+        const r = (typeof p.getPlayerResponse === 'function') ? p.getPlayerResponse() : null;
+        const list = r?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (Array.isArray(list)) {
+          state.trackCount = list.length;
+          state.tracks = list.map((t) => `${t.languageCode}${t.kind ? '/' + t.kind : ''}`);
+          state.hasCaptions = list.length > 0;
+        }
+      } catch (e) { state.trackErr = e.message; }
+    }
+  } catch (e) { state.trackErr = e.message; }
+  return state;
+};
+
+const MAIN_DRIVE_FUNC = (videoId, wantLang, wantTlang) => {
+  const fail = (detail) => window.postMessage({ type: 'COERCE_PLAYER_FAILED', requestId: 'scripting', videoId, detail }, '*');
+  const done = (detail) => window.postMessage({ type: 'COERCE_PLAYER_COMPLETE', requestId: 'scripting', videoId, detail }, '*');
+  try { document.querySelectorAll('video, audio').forEach((el) => { el.muted = true; el.volume = 0; }); } catch (e) {}
+  const player = document.getElementById('movie_player');
+  if (!player || typeof player.loadVideoById !== 'function') {
+    // Status goes through the MAIN-world sniffer's fetch/XHR hook logs; the
+    // ISOLATED listener can't see this postMessage, so throw to surface it.
+    throw new Error('no usable player in MAIN world');
+  }
+  const respTracks = () => {
+    try {
+      const r = player.getPlayerResponse?.();
+      return r?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    } catch (e) { return []; }
+  };
+  let needLoad = true;
+  try {
+    const cur = player.getPlayerResponse?.();
+    if (cur?.videoDetails?.videoId === videoId && respTracks().length > 0) needLoad = false;
+  } catch (e) {}
+  const armCaptions = () => {
+    // Settled-fast (mirrors sniffer drivePlayerCoercion): a confirmed-this-
+    // video response with 0 tracks on 2 consecutive polls means nothing to
+    // arm against — report immediately instead of the full 25-try budget.
+    const settledVideoId = () => {
+      try { return player?.getPlayerResponse?.()?.videoDetails?.videoId || null; }
+      catch (e) { return null; }
+    };
+    let trackTries = 0;
+    let settledZeroStreak = 0;
+    const trackTimer = setInterval(() => {
+      trackTries++;
+      const tracks = respTracks();
+      if (tracks.length === 0 && settledVideoId() === videoId) {
+        settledZeroStreak++;
+      } else {
+        settledZeroStreak = 0;
+      }
+      if (tracks.length > 0 || trackTries > 25 || settledZeroStreak >= 2) {
+        clearInterval(trackTimer);
+        let pick = null;
+        if (wantLang) pick = tracks.find((t) => t.languageCode === wantLang) || null;
+        if (!pick) pick = tracks.find((t) => t.kind === 'asr') || tracks[0];
+        try {
+          if (typeof player.loadModule === 'function') {
+            try { player.loadModule('captions'); } catch (e) {}
+            try { player.loadModule('cc'); } catch (e) {}
+          }
+          if (pick && typeof player.setOption === 'function') {
+            // Inlined twin of src/utils/translated-capture.js's
+            // buildCaptionTrackOptions — this function is serialized into the
+            // page by executeScript, so it cannot import. Keep it in sync.
+            // FALLBACK, not both: a bare follow-up setOption clobbers the
+            // translationLanguage (2026-10-03 tlang=none bug).
+            const rich = { languageCode: pick.languageCode };
+            if (pick.kind) rich.kind = pick.kind;
+            if (wantTlang) rich.translationLanguage = { languageCode: wantTlang };
+            const bare = { languageCode: pick.languageCode };
+            if (wantTlang) bare.translationLanguage = { languageCode: wantTlang };
+            let armed = false;
+            try { player.setOption('captions', 'track', rich); armed = true; } catch (e) {}
+            if (!armed) {
+              try { player.setOption('captions', 'track', bare); } catch (e) {}
+            }
+          }
+          let cycle = 0;
+          const toggleTimer = setInterval(() => {
+            cycle++;
+            try {
+              if (typeof player.toggleSubtitles === 'function') {
+                player.toggleSubtitles(false);
+                setTimeout(() => { try { player.toggleSubtitles(true); } catch (e) {} }, 300);
+              }
+            } catch (e) {}
+            if (cycle >= 3) {
+              clearInterval(toggleTimer);
+              done('captions armed on ' + (pick ? pick.languageCode : 'default') +
+                ` (respTracks=${tracks.length})`);
+            }
+          }, 800);
+        } catch (e) { fail('caption arm threw: ' + e.message); }
+      }
+    }, 200);
+  };
+  if (!needLoad) { armCaptions(); return 'already on video'; }
+  try {
+    player.loadVideoById({ videoId, muted: true });
+  } catch (e) {
+    try { player.loadVideoById(videoId); } catch (e2) { throw new Error('loadVideoById threw'); }
+  }
+  let attempts = 0;
+  const captionsTimer = setInterval(() => {
+    attempts++;
+    try {
+      if (player.getPlayerState() === 1) {
+        clearInterval(captionsTimer);
+        armCaptions();
+      } else if (attempts > 150) {
+        clearInterval(captionsTimer);
+        armCaptions();
+      }
+    } catch (e) {
+      if (attempts > 150) { clearInterval(captionsTimer); fail('state poll threw'); }
+    }
+  }, 200);
+  return 'drive dispatched';
+};
+
 // Message Handler
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // MAIN-world probe/drive via chrome.scripting (fallback when the sniffer
+  // postMessage bridge is unreachable). sender.tab scopes to the tab.
+  if (request.type === 'PROBE_PLAYER_MAIN') {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (!tabId) throw new Error('no sender tab');
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: MAIN_PROBE_FUNC,
+        });
+        sendResponse({ success: true, state: res?.result || { ready: false, probeErr: 'empty result' } });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+  if (request.type === 'DRIVE_PLAYER_MAIN') {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id;
+        if (!tabId) throw new Error('no sender tab');
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: MAIN_DRIVE_FUNC,
+          args: [request.videoId, request.wantLang || null, request.wantTlang || null],
+        });
+        sendResponse({ success: true });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
     // 1. Get Video Metadata (Languages)
     if (request.type === 'GET_VIDEO_METADATA') {
         // Atomic update of currentDownloadProgress to avoid overwriting on SW start
@@ -111,6 +302,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     // Set guard atomically before any async operations
     globalThis.isBatchProcessing = true;
+    // Fresh batch: clear any stale Stop request / driver-tab pin from a previous run
+    translationManager._batchCancelled = false;
+    translationManager._batchTabId = null;
+    translationManager._originalTabUrl = null;
+    globalThis.batchFinalizing = false;
+    globalThis.batchTerminalStatus = null;
 
     const downloadId = `playlist_${request.playlistId}_${Date.now()}`;
     // Initialize progress atomically so popup sees it on first poll (fire-and-forget)
@@ -124,24 +321,98 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       downloadId
     }, { force: true }).catch(() => {});
     // Fire-and-forget: process in background, popup polls via GET_DOWNLOAD_PROGRESS
-    handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId)
+    handleBatchDownloadPlaylist(request.videos, request.options, request.playlistId, request.playlistTitle, downloadId, request.tabId)
       .catch((err) => {
         console.error('[Background] Batch download failed:', err);
-        // Atomic error state update (fire-and-forget)
+        // Atomic error state update (fire-and-forget) — unless the failure
+        // followed an accepted Stop (restore already cleared the flag, so
+        // trust the marker handleBatchDownloadPlaylist attached).
         atomicProgressUpdate({
           playlistId: request.playlistId,
-          status: 'error',
+          status: err.wasStopped ? 'stopped' : 'error',
           error: err.message,
           total: request.videos.length
         }, { force: true }).catch(() => {});
+        globalThis.batchTerminalStatus = err.wasStopped ? 'stopped' : 'error';
       })
-      .finally(() => {
+      .finally(async () => {
         // ALWAYS reset the guard when batch completes (success, error, or stopped)
         globalThis.isBatchProcessing = false;
+        globalThis.activeBatchProcessor = null;
+        globalThis.batchFinalizing = false;
+        // Backstop: a STOP write accepted moments before finalization could
+        // theoretically land after the terminal write. Nothing writes after
+        // this point (guards cleared), so re-assert the intended terminal
+        // status if it was clobbered.
+        const intended = globalThis.batchTerminalStatus;
+        if (intended) {
+          try {
+            // Queued (#11): this read-check-write must not interleave with
+            // any straggling progress writer.
+            await queueProgressWrite(async () => {
+              const stored = await chrome.storage.local.get('currentDownloadProgress');
+              const cur = stored.currentDownloadProgress;
+              if (cur && cur.status !== intended) {
+                console.warn(`[Main] Terminal status clobbered (${cur.status} → ${intended}), re-asserting`);
+                const fixed = { ...cur, status: intended, updatedAt: Date.now() };
+                globalThis.currentDownloadProgress = fixed;
+                await chrome.storage.local.set({ currentDownloadProgress: fixed });
+              }
+            });
+          } catch (e) {
+            console.warn('[Main] Terminal re-assert failed:', e.message);
+          }
+        }
+        globalThis.batchTerminalStatus = null;
         console.log('[Main] Batch processing guard reset');
       });
     // Return immediately so popup can start polling
     sendResponse({ success: true, data: { downloadId } });
+    return true;
+  }
+
+  // 5b. Stop the active batch download (Stop button)
+  if (request.type === 'STOP_BATCH_DOWNLOAD') {
+    if (!globalThis.isBatchProcessing) {
+      sendResponse({ success: false, error: 'No batch running' });
+      return true;
+    }
+    // Finalizing (ZIP + restore) — the terminal status write is imminent or
+    // done. Writing 'stopping' now would clobber 'stopped'/'completed' and
+    // nothing would ever write progress again (permanently stuck popup).
+    if (globalThis.batchFinalizing) {
+      sendResponse({ success: false, error: 'Batch already finished' });
+      return true;
+    }
+    // AWAITED (not fire-and-forget): the response is sent only after the
+    // write lands, so ordering against the terminal write is structural.
+    // refuseIfTerminal: if a terminal status won the race, keep it and
+    // report the stop as already-finished. The cooperative cancel flag and
+    // processor stop are only applied when the write was accepted — a
+    // refused stop must not mutate batch state.
+    atomicProgressUpdate({ status: 'stopping' }, { force: true, refuseIfTerminal: true })
+      .then((merged) => {
+        const accepted = merged?.status === 'stopping';
+        if (accepted) {
+          // Cooperative cancel: queued videos skip, page-leg tiers bail at
+          // their next checkpoint, 2C aborts its poll within one tick.
+          translationManager._batchCancelled = true;
+          if (globalThis.activeBatchProcessor) globalThis.activeBatchProcessor.stop();
+        }
+        console.log(
+          '[Main] Stop requested for active batch' +
+            (accepted ? '' : ' — refused, batch already finished')
+        );
+        sendResponse(
+          accepted
+            ? { success: true }
+            : { success: false, error: 'Batch already finished' }
+        );
+      })
+      .catch((e) => {
+        console.error('[Main] Stop write failed:', e);
+        sendResponse({ success: false, error: e.message });
+      });
     return true;
   }
 
@@ -221,7 +492,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           source: 'api'
         });
       } catch (err) {
-        console.error('[Main] Failed to get playlist videos:', err);
+        console.error(`[Main] API failed: ${err.message}`);
+
+        // Final fallback: credentialed playlist page fetch via content script
+        // This handles private playlists (e.g. LL) where all unauthenticated
+        // API clients return "does not exist"
+        try {
+          console.log(`[Main] Trying credentialed fetch for playlist: ${request.playlistId}`);
+          const fetchResult = await translationManager._fetchPlaylistPageAuth(request.playlistId);
+
+          if (fetchResult && fetchResult.videos && fetchResult.videos.length > 0) {
+            console.log(`[Main] Credentialed fetch success: ${fetchResult.videos.length} videos`);
+            sendResponse({
+              success: true,
+              videos: fetchResult.videos.map((v, i) => ({ ...v, index: i + 1 })),
+              title: fetchResult.title || '',
+              source: 'tier0.5-auth'
+            });
+            return;
+          }
+        } catch (authErr) {
+          console.error('[Main] Credentialed fetch also failed:', authErr.message);
+        }
+
         sendResponse({ success: false, error: err.message });
       }
     })();
@@ -342,38 +635,43 @@ async function handleGetPlaylistTranscript(videoId, options = {}) {
   }
 }
 
-async function handleBatchDownloadPlaylist(videos, options, playlistId, playlistTitle = '', downloadId) {
+async function handleBatchDownloadPlaylist(videos, options, playlistId, playlistTitle = '', downloadId, sourceTabId = null) {
   // Progress is already initialized by the message handler
 
   let results = null;
+  // Heartbeat: keeps updatedAt fresh (popup staleness guard) and helps the
+  // MV3 service worker stay alive while the batch runs. Stops in finally.
+  // .unref() (Node only) so an abandoned test batch can't pin the process.
+  const heartbeat = setInterval(() => {
+    atomicProgressUpdate({}, {}).catch(() => {});
+  }, 15000);
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
   try {
+    // Pin the tab captured at CLICK time (popup sends it in the payload) —
+    // resolving "active tab" here could pick a tab the user switched to
+    // during a cold service-worker wake. Validated as a YouTube tab; seed
+    // falls back to active-or-first if this one is gone.
+    if (sourceTabId != null) {
+      try {
+        const t = await chrome.tabs.get(sourceTabId);
+        if (t && /https?:\/\/([^/]+\.)?youtube\.com\//.test(t.url || '')) {
+          translationManager._batchTabId = t.id;
+          console.log(`[Batch] Pinned driver tab from click-time tabId: ${t.id}`);
+        } else {
+          console.log(`[Batch] Click-time tab ${sourceTabId} not a YouTube tab, seed will resolve`);
+        }
+      } catch (e) {
+        console.log(`[Batch] Click-time tab ${sourceTabId} unavailable (${e.message}), seed will resolve`);
+      }
+    }
+
     const processor = new BatchProcessor({
       concurrency: 3,
       delayMs: 300,
       onProgress: async (progress) => {
-        // Atomic state update: read, merge, write
-        try {
-          const stored = await chrome.storage.local.get('currentDownloadProgress');
-          const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
-          
-          // Don't overwrite completed or error status with running from a potentially stale processor
-          if (current.status === 'completed' || current.status === 'error') {
-             // If we already finished in storage, just keep it
-             globalThis.currentDownloadProgress = current;
-             return;
-          }
-
-          globalThis.currentDownloadProgress = {
-            ...progress,
-            playlistId,
-            status: 'running',
-            downloadId: downloadId
-          };
-          await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
-        } catch (e) {
-          console.error('[Background] Progress update failed:', e);
-        }
+        // Queued read-guard-write (#11) — see persistBatchProgress.
+        await persistBatchProgress(progress, { playlistId, downloadId });
       },
       onVideoComplete: (result) => {
         console.log(`[Batch] Completed: ${result.videoId}`);
@@ -382,11 +680,33 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
         console.log(`[Batch] Failed: ${error.videoId} - ${error.error}`);
       }
     });
+    globalThis.activeBatchProcessor = processor;
 
-    // Run batch processing
+    // Seed the tab ONCE to a /watch page so Tier 1.7 player coercion has a
+    // real movie_player to drive via loadVideoById (one navigation per
+    // batch; later videos switch in-page). Keeps playlist context (&list=).
+    // restoreOriginalTab (end of batch) returns the user to the list page.
+    // Since 2026-10-03 this runs for translated batches too: 1.7 is now the
+    // translation-capable player tier (arms a translationLanguage and the
+    // capture is accepted only with a matching tlang), and with API tiers
+    // bot-checked it is the tier that actually works. See ISSUES #3/#21.
+    if (videos.length > 0) {
+      await translationManager.seedWatchPage(videos[0].videoId, playlistId).catch(() => {});
+    }
     results = await processor.process(videos, options);
+    // Phase flip: from here only the terminal write may touch progress status.
+    globalThis.batchFinalizing = true;
+    const wasStopped = translationManager._batchCancelled;
 
-    // Create ZIP with subtitles
+    // Create ZIP with subtitles — skipped entirely when the user stopped the
+    // batch with zero successes (nothing to deliver). A partial batch with
+    // successes still ships a ZIP, saved silently (no Save-As dialog) since
+    // the user just asked everything to stop.
+    const stopWithoutResults = wasStopped && results.success.length === 0;
+    let swDownloaded = false;
+    if (stopWithoutResults) {
+      console.log('[Background] Batch stopped with no successful transcripts — skipping ZIP');
+    } else {
     const zipData = {};
     const format = options.format || 'srt';
     const lang = options.translate ? options.targetLang : options.sourceLang;
@@ -412,44 +732,77 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
       zipData['_errors.txt'] = strToU8(errorReport);
     }
 
-    // Create ZIP blob (async to avoid blocking service worker)
-    const zipBlob = await createZipInBackground(zipData);
-
-    // Convert blob to base64 for storage with error handling
-    const reader = new FileReader();
-    const base64Data = await new Promise((resolve, reject) => {
-      reader.onloadend = () => resolve(reader.result.split(',')[1]);
-      reader.onerror = () => reject(new Error('FileReader failed to read blob'));
-      reader.readAsDataURL(zipBlob);
-    });
-
-    await chrome.storage.local.set({
-      [downloadId]: {
-        data: base64Data,
-        filename: generateZipFilename(playlistId, lang, playlistTitle),
-        timestamp: Date.now()
-      }
-    });
-
-    // Update progress to completed (popup will download with correct filename via DOM)
+    // Create ZIP data (sync, returns Uint8Array)
+    let zipUint8;
     try {
-      const stored = await chrome.storage.local.get('currentDownloadProgress');
-      const current = stored.currentDownloadProgress || {};
-      
-      globalThis.currentDownloadProgress = {
-        ...current,
-        playlistId,
-        status: 'completed',
-        completed: results.success.length + results.errors.length,
-        total: videos.length,
-        failed: results.errors.length,
-        downloadId,
-        autoDownloaded: false
-      };
-      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+      zipUint8 = zipSync(zipData, { level: 6 });
+    } catch (err) {
+      throw new Error(`ZIP creation failed: ${err.message}`);
+    }
+
+    // Convert Uint8Array → base64 data URL (avoids FileReader/Blob URL in SW)
+    const filename = generateZipFilename(playlistId, lang, playlistTitle);
+    let binary = '';
+    for (let i = 0; i < zipUint8.length; i++) {
+      binary += String.fromCharCode(zipUint8[i]);
+    }
+    const dataUrl = 'data:application/zip;base64,' + btoa(binary);
+
+    try {
+      await chrome.downloads.download({
+        url: dataUrl,
+        filename: filename,
+        saveAs: !wasStopped // silent partial download when stopping
+      });
+      // Mark that SW already triggered the download — popup just needs to show success
+      swDownloaded = true;
+    } catch (e) {
+      console.error('[Background] chrome.downloads.download failed:', e);
+      // Fallback: store in storage for popup-based download
+      try {
+        await chrome.storage.local.set({
+          [downloadId]: {
+            data: dataUrl.split(',')[1],
+            filename: filename,
+            timestamp: Date.now()
+          }
+        });
+      } catch (storeErr) {
+        console.error('[Background] Storage fallback also failed:', storeErr);
+      }
+    }
+    } // end !stopWithoutResults
+
+    // Update progress to completed/stopped — queued (#11) so a racing STOP
+    // write lands before or after this, never inside its read-write window.
+    try {
+      await queueProgressWrite(async () => {
+        const stored = await chrome.storage.local.get('currentDownloadProgress');
+        const current = stored.currentDownloadProgress || {};
+
+        const terminalStatus = wasStopped ? 'stopped' : 'completed';
+        globalThis.currentDownloadProgress = {
+          ...current,
+          playlistId,
+          status: terminalStatus,
+          completed: results.success.length + results.errors.length,
+          total: videos.length,
+          failed: results.errors.length,
+          downloadId,
+          autoDownloaded: false,
+          swDownloaded,
+          updatedAt: Date.now(),
+          ...(wasStopped ? { stoppedSaved: swDownloaded } : {})
+        };
+        globalThis.batchTerminalStatus = terminalStatus;
+        await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+      });
     } catch (e) {
       console.error('[Background] Final progress update failed:', e);
     }
+
+    // Restore tab to original URL after batch completes
+    await translationManager.restoreOriginalTab();
 
     return {
       downloadId,
@@ -459,65 +812,159 @@ async function handleBatchDownloadPlaylist(videos, options, playlistId, playlist
     };
 
   } catch (err) {
+    // If this failure happened after an accepted Stop, the user's terminal
+    // state is 'stopped', not 'error' — capture the flag before restore
+    // clears it and mark the error for the outer catch.
+    const stoppedAlready = translationManager._batchCancelled;
+    err.wasStopped = stoppedAlready;
     console.error('[Background] Batch download failed:', err);
 
-    // Update progress to error state so popup can see it
+    // Update progress to error/stopped state so popup can see it — queued
+    // (#11) like the terminal write above.
     try {
-      const stored = await chrome.storage.local.get('currentDownloadProgress');
-      const current = stored.currentDownloadProgress || {};
+      await queueProgressWrite(async () => {
+        const stored = await chrome.storage.local.get('currentDownloadProgress');
+        const current = stored.currentDownloadProgress || {};
 
-      globalThis.currentDownloadProgress = {
-        ...current,
-        playlistId,
-        status: 'error',
-        completed: results?.success?.length || current.completed || 0,
-        total: videos.length,
-        failed: results?.errors?.length || current.failed || 0,
-        error: err.message,
-        downloadId
-      };
-      await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+        const errorStatus = stoppedAlready ? 'stopped' : 'error';
+        globalThis.currentDownloadProgress = {
+          ...current,
+          playlistId,
+          status: errorStatus,
+          completed: results?.success?.length || current.completed || 0,
+          total: videos.length,
+          failed: results?.errors?.length || current.failed || 0,
+          error: err.message,
+          downloadId,
+          updatedAt: Date.now()
+        };
+        globalThis.batchTerminalStatus = errorStatus;
+        await chrome.storage.local.set({ currentDownloadProgress: globalThis.currentDownloadProgress });
+      });
     } catch (e) {
       console.error('[Background] Error state update failed:', e);
     }
 
+    // Restore tab to original URL even on error
+    await translationManager.restoreOriginalTab();
+
     throw err;
+  } finally {
+    clearInterval(heartbeat);
   }
+}
+
+/**
+ * Progress write queue (#11). chrome.storage has no compare-and-set, but the
+ * SW is single-threaded: running every read-modify-write below as ONE queued
+ * unit means each guard sees every prior write's committed state. Before
+ * this, onProgress read at one moment and wrote later — a STOP's 'stopping'
+ * landing in between was clobbered back to 'running' (the popup showed
+ * "Downloading…" instead of "Stopping…" until the terminal write).
+ *
+ * INVARIANT: a site either calls atomicProgressUpdate/persistBatchProgress
+ * (queued inside) or wraps its own raw body in queueProgressWrite — never
+ * queues a call that itself calls one of those (self-wait = deadlock).
+ *
+ * Two load-bearing properties, both consequences of the chain being
+ * appended SYNCHRONOUSLY (queueProgressWrite must stay sync-at-entry):
+ *  - BatchProcessor's fire-and-forget last onProgress (batch-processor.mjs
+ *    :75/:99/:139, not awaited) enqueues before handleBatch continues to the
+ *    terminal write, so the final tick always lands first. Making the queue
+ *    async-at-entry silently loses that ordering.
+ *  - CLEAR_DOWNLOAD_PROGRESS (popup remove, main.mjs handler) is deliberately
+ *    NOT queued: it only ever runs after a terminal write has landed (the
+ *    popup clears on terminal/delivery outcomes) and nothing enqueues after
+ *    it, so the bypass cannot interleave with a progress writer in the bad
+ *    order. Re-plumb it through the queue only if a writer is ever added
+ *    after terminal.
+ */
+let progressWriteChain = Promise.resolve();
+function queueProgressWrite(fn) {
+  const run = progressWriteChain.then(fn, fn);
+  progressWriteChain = run.then(() => {}, () => {});
+  return run;
+}
+
+/**
+ * Per-video progress tick from BatchProcessor.onProgress (exported for
+ * tests). Guarded: a record already terminal/stopping in storage is never
+ * overwritten by a stale processor; with the write queue the read and the
+ * write cannot be interleaved by another writer.
+ */
+export async function persistBatchProgress(progress, { playlistId, downloadId }) {
+  return queueProgressWrite(async () => {
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+
+      // Don't overwrite terminal/stop states from a potentially stale processor
+      if (current.status === 'completed' || current.status === 'error' ||
+          current.status === 'stopping' || current.status === 'stopped') {
+        // If we already finished (or are stopping) in storage, just keep it
+        globalThis.currentDownloadProgress = current;
+        return current;
+      }
+
+      const next = {
+        ...progress,
+        playlistId,
+        status: 'running',
+        downloadId,
+        updatedAt: Date.now()
+      };
+      globalThis.currentDownloadProgress = next;
+      await chrome.storage.local.set({ currentDownloadProgress: next });
+      return next;
+    } catch (e) {
+      console.error('[Background] Progress update failed:', e);
+      return globalThis.currentDownloadProgress;
+    }
+  });
 }
 
 /**
  * Atomic progress update helper
  * Reads current state from storage, merges with updates, writes back.
  * Prevents stale state overwrites from concurrent updates or SW restarts.
+ * Serialized through the progress write queue (see INVARIANT above).
  */
-async function atomicProgressUpdate(updates, options = {}) {
-  try {
-    const stored = await chrome.storage.local.get('currentDownloadProgress');
-    const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
+export function atomicProgressUpdate(updates, options = {}) {
+  return queueProgressWrite(async () => {
+    try {
+      const stored = await chrome.storage.local.get('currentDownloadProgress');
+      const current = stored.currentDownloadProgress || globalThis.currentDownloadProgress || {};
 
-    // By default, don't overwrite completed/error states with running updates
-    if (!options.force && (current.status === 'completed' || current.status === 'error')) {
-      globalThis.currentDownloadProgress = current;
-      return current;
+      // Terminal states are only ever overwritten by force writes that were
+      // not explicitly told to respect them (STOP uses refuseIfTerminal so a
+      // racing terminal write always wins over 'stopping').
+      const isTerminal =
+        current.status === 'completed' || current.status === 'error' || current.status === 'stopped';
+      if (isTerminal && (options.refuseIfTerminal || !options.force)) {
+        globalThis.currentDownloadProgress = current;
+        return current;
+      }
+
+      const merged = {
+        ...current,
+        ...updates,
+        // Preserve critical fields if not explicitly provided
+        playlistId: updates.playlistId ?? current.playlistId,
+        downloadId: updates.downloadId ?? current.downloadId,
+        // Freshness stamp for the popup's staleness guard (SW-death recovery)
+        updatedAt: Date.now()
+      };
+
+      globalThis.currentDownloadProgress = merged;
+      await chrome.storage.local.set({ currentDownloadProgress: merged });
+      return merged;
+    } catch (e) {
+      console.error('[Main] Atomic progress update failed:', e);
+      // Fallback: just update globalThis
+      globalThis.currentDownloadProgress = { ...globalThis.currentDownloadProgress, ...updates };
+      return globalThis.currentDownloadProgress;
     }
-
-    const merged = {
-      ...current,
-      ...updates,
-      // Preserve critical fields if not explicitly provided
-      playlistId: updates.playlistId ?? current.playlistId,
-      downloadId: updates.downloadId ?? current.downloadId
-    };
-
-    globalThis.currentDownloadProgress = merged;
-    await chrome.storage.local.set({ currentDownloadProgress: merged });
-    return merged;
-  } catch (e) {
-    console.error('[Main] Atomic progress update failed:', e);
-    // Fallback: just update globalThis
-    globalThis.currentDownloadProgress = { ...globalThis.currentDownloadProgress, ...updates };
-    return globalThis.currentDownloadProgress;
-  }
+  });
 }
 
 // Helper function to convert transcript to SRT
