@@ -3,7 +3,7 @@
 Audit- and mining-shaped findings that outlived the session that found them.
 Stable IDs — never renumber. `Status: FIXED` rows stay, with their evidence.
 
-Total: 21 open, 4 fixed.
+Total: 21 open, 6 fixed.
 
 ---
 
@@ -318,3 +318,19 @@ From a real session log (2026-10-02): popup open → first srt = 37.4s wall cloc
 **Status: OPEN** · low (Tier 3 has no recorded real success) · from CodeRabbit (PR #2, outside-diff); the premise verified in `tier3-worker.mjs`
 
 When the iOS and WEB `getInfo` calls both reject, `fetchTier3Transcript` does `throw e2` before the three-attempt direct `/player` loop, which does not use `info`. A direct response that carries caption tracks therefore cannot rescue the transcript. Fix: keep the error instead of throwing, make the `info.captions…` reads null-safe, run the direct loop, and rethrow the kept error only if no tracks are found — and never call `info.getTranscript()` without an `info`. Add a test (the tier3 worker is currently only exercised through `mock.module`).
+
+---
+
+### #26 — release rail: historical tags had drifted from their built code
+
+**Status: FIXED** (2026-10-07) · high (release integrity) · found while answering "what is the proper workflow"
+
+Every GitHub release before 2026-10-07 pointed its tag at a commit that did not carry the version the release was named for. `v1.1.4` was tagged at the PR #1 merge (`164162b`, manifest `1.1.2`); `v1.1.0` at `b9d3692` (manifest `1.0.2`). `v1.0.0`'s draft asset had been silently repointed to `1.1.2` code by a stray June dispatch (asset `updated_at` = the June upload), and a duplicate draft held a second copy of `v1.0.1`. Mechanism: `build-release.yml` took a free-text `version` input and hardcoded `target_commitish: main`, while the version bump lived only on `playlist-download` — so the tag landed on main's head while the zip was built from the branch. Fix: the rail (`release.yml`) derives everything from the repo (no free-text inputs, refuses non-main dispatches, tag at `${{ github.sha }}`); history repaired in place — tags `v1.1.0`/`v1.1.4` moved to their asset-build commits, `v1.0.0` published with a rebuilt-from-source asset, duplicate draft deleted, every release given a body, missing `v1.0.0`/`v1.1.0` tags created. Pinned by `test/release-rail.test.mjs`.
+
+---
+
+### #27 — build scripts were invisible to CI and broke silently on two major bumps
+
+**Status: FIXED** (2026-10-07) · medium · found while merging the Dependabot dev-deps group
+
+`npm test` + `npm run build` never touch `scripts/zip.cjs` or `scripts/pack.cjs`, so the dev-deps PR passed CI while both scripts were broken: `zip-a-folder` 7 pulls a native `@napi-rs/lzma` binding that hits the known npm optional-deps install bug (npm/cli#4828 — "Cannot find native binding") and `node-rsa` 2.0 moved its constructor to a named export (`NodeRSA is not a constructor`). `npm run zip` feeds `release.yml`'s store upload, so a native binding there is a release hazard. Fix: `zip.cjs` rewritten on `fflate` (pure JS, already a runtime dependency; all manifest-referenced entries asserted present) and `zip-a-folder` dropped; `pack.cjs` uses `const { NodeRSA } = require('node-rsa')` and packed a valid `.crx` locally. Follow-up worth doing: make CI run `npm run zip` and assert the archive contains every manifest reference.
